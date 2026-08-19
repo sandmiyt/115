@@ -10,12 +10,19 @@ struct VideoCard: View {
 
   var body: some View {
     Button(action: onOpen) {
-      VStack(alignment: .leading, spacing: 7) {
+      VStack(alignment: .leading, spacing: 8) {
         ZStack(alignment: .bottomTrailing) {
           thumbnail
-            .aspectRatio(16 / 10, contentMode: .fill)
+            .aspectRatio(16 / 9, contentMode: .fill)
             .frame(maxWidth: .infinity)
             .clipped()
+
+          LinearGradient(
+            colors: [.clear, .black.opacity(0.34)],
+            startPoint: .center,
+            endPoint: .bottom
+          )
+          .allowsHitTesting(false)
 
           if !item.formattedDuration.isEmpty {
             Text(item.formattedDuration)
@@ -27,10 +34,14 @@ struct VideoCard: View {
               .padding(6)
           }
         }
-        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .overlay {
+          RoundedRectangle(cornerRadius: 13, style: .continuous)
+            .stroke(.primary.opacity(0.06), lineWidth: 0.5)
+        }
 
         Text(item.name)
-          .font(.subheadline.weight(.medium))
+          .font(.subheadline.weight(.semibold))
           .foregroundStyle(.primary)
           .lineLimit(2)
           .multilineTextAlignment(.leading)
@@ -44,7 +55,7 @@ struct VideoCard: View {
           if appState.libraryStore.isFavorite(item) {
             Image(systemName: "heart.fill")
               .font(.caption2)
-              .foregroundStyle(.red)
+              .foregroundStyle(.pink)
           }
         }
       }
@@ -75,8 +86,7 @@ struct VideoCard: View {
       Image(uiImage: generatedImage)
         .resizable()
     } else if let url = item.thumbnailURL, !serverThumbnailFailed {
-      AsyncImage(url: url, transaction: Transaction(animation: .easeInOut(duration: 0.2))) {
-        phase in
+      AsyncImage(url: url, transaction: Transaction(animation: .easeInOut(duration: 0.2))) { phase in
         switch phase {
         case .success(let image):
           image.resizable()
@@ -105,7 +115,7 @@ struct VideoCard: View {
 
   private var placeholder: some View {
     ZStack {
-      Rectangle().fill(.quaternary)
+      Rectangle().fill(.secondary.opacity(0.10))
       Image(systemName: "play.rectangle.fill")
         .font(.system(size: 30))
         .foregroundStyle(.secondary)

@@ -7,11 +7,44 @@ struct SettingsView: View {
   @State private var rootFolderID = ""
   @State private var statusMessage: String?
   @State private var isTesting = false
+  @State private var isChangingFaceID = false
 
   var body: some View {
     @Bindable var appState = appState
 
     Form {
+      Section("隐私与安全") {
+        Toggle(
+          "\(appState.biometricTitle)进入验证",
+          isOn: Binding(
+            get: { appState.faceIDEnabled },
+            set: { newValue in
+              guard !isChangingFaceID else { return }
+              isChangingFaceID = true
+              Task {
+                _ = await appState.setFaceIDProtection(newValue)
+                isChangingFaceID = false
+              }
+            }
+          )
+        )
+        .disabled(isChangingFaceID || (!appState.canUseBiometrics && !appState.faceIDEnabled))
+
+        Text(
+          appState.canUseBiometrics
+            ? "开启后，每次 App 重新进入前都会先验证身份。"
+            : "当前设备未检测到可用的面容 ID / 生物识别。"
+        )
+        .font(.footnote)
+        .foregroundStyle(.secondary)
+
+        if let message = appState.biometricErrorMessage {
+          Text(message)
+            .font(.footnote)
+            .foregroundStyle(.red)
+        }
+      }
+
       Section("浏览") {
         Picker("封面列数", selection: $appState.gridColumns) {
           Text("2 列").tag(2)
@@ -28,6 +61,16 @@ struct SettingsView: View {
             Text(scheme.title).tag(scheme)
           }
         }
+      }
+
+      Section("播放器") {
+        LabeledContent("播放器", value: "AVPlayer")
+        LabeledContent("画中画", value: "支持")
+        LabeledContent("横竖屏", value: "自动适配")
+        LabeledContent("VLC 原画兜底", value: VLCAvailability.isAvailable ? "已启用" : "未安装")
+        Text("播放页已改为沉浸式全屏。原画无法打开时会自动切到最高可用转码，不会卡在黑屏。")
+          .font(.footnote)
+          .foregroundStyle(.secondary)
       }
 
       Section("115 连接") {
@@ -55,11 +98,11 @@ struct SettingsView: View {
         if let statusMessage {
           Text(statusMessage)
             .font(.footnote)
-            .foregroundStyle(statusMessage.contains("成功") ? .green : .red)
+            .foregroundStyle(statusMessage.contains("成功") || statusMessage.contains("已清除") ? .green : .red)
         }
       }
 
-      Section("缓存") {
+      Section("缓存与记录") {
         Button("清除封面缓存") {
           Task {
             await appState.thumbnailService.clearCache()
@@ -71,10 +114,10 @@ struct SettingsView: View {
         }
       }
 
-      Section("播放器") {
-        LabeledContent("系统播放器", value: "AVPlayer")
-        LabeledContent("VLC 原画兜底", value: VLCAvailability.isAvailable ? "已启用" : "未安装")
-        Text("默认优先使用 115 的最高转码，原画失败会自动回退，避免出现只显示“加载失败”的死路。")
+      Section("关于") {
+        LabeledContent("名称", value: "影")
+        LabeledContent("版本", value: "1.1")
+        Text("一个专注于 115 视频封面浏览与播放的 iPhone 客户端。")
           .font(.footnote)
           .foregroundStyle(.secondary)
       }

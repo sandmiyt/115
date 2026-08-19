@@ -10,6 +10,10 @@ struct SystemPlayerView: UIViewControllerRepresentable {
     controller.allowsPictureInPicturePlayback = true
     controller.canStartPictureInPictureAutomaticallyFromInline = true
     controller.showsPlaybackControls = true
+    controller.entersFullScreenWhenPlaybackBegins = false
+    controller.exitsFullScreenWhenPlaybackEnds = false
+    controller.videoGravity = .resizeAspect
+    controller.view.backgroundColor = .black
     return controller
   }
 
@@ -17,5 +21,6 @@ struct SystemPlayerView: UIViewControllerRepresentable {
     if controller.player !== player {
       controller.player = player
     }
+    controller.videoGravity = .resizeAspect
   }
 }

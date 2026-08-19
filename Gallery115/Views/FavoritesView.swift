@@ -14,23 +14,27 @@ struct FavoritesView: View {
         )
       } else {
         ScrollView {
-          LazyVGrid(columns: columns, spacing: 14) {
+          LazyVGrid(columns: columns, spacing: 18) {
             ForEach(appState.libraryStore.favorites) { item in
               VideoCard(item: item) {
                 selectedVideo = item
               }
             }
           }
-          .padding(14)
+          .padding(.horizontal, 14)
+          .padding(.top, 10)
+          .padding(.bottom, 30)
         }
       }
     }
     .navigationTitle("收藏")
-    .sheet(item: $selectedVideo) { PlayerScreen(item: $0) }
+    .fullScreenCover(item: $selectedVideo) { PlayerScreen(item: $0) }
   }
 
   private var columns: [GridItem] {
     Array(
-      repeating: GridItem(.flexible(), spacing: 10, alignment: .top), count: appState.gridColumns)
+      repeating: GridItem(.flexible(), spacing: 11, alignment: .top),
+      count: appState.gridColumns
+    )
   }
 }
