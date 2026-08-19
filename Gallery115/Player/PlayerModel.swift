@@ -17,8 +17,8 @@ final class PlayerModel {
   private let api: APIClient
   private let libraryStore: LibraryStore
   private let defaultQuality: AppState.DefaultQuality
-  private var timeObserver: Any?
-  private var failureObserver: NSObjectProtocol?
+  nonisolated(unsafe) private var timeObserver: Any?
+  nonisolated(unsafe) private var failureObserver: NSObjectProtocol?
   private var lastSavedSecond = -1
   private var isFallingBack = false
 
@@ -138,11 +138,13 @@ final class PlayerModel {
       forInterval: CMTime(seconds: 1, preferredTimescale: 2),
       queue: .main
     ) { [weak self] time in
-      guard let self else { return }
-      let second = Int(time.seconds.isFinite ? time.seconds : 0)
-      if second >= 0, second != self.lastSavedSecond, second % 5 == 0 {
-        self.lastSavedSecond = second
-        self.saveProgress(force: false)
+      Task { @MainActor [weak self] in
+        guard let self else { return }
+        let second = Int(time.seconds.isFinite ? time.seconds : 0)
+        if second >= 0, second != self.lastSavedSecond, second % 5 == 0 {
+          self.lastSavedSecond = second
+          self.saveProgress(force: false)
+        }
       }
     }
 
