@@ -753,7 +753,7 @@ struct PlayerScreen: View {
     controlsTask?.cancel()
     guard model?.isPlaying == true, !isLocked, !isScrubbing else { return }
     controlsTask = Task { @MainActor in
-      try? await Task.sleep(for: .seconds(1.0))
+      try? await Task.sleep(for: .seconds(2.0))
       guard !Task.isCancelled else { return }
       withAnimation(.easeIn(duration: 0.22)) {
         controlsVisible = false
