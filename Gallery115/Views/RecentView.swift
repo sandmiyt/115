@@ -87,28 +87,16 @@ private struct RecentThumbnail: View {
 
   var body: some View {
     ZStack(alignment: .bottom) {
-      ZStack {
-        RoundedRectangle(cornerRadius: 10, style: .continuous)
-          .fill(.secondary.opacity(0.10))
-        if let url = entry.item.thumbnailURL {
-          AsyncImage(url: url) { image in
-            image.resizable().scaledToFill()
-          } placeholder: {
-            Image(systemName: "play.rectangle.fill")
-              .foregroundStyle(.secondary)
-          }
-        } else {
-          Image(systemName: "play.rectangle.fill")
-            .foregroundStyle(.secondary)
-        }
-      }
+      VideoArtwork(item: entry.item)
 
       GeometryReader { proxy in
-        VStack {
+        VStack(spacing: 0) {
           Spacer()
           ZStack(alignment: .leading) {
-            Rectangle().fill(.black.opacity(0.38))
-            Rectangle().fill(.purple).frame(width: proxy.size.width * progress)
+            Rectangle().fill(.black.opacity(0.34))
+            Rectangle()
+              .fill(CinevaTheme.accent)
+              .frame(width: proxy.size.width * progress)
           }
           .frame(height: 3)
         }

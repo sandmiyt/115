@@ -1,19 +1,38 @@
+import AVFoundation
 import AVKit
 import SwiftUI
 
+enum PlayerVideoLayout: String, CaseIterable {
+  case fit
+  case fill
+
+  var gravity: AVLayerVideoGravity {
+    switch self {
+    case .fit: return .resizeAspect
+    case .fill: return .resizeAspectFill
+    }
+  }
+
+  var title: String {
+    switch self {
+    case .fit: return "适应屏幕"
+    case .fill: return "铺满屏幕"
+    }
+  }
+}
+
 struct SystemPlayerView: UIViewControllerRepresentable {
   let player: AVPlayer
+  var videoLayout: PlayerVideoLayout = .fit
+  var showsPlaybackControls = false
 
   func makeUIViewController(context: Context) -> AVPlayerViewController {
     let controller = AVPlayerViewController()
     controller.player = player
+    controller.videoGravity = videoLayout.gravity
     controller.allowsPictureInPicturePlayback = true
     controller.canStartPictureInPictureAutomaticallyFromInline = true
-    controller.showsPlaybackControls = true
-    controller.entersFullScreenWhenPlaybackBegins = false
-    controller.exitsFullScreenWhenPlaybackEnds = false
-    controller.videoGravity = .resizeAspect
-    controller.view.backgroundColor = .black
+    controller.showsPlaybackControls = showsPlaybackControls
     return controller
   }
 
@@ -21,6 +40,11 @@ struct SystemPlayerView: UIViewControllerRepresentable {
     if controller.player !== player {
       controller.player = player
     }
-    controller.videoGravity = .resizeAspect
+    if controller.videoGravity != videoLayout.gravity {
+      controller.videoGravity = videoLayout.gravity
+    }
+    if controller.showsPlaybackControls != showsPlaybackControls {
+      controller.showsPlaybackControls = showsPlaybackControls
+    }
   }
 }

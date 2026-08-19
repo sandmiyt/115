@@ -46,26 +46,7 @@ struct FolderView: View {
           description: Text(query.isEmpty ? "当前目录中没有文件夹或视频。" : "换一个关键词试试。")
         )
       } else {
-        ScrollView {
-          LazyVGrid(columns: columns, spacing: 18) {
-            ForEach(filteredItems) { item in
-              if item.isDirectory {
-                NavigationLink(value: item) {
-                  FolderCard(item: item)
-                }
-                .buttonStyle(.plain)
-              } else {
-                VideoCard(item: item) {
-                  selectedVideo = item
-                }
-              }
-            }
-          }
-          .padding(.horizontal, 14)
-          .padding(.top, 10)
-          .padding(.bottom, 30)
-        }
-        .refreshable { await load() }
+        content
       }
     }
     .navigationTitle(title)
@@ -75,7 +56,14 @@ struct FolderView: View {
     }
     .searchable(text: $query, prompt: "搜索当前目录")
     .toolbar {
-      ToolbarItem(placement: .topBarTrailing) {
+      ToolbarItemGroup(placement: .topBarTrailing) {
+        Button {
+          appState.browserLayout = appState.browserLayout == .grid ? .list : .grid
+        } label: {
+          Image(systemName: appState.browserLayout == .grid ? "list.bullet" : "square.grid.2x2")
+        }
+        .accessibilityLabel(appState.browserLayout == .grid ? "切换列表" : "切换封面墙")
+
         Menu {
           Section("排序") {
             Picker("排序", selection: $sortMode) {
@@ -84,11 +72,14 @@ struct FolderView: View {
               }
             }
           }
-          Section("封面墙") {
-            Picker("每行", selection: gridColumnsBinding) {
-              Text("2 列").tag(2)
-              Text("3 列").tag(3)
-              Text("4 列").tag(4)
+
+          if appState.browserLayout == .grid {
+            Section("封面墙") {
+              Picker("每行", selection: gridColumnsBinding) {
+                Text("2 列").tag(2)
+                Text("3 列").tag(3)
+                Text("4 列").tag(4)
+              }
             }
           }
         } label: {
@@ -100,6 +91,53 @@ struct FolderView: View {
       PlayerScreen(item: item)
     }
     .task(id: folderID) { await load() }
+  }
+
+  @ViewBuilder
+  private var content: some View {
+    switch appState.browserLayout {
+    case .grid:
+      ScrollView {
+        LazyVGrid(columns: columns, spacing: 18) {
+          ForEach(filteredItems) { item in
+            if item.isDirectory {
+              NavigationLink(value: item) {
+                FolderCard(item: item)
+              }
+              .buttonStyle(.plain)
+            } else {
+              VideoCard(item: item) {
+                selectedVideo = item
+              }
+            }
+          }
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 10)
+        .padding(.bottom, 30)
+      }
+      .refreshable { await load() }
+
+    case .list:
+      List {
+        ForEach(filteredItems) { item in
+          if item.isDirectory {
+            NavigationLink(value: item) {
+              FolderListRow(item: item)
+            }
+          } else {
+            Button {
+              selectedVideo = item
+            } label: {
+              VideoListRow(item: item)
+            }
+            .buttonStyle(.plain)
+          }
+        }
+      }
+      .listStyle(.plain)
+      .refreshable { await load() }
+    }
   }
 
   private var loadingState: some View {
@@ -165,13 +203,13 @@ private struct FolderCard: View {
     VStack(alignment: .leading, spacing: 8) {
       ZStack(alignment: .bottomLeading) {
         LinearGradient(
-          colors: [Color.orange.opacity(0.24), Color.yellow.opacity(0.10)],
+          colors: [CinevaTheme.accentWarm.opacity(0.30), CinevaTheme.accent.opacity(0.10)],
           startPoint: .topLeading,
           endPoint: .bottomTrailing
         )
         Image(systemName: "folder.fill")
           .font(.system(size: 38, weight: .semibold))
-          .foregroundStyle(.orange)
+          .foregroundStyle(CinevaTheme.accent)
           .padding(14)
       }
       .aspectRatio(16 / 9, contentMode: .fit)
@@ -188,5 +226,94 @@ private struct FolderCard: View {
         .foregroundStyle(.secondary)
     }
     .contentShape(Rectangle())
+  }
+}
+
+private struct FolderListRow: View {
+  let item: CloudItem
+
+  var body: some View {
+    HStack(spacing: 13) {
+      ZStack {
+        RoundedRectangle(cornerRadius: 12, style: .continuous)
+          .fill(CinevaTheme.accent.opacity(0.10))
+        Image(systemName: "folder.fill")
+          .font(.title2)
+          .foregroundStyle(CinevaTheme.accent)
+      }
+      .frame(width: 74, height: 52)
+
+      VStack(alignment: .leading, spacing: 4) {
+        Text(item.name)
+          .font(.subheadline.weight(.semibold))
+          .lineLimit(2)
+        Text("文件夹")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+      }
+      Spacer(minLength: 4)
+    }
+    .padding(.vertical, 4)
+  }
+}
+
+private struct VideoListRow: View {
+  @Environment(AppState.self) private var appState
+  let item: CloudItem
+
+  var body: some View {
+    HStack(spacing: 13) {
+      ZStack(alignment: .bottom) {
+        VideoArtwork(item: item)
+        if progress > 0.002 {
+          GeometryReader { proxy in
+            VStack(spacing: 0) {
+              Spacer()
+              ZStack(alignment: .leading) {
+                Rectangle().fill(.white.opacity(0.18))
+                Rectangle()
+                  .fill(CinevaTheme.accent)
+                  .frame(width: max(2, proxy.size.width * progress))
+              }
+              .frame(height: 3)
+            }
+          }
+        }
+      }
+      .frame(width: 112, height: 63)
+      .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+      VStack(alignment: .leading, spacing: 5) {
+        Text(item.name)
+          .font(.subheadline.weight(.semibold))
+          .foregroundStyle(.primary)
+          .lineLimit(2)
+
+        HStack(spacing: 6) {
+          if !item.fileExtension.isEmpty {
+            Text(item.fileExtension.uppercased())
+          }
+          Text(item.formattedSize)
+          if !item.formattedDuration.isEmpty {
+            Text("·")
+            Text(item.formattedDuration)
+          }
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+      }
+      Spacer(minLength: 4)
+      Image(systemName: "play.circle.fill")
+        .font(.title3)
+        .foregroundStyle(CinevaTheme.accent)
+    }
+    .padding(.vertical, 4)
+  }
+
+  private var progress: Double {
+    guard item.duration > 0 else { return 0 }
+    let position = appState.libraryStore.resumePosition(for: item)
+    guard position > 2, position < item.duration - 8 else { return 0 }
+    return min(max(position / item.duration, 0), 1)
   }
 }

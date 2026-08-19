@@ -13,6 +13,69 @@ struct SettingsView: View {
     @Bindable var appState = appState
 
     Form {
+      Section("外观") {
+        Picker("界面", selection: $appState.colorSchemePreference) {
+          ForEach(AppState.ColorSchemePreference.allCases) { scheme in
+            Text(scheme.title).tag(scheme)
+          }
+        }
+        .pickerStyle(.segmented)
+
+        Picker("默认浏览方式", selection: $appState.browserLayout) {
+          ForEach(AppState.BrowserLayout.allCases) { layout in
+            Label(layout.title, systemImage: layout.icon).tag(layout)
+          }
+        }
+
+        if appState.browserLayout == .grid {
+          Picker("封面列数", selection: $appState.gridColumns) {
+            Text("2 列").tag(2)
+            Text("3 列").tag(3)
+            Text("4 列").tag(4)
+          }
+        }
+
+        Picker("缩略图显示", selection: $appState.artworkMode) {
+          ForEach(AppState.ArtworkMode.allCases) { mode in
+            Text(mode.title).tag(mode)
+          }
+        }
+
+        HStack(spacing: 8) {
+          Circle().fill(CinevaTheme.accentWarm).frame(width: 18, height: 18)
+          Circle().fill(CinevaTheme.accent).frame(width: 18, height: 18)
+          Circle().fill(CinevaTheme.accentRed).frame(width: 18, height: 18)
+          Text("Cineva 影院橙")
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+        }
+      }
+
+      Section("播放") {
+        Picker("默认清晰度", selection: $appState.defaultQuality) {
+          ForEach(AppState.DefaultQuality.allCases) { quality in
+            Text(quality.title).tag(quality)
+          }
+        }
+
+        Toggle("播放器手势", isOn: $appState.playerGesturesEnabled)
+
+        if appState.playerGesturesEnabled {
+          Picker("双击快进/快退", selection: $appState.doubleTapSeekSeconds) {
+            Text("10 秒").tag(10)
+            Text("15 秒").tag(15)
+            Text("30 秒").tag(30)
+          }
+        }
+
+        Toggle("播放结束自动下一集", isOn: $appState.autoPlayNextEpisode)
+
+        LabeledContent("播放器", value: "AVPlayer")
+        LabeledContent("画中画", value: "支持")
+        LabeledContent("横竖屏", value: "自动适配")
+        LabeledContent("VLC 原画兜底", value: VLCAvailability.isAvailable ? "已启用" : "未安装")
+      }
+
       Section("隐私与安全") {
         Toggle(
           "\(appState.biometricTitle)进入验证",
@@ -32,7 +95,7 @@ struct SettingsView: View {
 
         Text(
           appState.canUseBiometrics
-            ? "开启后，每次 App 重新进入前都会先验证身份。"
+            ? "开启后，Cineva 从后台重新进入时会先验证身份。"
             : "当前设备未检测到可用的面容 ID / 生物识别。"
         )
         .font(.footnote)
@@ -43,34 +106,6 @@ struct SettingsView: View {
             .font(.footnote)
             .foregroundStyle(.red)
         }
-      }
-
-      Section("浏览") {
-        Picker("封面列数", selection: $appState.gridColumns) {
-          Text("2 列").tag(2)
-          Text("3 列").tag(3)
-          Text("4 列").tag(4)
-        }
-        Picker("默认清晰度", selection: $appState.defaultQuality) {
-          ForEach(AppState.DefaultQuality.allCases) { quality in
-            Text(quality.title).tag(quality)
-          }
-        }
-        Picker("外观", selection: $appState.colorSchemePreference) {
-          ForEach(AppState.ColorSchemePreference.allCases) { scheme in
-            Text(scheme.title).tag(scheme)
-          }
-        }
-      }
-
-      Section("播放器") {
-        LabeledContent("播放器", value: "AVPlayer")
-        LabeledContent("画中画", value: "支持")
-        LabeledContent("横竖屏", value: "自动适配")
-        LabeledContent("VLC 原画兜底", value: VLCAvailability.isAvailable ? "已启用" : "未安装")
-        Text("播放页已改为沉浸式全屏。原画无法打开时会自动切到最高可用转码，不会卡在黑屏。")
-          .font(.footnote)
-          .foregroundStyle(.secondary)
       }
 
       Section("115 连接") {
@@ -115,11 +150,14 @@ struct SettingsView: View {
       }
 
       Section("关于") {
-        LabeledContent("名称", value: "影")
-        LabeledContent("版本", value: "1.1")
-        Text("一个专注于 115 视频封面浏览与播放的 iPhone 客户端。")
-          .font(.footnote)
-          .foregroundStyle(.secondary)
+        HStack(spacing: 12) {
+          CinevaLogoMark(size: 42)
+          VStack(alignment: .leading, spacing: 2) {
+            Text("Cineva").font(.headline)
+            Text("115 云端影音播放器").font(.caption).foregroundStyle(.secondary)
+          }
+        }
+        LabeledContent("版本", value: "1.4")
       }
 
       Section {

@@ -1,5 +1,13 @@
 import SwiftUI
 
+enum AppTab: Hashable {
+  case home
+  case library
+  case favorites
+  case recent
+  case settings
+}
+
 struct RootView: View {
   @Environment(AppState.self) private var appState
 
@@ -23,31 +31,23 @@ private struct AppLockView: View {
   var body: some View {
     ZStack {
       LinearGradient(
-        colors: [Color.black, Color(red: 0.08, green: 0.06, blue: 0.13)],
-        startPoint: .top,
-        endPoint: .bottom
+        colors: [CinevaTheme.darkBackground, .black],
+        startPoint: .topLeading,
+        endPoint: .bottomTrailing
       )
       .ignoresSafeArea()
 
       VStack(spacing: 24) {
         Spacer()
+        CinevaLogoMark(size: 104)
 
-        ZStack {
-          RoundedRectangle(cornerRadius: 28, style: .continuous)
-            .fill(.white.opacity(0.08))
-            .frame(width: 108, height: 108)
-          Image(systemName: "play.rectangle.fill")
-            .font(.system(size: 48, weight: .semibold))
-            .foregroundStyle(.purple, .white.opacity(0.82))
-        }
-
-        VStack(spacing: 8) {
-          Text("影")
-            .font(.system(size: 40, weight: .bold, design: .rounded))
+        VStack(spacing: 7) {
+          Text("Cineva")
+            .font(.system(size: 38, weight: .bold, design: .rounded))
             .foregroundStyle(.white)
-          Text("你的私人影音库")
+          Text("私人影音库已锁定")
             .font(.subheadline)
-            .foregroundStyle(.white.opacity(0.6))
+            .foregroundStyle(.white.opacity(0.58))
         }
 
         Button {
@@ -69,7 +69,7 @@ private struct AppLockView: View {
           }
           .frame(maxWidth: .infinity)
           .frame(height: 52)
-          .background(.purple, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+          .background(CinevaTheme.brandGradient, in: RoundedRectangle(cornerRadius: 17, style: .continuous))
           .foregroundStyle(.white)
         }
         .padding(.horizontal, 34)
@@ -78,15 +78,15 @@ private struct AppLockView: View {
           Text(message)
             .font(.footnote)
             .multilineTextAlignment(.center)
-            .foregroundStyle(.white.opacity(0.62))
+            .foregroundStyle(.white.opacity(0.60))
             .padding(.horizontal, 36)
         }
 
         Spacer()
-        Text("播放记录与 115 授权仅保存在本机")
+        Label("本机生物识别保护", systemImage: "lock.shield")
           .font(.caption)
-          .foregroundStyle(.white.opacity(0.35))
-          .padding(.bottom, 20)
+          .foregroundStyle(.white.opacity(0.34))
+          .padding(.bottom, 22)
       }
     }
     .task {
@@ -99,50 +99,53 @@ private struct AppLockView: View {
 }
 
 private struct MainTabView: View {
+  @Environment(\.colorScheme) private var colorScheme
   @Environment(AppState.self) private var appState
+  @State private var selectedTab: AppTab = .home
 
   var body: some View {
-    TabView {
-      NavigationStack {
-        HomeView()
-      }
-      .tabItem { Label("首页", systemImage: "house.fill") }
+    TabView(selection: $selectedTab) {
+      NavigationStack { HomeView(selectedTab: $selectedTab) }
+        .tag(AppTab.home)
+        .tabItem { Label("首页", systemImage: "house.fill") }
 
       NavigationStack {
-        FolderView(folderID: appState.rootFolderID, title: "我的文件")
+        FolderView(folderID: appState.rootFolderID, title: "资料库")
       }
-      .tabItem { Label("文件", systemImage: "folder.fill") }
+      .tag(AppTab.library)
+      .tabItem { Label("资料库", systemImage: "rectangle.stack.fill") }
 
-      NavigationStack {
-        FavoritesView()
-      }
-      .tabItem { Label("收藏", systemImage: "heart.fill") }
+      NavigationStack { FavoritesView() }
+        .tag(AppTab.favorites)
+        .tabItem { Label("收藏", systemImage: "heart.fill") }
 
-      NavigationStack {
-        RecentView()
-      }
-      .tabItem { Label("最近", systemImage: "clock.fill") }
+      NavigationStack { RecentView() }
+        .tag(AppTab.recent)
+        .tabItem { Label("最近", systemImage: "clock.fill") }
 
-      NavigationStack {
-        SettingsView()
-      }
-      .tabItem { Label("设置", systemImage: "gearshape.fill") }
+      NavigationStack { SettingsView() }
+        .tag(AppTab.settings)
+        .tabItem { Label("设置", systemImage: "gearshape.fill") }
     }
+    .toolbarBackground(.ultraThinMaterial, for: .tabBar)
     .toolbarBackground(.visible, for: .tabBar)
+    .toolbarColorScheme(colorScheme, for: .tabBar)
   }
 }
 
 private struct HomeView: View {
+  @Environment(\.colorScheme) private var colorScheme
   @Environment(AppState.self) private var appState
+  @Binding var selectedTab: AppTab
   @State private var selectedVideo: CloudItem?
 
   var body: some View {
     ScrollView {
-      VStack(alignment: .leading, spacing: 28) {
-        hero
+      LazyVStack(alignment: .leading, spacing: 26) {
+        header
 
         if !appState.libraryStore.recents.isEmpty {
-          mediaSection(title: "继续观看", subtitle: "接着上次的位置播放") {
+          mediaSection(title: "继续观看", subtitle: "从上次的位置继续") {
             ScrollView(.horizontal) {
               LazyHStack(spacing: 14) {
                 ForEach(appState.libraryStore.recents.prefix(12)) { entry in
@@ -151,10 +154,13 @@ private struct HomeView: View {
                   }
                 }
               }
+              .padding(.horizontal, 1)
             }
             .scrollIndicators(.hidden)
           }
         }
+
+        libraryActions
 
         if !appState.libraryStore.favorites.isEmpty {
           mediaSection(title: "我的收藏", subtitle: "随时回到喜欢的内容") {
@@ -166,47 +172,115 @@ private struct HomeView: View {
                   }
                 }
               }
+              .padding(.horizontal, 1)
             }
             .scrollIndicators(.hidden)
           }
         }
 
-        quickInfo
+        playbackSummary
       }
       .padding(.horizontal, 16)
-      .padding(.bottom, 28)
+      .padding(.top, 8)
+      .padding(.bottom, 34)
     }
-    .background(Color(uiColor: .systemBackground))
-    .navigationTitle("影")
-    .navigationBarTitleDisplayMode(.large)
+    .background(pageBackground.ignoresSafeArea())
+    .navigationBarHidden(true)
     .fullScreenCover(item: $selectedVideo) { item in
       PlayerScreen(item: item)
     }
   }
 
-  private var hero: some View {
-    ZStack(alignment: .bottomLeading) {
-      LinearGradient(
-        colors: [Color.purple.opacity(0.75), Color.indigo.opacity(0.48), Color.black.opacity(0.72)],
-        startPoint: .topLeading,
-        endPoint: .bottomTrailing
-      )
-
-      VStack(alignment: .leading, spacing: 8) {
-        Image(systemName: "play.rectangle.on.rectangle.fill")
-          .font(.system(size: 34, weight: .semibold))
-        Text("你的 115，像真正的影音库")
-          .font(.title2.bold())
-        Text("封面浏览 · 原画/转码播放 · 进度记录")
-          .font(.subheadline)
-          .foregroundStyle(.white.opacity(0.72))
+  private var header: some View {
+    HStack(spacing: 12) {
+      CinevaLogoMark(size: 48)
+      VStack(alignment: .leading, spacing: 2) {
+        Text("Cineva")
+          .font(.system(size: 29, weight: .bold, design: .rounded))
+        Text("你的私人云端影院")
+          .font(.caption)
+          .foregroundStyle(.secondary)
       }
-      .foregroundStyle(.white)
-      .padding(20)
+      Spacer()
+      HStack(spacing: 6) {
+        Circle().fill(.green).frame(width: 7, height: 7)
+        Text("115 已连接")
+      }
+      .font(.caption.weight(.medium))
+      .foregroundStyle(.secondary)
+      .padding(.horizontal, 10)
+      .frame(height: 32)
+      .background(panelBackground, in: Capsule())
     }
-    .frame(height: 176)
-    .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
-    .shadow(color: .black.opacity(0.12), radius: 22, y: 10)
+    .padding(.top, 6)
+  }
+
+  private var libraryActions: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      Text("媒体库")
+        .font(.title3.bold())
+
+      HStack(spacing: 12) {
+        LibraryActionCard(
+          icon: "rectangle.stack.fill",
+          title: "浏览资料库",
+          subtitle: appState.browserLayout.title,
+          accent: CinevaTheme.accent
+        ) {
+          selectedTab = .library
+        }
+
+        LibraryActionCard(
+          icon: "clock.arrow.circlepath",
+          title: "播放记录",
+          subtitle: "\(appState.libraryStore.recents.count) 个项目",
+          accent: CinevaTheme.accentWarm
+        ) {
+          selectedTab = .recent
+        }
+      }
+    }
+  }
+
+  private var playbackSummary: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      Text("播放能力")
+        .font(.title3.bold())
+
+      HStack(spacing: 0) {
+        summaryCell(icon: "4k.tv", title: "原画 / 4K", subtitle: "自动转码")
+        Divider().frame(height: 48)
+        summaryCell(icon: "captions.bubble", title: "字幕 / 音轨", subtitle: "内嵌切换")
+        Divider().frame(height: 48)
+        summaryCell(icon: "hand.tap", title: "手势控制", subtitle: "亮度 · 音量")
+      }
+      .padding(.vertical, 13)
+      .background(panelBackground, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+  }
+
+  private func summaryCell(icon: String, title: String, subtitle: String) -> some View {
+    VStack(spacing: 5) {
+      Image(systemName: icon)
+        .font(.headline)
+        .foregroundStyle(CinevaTheme.accent)
+      Text(title)
+        .font(.caption.weight(.semibold))
+        .lineLimit(1)
+      Text(subtitle)
+        .font(.caption2)
+        .foregroundStyle(.secondary)
+        .lineLimit(1)
+    }
+    .frame(maxWidth: .infinity)
+  }
+
+  private var pageBackground: Color {
+    colorScheme == .dark ? CinevaTheme.darkBackground : Color(uiColor: .systemGroupedBackground)
+  }
+
+  private var panelBackground: Color {
+    colorScheme == .dark ? CinevaTheme.darkPanel : Color(uiColor: .secondarySystemGroupedBackground)
   }
 
   @ViewBuilder
@@ -216,41 +290,49 @@ private struct HomeView: View {
     @ViewBuilder content: () -> Content
   ) -> some View {
     VStack(alignment: .leading, spacing: 12) {
-      VStack(alignment: .leading, spacing: 3) {
+      VStack(alignment: .leading, spacing: 2) {
         Text(title).font(.title3.bold())
         Text(subtitle).font(.caption).foregroundStyle(.secondary)
       }
       content()
     }
   }
-
-  private var quickInfo: some View {
-    HStack(spacing: 12) {
-      HomeInfoTile(icon: "heart.fill", value: "\(appState.libraryStore.favorites.count)", label: "收藏")
-      HomeInfoTile(icon: "clock.fill", value: "\(appState.libraryStore.recents.count)", label: "最近")
-      HomeInfoTile(icon: "rectangle.grid.2x2.fill", value: "\(appState.gridColumns) 列", label: "封面墙")
-    }
-  }
 }
 
-private struct HomeInfoTile: View {
+private struct LibraryActionCard: View {
+  @Environment(\.colorScheme) private var colorScheme
   let icon: String
-  let value: String
-  let label: String
+  let title: String
+  let subtitle: String
+  let accent: Color
+  let action: () -> Void
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 7) {
-      Image(systemName: icon)
-        .foregroundStyle(.purple)
-      Text(value)
-        .font(.headline.monospacedDigit())
-      Text(label)
-        .font(.caption)
-        .foregroundStyle(.secondary)
+    Button(action: action) {
+      VStack(alignment: .leading, spacing: 13) {
+        Image(systemName: icon)
+          .font(.title3.weight(.semibold))
+          .foregroundStyle(accent)
+          .frame(width: 38, height: 38)
+          .background(accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+
+        VStack(alignment: .leading, spacing: 3) {
+          Text(title)
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(.primary)
+          Text(subtitle)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .padding(14)
+      .background(
+        colorScheme == .dark ? CinevaTheme.darkPanel : Color(uiColor: .secondarySystemGroupedBackground),
+        in: RoundedRectangle(cornerRadius: 18, style: .continuous)
+      )
     }
-    .frame(maxWidth: .infinity, alignment: .leading)
-    .padding(14)
-    .background(.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+    .buttonStyle(.plain)
   }
 }
 
@@ -258,7 +340,7 @@ private struct ContinueWatchingCard: View {
   let entry: PlaybackEntry
   let action: () -> Void
 
-  var progress: Double {
+  private var progress: Double {
     guard entry.item.duration > 0 else { return 0 }
     return min(max(entry.lastPosition / entry.item.duration, 0), 1)
   }
@@ -267,28 +349,28 @@ private struct ContinueWatchingCard: View {
     Button(action: action) {
       VStack(alignment: .leading, spacing: 8) {
         ZStack(alignment: .bottom) {
-          MediaThumbnail(item: entry.item)
+          VideoArtwork(item: entry.item)
           GeometryReader { proxy in
-            VStack {
+            VStack(spacing: 0) {
               Spacer()
               ZStack(alignment: .leading) {
-                Rectangle().fill(.white.opacity(0.22))
+                Rectangle().fill(.white.opacity(0.20))
                 Rectangle()
-                  .fill(.purple)
+                  .fill(CinevaTheme.accent)
                   .frame(width: proxy.size.width * progress)
               }
               .frame(height: 3)
             }
           }
         }
-        .frame(width: 190, height: 108)
+        .frame(width: 214)
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
 
         Text(entry.item.name)
           .font(.subheadline.weight(.semibold))
           .foregroundStyle(.primary)
           .lineLimit(1)
-          .frame(width: 190, alignment: .leading)
+          .frame(width: 214, alignment: .leading)
         Text("继续 · \(formatTime(entry.lastPosition))")
           .font(.caption)
           .foregroundStyle(.secondary)
@@ -313,49 +395,16 @@ private struct CompactPosterCard: View {
   var body: some View {
     Button(action: action) {
       VStack(alignment: .leading, spacing: 8) {
-        MediaThumbnail(item: item)
-          .frame(width: 168, height: 95)
+        VideoArtwork(item: item)
+          .frame(width: 184)
           .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         Text(item.name)
           .font(.subheadline.weight(.semibold))
           .foregroundStyle(.primary)
           .lineLimit(1)
-          .frame(width: 168, alignment: .leading)
+          .frame(width: 184, alignment: .leading)
       }
     }
     .buttonStyle(.plain)
-  }
-}
-
-private struct MediaThumbnail: View {
-  @Environment(AppState.self) private var appState
-  let item: CloudItem
-  @State private var generatedImage: UIImage?
-
-  var body: some View {
-    ZStack {
-      Rectangle().fill(.secondary.opacity(0.12))
-      if let generatedImage {
-        Image(uiImage: generatedImage).resizable().scaledToFill()
-      } else if let url = item.thumbnailURL {
-        AsyncImage(url: url) { phase in
-          switch phase {
-          case .success(let image): image.resizable().scaledToFill()
-          case .empty: ProgressView()
-          default: Image(systemName: "play.rectangle.fill").font(.title2).foregroundStyle(.secondary)
-          }
-        }
-      } else {
-        Image(systemName: "play.rectangle.fill")
-          .font(.title2)
-          .foregroundStyle(.secondary)
-      }
-    }
-    .clipped()
-    .task(id: item.id) {
-      if item.thumbnailURL == nil {
-        generatedImage = await appState.thumbnailService.generatedThumbnail(for: item, api: appState.api)
-      }
-    }
   }
 }

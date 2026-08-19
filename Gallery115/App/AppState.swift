@@ -30,6 +30,43 @@ final class AppState {
     }
   }
 
+
+
+  enum BrowserLayout: String, CaseIterable, Identifiable {
+    case grid
+    case list
+
+    var id: String { rawValue }
+
+    var title: String {
+      switch self {
+      case .grid: return "封面墙"
+      case .list: return "列表"
+      }
+    }
+
+    var icon: String {
+      switch self {
+      case .grid: return "square.grid.2x2"
+      case .list: return "list.bullet"
+      }
+    }
+  }
+
+  enum ArtworkMode: String, CaseIterable, Identifiable {
+    case fit
+    case fill
+
+    var id: String { rawValue }
+
+    var title: String {
+      switch self {
+      case .fit: return "完整显示（推荐）"
+      case .fill: return "铺满裁切"
+      }
+    }
+  }
+
   enum DefaultQuality: String, CaseIterable, Identifiable {
     case highestTranscode
     case original
@@ -60,6 +97,14 @@ final class AppState {
     }
   }
 
+  var artworkMode: ArtworkMode {
+    didSet { UserDefaults.standard.set(artworkMode.rawValue, forKey: Keys.artworkMode) }
+  }
+
+  var browserLayout: BrowserLayout {
+    didSet { UserDefaults.standard.set(browserLayout.rawValue, forKey: Keys.browserLayout) }
+  }
+
   var defaultQuality: DefaultQuality {
     didSet { UserDefaults.standard.set(defaultQuality.rawValue, forKey: Keys.defaultQuality) }
   }
@@ -76,10 +121,29 @@ final class AppState {
     didSet { UserDefaults.standard.set(faceIDEnabled, forKey: Keys.faceIDEnabled) }
   }
 
+  var playerGesturesEnabled: Bool {
+    didSet { UserDefaults.standard.set(playerGesturesEnabled, forKey: Keys.playerGesturesEnabled) }
+  }
+
+  var autoPlayNextEpisode: Bool {
+    didSet { UserDefaults.standard.set(autoPlayNextEpisode, forKey: Keys.autoPlayNextEpisode) }
+  }
+
+  var doubleTapSeekSeconds: Int {
+    didSet {
+      if ![10, 15, 30].contains(doubleTapSeekSeconds) { doubleTapSeekSeconds = 15 }
+      UserDefaults.standard.set(doubleTapSeekSeconds, forKey: Keys.doubleTapSeekSeconds)
+    }
+  }
+
   init() {
     let defaults = UserDefaults.standard
     let storedColumns = defaults.object(forKey: Keys.gridColumns) as? Int ?? 2
     gridColumns = min(max(storedColumns, 2), 4)
+    artworkMode =
+      ArtworkMode(rawValue: defaults.string(forKey: Keys.artworkMode) ?? "") ?? .fit
+    browserLayout =
+      BrowserLayout(rawValue: defaults.string(forKey: Keys.browserLayout) ?? "") ?? .grid
     defaultQuality =
       DefaultQuality(rawValue: defaults.string(forKey: Keys.defaultQuality) ?? "")
       ?? .highestTranscode
@@ -87,6 +151,10 @@ final class AppState {
       ColorSchemePreference(rawValue: defaults.string(forKey: Keys.colorScheme) ?? "") ?? .system
     rootFolderID = defaults.string(forKey: Keys.rootFolderID) ?? "0"
     faceIDEnabled = defaults.bool(forKey: Keys.faceIDEnabled)
+    playerGesturesEnabled = defaults.object(forKey: Keys.playerGesturesEnabled) as? Bool ?? true
+    autoPlayNextEpisode = defaults.object(forKey: Keys.autoPlayNextEpisode) as? Bool ?? true
+    let storedSeek = defaults.object(forKey: Keys.doubleTapSeekSeconds) as? Int ?? 15
+    doubleTapSeekSeconds = [10, 15, 30].contains(storedSeek) ? storedSeek : 15
     isAppUnlocked = !defaults.bool(forKey: Keys.faceIDEnabled)
   }
 
@@ -116,7 +184,7 @@ final class AppState {
       return true
     }
     guard !isAppUnlocked else { return true }
-    return await authenticate(reason: "验证身份后进入“影”")
+    return await authenticate(reason: "验证身份后进入 Cineva")
   }
 
   @discardableResult
@@ -191,9 +259,14 @@ final class AppState {
 
   private enum Keys {
     static let gridColumns = "gallery115.gridColumns"
+    static let artworkMode = "gallery115.artworkMode"
+    static let browserLayout = "gallery115.browserLayout"
     static let defaultQuality = "gallery115.defaultQuality"
     static let colorScheme = "gallery115.colorScheme"
     static let rootFolderID = "gallery115.rootFolderID"
     static let faceIDEnabled = "gallery115.faceIDEnabled"
+    static let playerGesturesEnabled = "gallery115.playerGesturesEnabled"
+    static let autoPlayNextEpisode = "gallery115.autoPlayNextEpisode"
+    static let doubleTapSeekSeconds = "gallery115.doubleTapSeekSeconds"
   }
 }

@@ -2,12 +2,28 @@ import AVFoundation
 import Foundation
 import Observation
 
+struct PlayerMediaOption: Identifiable {
+  let id: String
+  let title: String
+  fileprivate let option: AVMediaSelectionOption
+}
+
 @MainActor
 @Observable
 final class PlayerModel {
   private(set) var sources: [VideoSource] = []
   private(set) var selectedSource: VideoSource?
   private(set) var isPreparing = false
+  private(set) var currentTime: Double = 0
+  private(set) var duration: Double = 0
+  private(set) var bufferedUntil: Double = 0
+  private(set) var isPlaying = false
+  private(set) var didReachEnd = false
+  private(set) var audioOptions: [PlayerMediaOption] = []
+  private(set) var subtitleOptions: [PlayerMediaOption] = []
+  private(set) var selectedAudioOptionID: String?
+  private(set) var selectedSubtitleOptionID: String?
+
   var errorMessage: String?
   var didFallbackFromOriginal = false
 
@@ -17,8 +33,11 @@ final class PlayerModel {
   private let api: APIClient
   private let libraryStore: LibraryStore
   private let defaultQuality: AppState.DefaultQuality
+  private var audioGroup: AVMediaSelectionGroup?
+  private var subtitleGroup: AVMediaSelectionGroup?
   nonisolated(unsafe) private var timeObserver: Any?
   nonisolated(unsafe) private var failureObserver: NSObjectProtocol?
+  nonisolated(unsafe) private var endObserver: NSObjectProtocol?
   private var lastSavedSecond = -1
   private var isFallingBack = false
 
@@ -30,6 +49,7 @@ final class PlayerModel {
     self.api = api
     self.libraryStore = libraryStore
     self.defaultQuality = defaultQuality
+    self.duration = max(item.duration, 0)
   }
 
   deinit {
@@ -39,11 +59,15 @@ final class PlayerModel {
     if let failureObserver {
       NotificationCenter.default.removeObserver(failureObserver)
     }
+    if let endObserver {
+      NotificationCenter.default.removeObserver(endObserver)
+    }
   }
 
   func prepareAndPlay() async {
     guard !isPreparing else { return }
     isPreparing = true
+    didReachEnd = false
     defer { isPreparing = false }
 
     do {
@@ -63,7 +87,7 @@ final class PlayerModel {
       if let preferred {
         await play(preferred, allowFallback: true)
       }
-      installObserversIfNeeded()
+      installTimeObserverIfNeeded()
     } catch {
       errorMessage = error.localizedDescription
     }
@@ -76,11 +100,65 @@ final class PlayerModel {
 
   func pause() {
     player.pause()
+    isPlaying = false
     saveProgress(force: true)
   }
 
   func resume() {
+    didReachEnd = false
     player.play()
+    isPlaying = true
+  }
+
+  func togglePlayback() {
+    if player.timeControlStatus == .playing {
+      pause()
+    } else {
+      resume()
+    }
+  }
+
+  func seek(to seconds: Double) {
+    let upper = duration > 0 ? duration : max(seconds, currentTime + 60)
+    let target = min(max(seconds, 0), upper)
+    currentTime = target
+    player.seek(to: CMTime(seconds: target, preferredTimescale: 600))
+  }
+
+  func seekBy(_ delta: Double) {
+    seek(to: currentTime + delta)
+  }
+
+  func setPlaybackRate(_ rate: Float) {
+    let safeRate = min(max(rate, 0.25), 3.0)
+    player.defaultRate = safeRate
+    if player.timeControlStatus == .playing {
+      player.rate = safeRate
+    }
+  }
+
+  func selectAudio(_ id: String?) {
+    guard let playerItem = player.currentItem, let audioGroup else { return }
+    player.appliesMediaSelectionCriteriaAutomatically = false
+    if let id, let mediaOption = audioOptions.first(where: { $0.id == id }) {
+      playerItem.select(mediaOption.option, in: audioGroup)
+      selectedAudioOptionID = id
+    } else {
+      playerItem.selectMediaOptionAutomatically(in: audioGroup)
+      selectedAudioOptionID = nil
+    }
+  }
+
+  func selectSubtitle(_ id: String?) {
+    guard let playerItem = player.currentItem, let subtitleGroup else { return }
+    player.appliesMediaSelectionCriteriaAutomatically = false
+    if let id, let mediaOption = subtitleOptions.first(where: { $0.id == id }) {
+      playerItem.select(mediaOption.option, in: subtitleGroup)
+      selectedSubtitleOptionID = id
+    } else {
+      playerItem.select(nil, in: subtitleGroup)
+      selectedSubtitleOptionID = nil
+    }
   }
 
   var bestTranscode: VideoSource? {
@@ -91,9 +169,26 @@ final class PlayerModel {
     sources.first(where: \.isOriginal)
   }
 
+  var progress: Double {
+    guard duration > 0 else { return 0 }
+    return min(max(currentTime / duration, 0), 1)
+  }
+
+  var bufferProgress: Double {
+    guard duration > 0 else { return 0 }
+    return min(max(bufferedUntil / duration, 0), 1)
+  }
+
   private func play(_ source: VideoSource, allowFallback: Bool) async {
     selectedSource = source
     errorMessage = nil
+    didReachEnd = false
+    audioOptions = []
+    subtitleOptions = []
+    audioGroup = nil
+    subtitleGroup = nil
+    selectedAudioOptionID = nil
+    selectedSubtitleOptionID = nil
 
     let asset: AVURLAsset
     if source.headers.isEmpty {
@@ -112,6 +207,10 @@ final class PlayerModel {
           domain: "Gallery115.Player", code: -1,
           userInfo: [NSLocalizedDescriptionKey: "当前原画编码或地址无法由系统播放器打开。"])
       }
+      let loadedDuration = try? await asset.load(.duration)
+      if let loadedDuration, loadedDuration.seconds.isFinite, loadedDuration.seconds > 0 {
+        duration = loadedDuration.seconds
+      }
     } catch {
       if source.isOriginal, allowFallback, let fallback = bestTranscode {
         didFallbackFromOriginal = true
@@ -123,39 +222,109 @@ final class PlayerModel {
     }
 
     let playerItem = AVPlayerItem(asset: asset)
+    installItemObservers(for: playerItem)
     player.replaceCurrentItem(with: playerItem)
 
-    let resume = libraryStore.resumePosition(for: item)
-    if resume > 2, item.duration <= 0 || resume < item.duration - 15 {
-      await player.seek(to: CMTime(seconds: resume, preferredTimescale: 600))
+    await loadMediaSelectionOptions(asset: asset, playerItem: playerItem)
+
+    let resumePosition = libraryStore.resumePosition(for: item)
+    if resumePosition > 2, duration <= 0 || resumePosition < duration - 15 {
+      currentTime = resumePosition
+      await player.seek(to: CMTime(seconds: resumePosition, preferredTimescale: 600))
+    } else {
+      currentTime = 0
     }
     player.play()
+    isPlaying = true
   }
 
-  private func installObserversIfNeeded() {
+  private func loadMediaSelectionOptions(asset: AVAsset, playerItem: AVPlayerItem) async {
+    async let loadedAudioGroup = try? asset.loadMediaSelectionGroup(for: .audible)
+    async let loadedSubtitleGroup = try? asset.loadMediaSelectionGroup(for: .legible)
+
+    let (audio, subtitles) = await (loadedAudioGroup, loadedSubtitleGroup)
+    audioGroup = audio
+    subtitleGroup = subtitles
+
+    if let audio {
+      audioOptions = audio.options.enumerated().map { index, option in
+        PlayerMediaOption(id: "audio-\(index)-\(option.displayName)", title: option.displayName, option: option)
+      }
+      if let selected = playerItem.currentMediaSelection.selectedMediaOption(in: audio),
+        let index = audio.options.firstIndex(of: selected)
+      {
+        selectedAudioOptionID = audioOptions[safe: index]?.id
+      }
+    }
+
+    if let subtitles {
+      subtitleOptions = subtitles.options.enumerated().map { index, option in
+        PlayerMediaOption(id: "subtitle-\(index)-\(option.displayName)", title: option.displayName, option: option)
+      }
+      if let selected = playerItem.currentMediaSelection.selectedMediaOption(in: subtitles),
+        let index = subtitles.options.firstIndex(of: selected)
+      {
+        selectedSubtitleOptionID = subtitleOptions[safe: index]?.id
+      }
+    }
+  }
+
+  private func installTimeObserverIfNeeded() {
     guard timeObserver == nil else { return }
     timeObserver = player.addPeriodicTimeObserver(
-      forInterval: CMTime(seconds: 1, preferredTimescale: 2),
+      forInterval: CMTime(seconds: 0.5, preferredTimescale: 2),
       queue: .main
     ) { [weak self] time in
       Task { @MainActor [weak self] in
         guard let self else { return }
-        let second = Int(time.seconds.isFinite ? time.seconds : 0)
+        let seconds = time.seconds.isFinite ? max(time.seconds, 0) : 0
+        self.currentTime = seconds
+        self.isPlaying = self.player.timeControlStatus == .playing
+
+        if let range = self.player.currentItem?.loadedTimeRanges.last?.timeRangeValue {
+          let end = CMTimeGetSeconds(CMTimeRangeGetEnd(range))
+          self.bufferedUntil = end.isFinite ? max(end, 0) : 0
+        }
+
+        let second = Int(seconds)
         if second >= 0, second != self.lastSavedSecond, second % 5 == 0 {
           self.lastSavedSecond = second
           self.saveProgress(force: false)
         }
       }
     }
+  }
+
+  private func installItemObservers(for playerItem: AVPlayerItem) {
+    if let failureObserver {
+      NotificationCenter.default.removeObserver(failureObserver)
+    }
+    if let endObserver {
+      NotificationCenter.default.removeObserver(endObserver)
+    }
 
     failureObserver = NotificationCenter.default.addObserver(
       forName: .AVPlayerItemFailedToPlayToEndTime,
-      object: nil,
+      object: playerItem,
       queue: .main
     ) { [weak self] notification in
       guard let self else { return }
       Task { @MainActor in
         await self.handlePlaybackFailure(notification)
+      }
+    }
+
+    endObserver = NotificationCenter.default.addObserver(
+      forName: .AVPlayerItemDidPlayToEndTime,
+      object: playerItem,
+      queue: .main
+    ) { [weak self] _ in
+      Task { @MainActor [weak self] in
+        guard let self else { return }
+        self.currentTime = self.duration
+        self.isPlaying = false
+        self.didReachEnd = true
+        self.saveProgress(force: true)
       }
     }
   }
@@ -183,9 +352,15 @@ final class PlayerModel {
         await api.updateVideoHistory(
           pickCode: item.pickCode,
           seconds: Int(seconds),
-          watchEnd: item.duration > 0 && seconds >= item.duration - 10
+          watchEnd: duration > 0 && seconds >= duration - 10
         )
       }
     }
+  }
+}
+
+private extension Array {
+  subscript(safe index: Index) -> Element? {
+    indices.contains(index) ? self[index] : nil
   }
 }
