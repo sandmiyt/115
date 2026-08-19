@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreGraphics
 import Foundation
 import Observation
 
@@ -19,6 +20,8 @@ final class PlayerModel {
   private(set) var bufferedUntil: Double = 0
   private(set) var isPlaying = false
   private(set) var didReachEnd = false
+  private(set) var isBuffering = false
+  private(set) var videoDisplaySize: CGSize?
   private(set) var audioOptions: [PlayerMediaOption] = []
   private(set) var subtitleOptions: [PlayerMediaOption] = []
   private(set) var selectedAudioOptionID: String?
@@ -101,6 +104,7 @@ final class PlayerModel {
   func pause() {
     player.pause()
     isPlaying = false
+    isBuffering = false
     saveProgress(force: true)
   }
 
@@ -108,6 +112,8 @@ final class PlayerModel {
     didReachEnd = false
     player.play()
     isPlaying = true
+    isBuffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
+    isBuffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
   }
 
   func togglePlayback() {
@@ -183,6 +189,8 @@ final class PlayerModel {
     selectedSource = source
     errorMessage = nil
     didReachEnd = false
+    isBuffering = true
+    videoDisplaySize = nil
     audioOptions = []
     subtitleOptions = []
     audioGroup = nil
@@ -211,6 +219,7 @@ final class PlayerModel {
       if let loadedDuration, loadedDuration.seconds.isFinite, loadedDuration.seconds > 0 {
         duration = loadedDuration.seconds
       }
+      videoDisplaySize = await detectVideoDisplaySize(asset)
     } catch {
       if source.isOriginal, allowFallback, let fallback = bestTranscode {
         didFallbackFromOriginal = true
@@ -236,6 +245,21 @@ final class PlayerModel {
     }
     player.play()
     isPlaying = true
+  }
+
+  private func detectVideoDisplaySize(_ asset: AVAsset) async -> CGSize? {
+    guard let tracks = try? await asset.loadTracks(withMediaType: .video),
+      let track = tracks.first,
+      let naturalSize = try? await track.load(.naturalSize),
+      let preferredTransform = try? await track.load(.preferredTransform)
+    else {
+      return nil
+    }
+
+    let transformed = CGRect(origin: .zero, size: naturalSize).applying(preferredTransform)
+    let size = CGSize(width: abs(transformed.width), height: abs(transformed.height))
+    guard size.width > 0, size.height > 0 else { return nil }
+    return size
   }
 
   private func loadMediaSelectionOptions(asset: AVAsset, playerItem: AVPlayerItem) async {
@@ -280,6 +304,7 @@ final class PlayerModel {
         let seconds = time.seconds.isFinite ? max(time.seconds, 0) : 0
         self.currentTime = seconds
         self.isPlaying = self.player.timeControlStatus == .playing
+        self.isBuffering = self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate
 
         if let range = self.player.currentItem?.loadedTimeRanges.last?.timeRangeValue {
           let end = CMTimeGetSeconds(CMTimeRangeGetEnd(range))

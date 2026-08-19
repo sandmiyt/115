@@ -19,7 +19,7 @@ actor APIClient {
     }
   }
 
-  static let userAgent = "115Gallery-iOS/1.0"
+  static let userAgent = "Cineva-iOS/1.5"
 
   private let baseURL = URL(string: "https://proapi.115.com")!
   private let authURL = URL(string: "https://passportapi.115.com")!
@@ -305,6 +305,38 @@ private struct FileListResponse: Decodable {
   let message: String
   let data: [FileRecord]
   let count: Int
+
+  enum CodingKeys: String, CodingKey {
+    case state, code, message, error, data, count
+  }
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    state = c.flexibleBool(.state)
+    code = c.flexibleInt64(.code)
+    message = c.flexibleString(.message).isEmpty
+      ? c.flexibleString(.error)
+      : c.flexibleString(.message)
+
+    // 115 occasionally returns null / mixed records on later pages.
+    // Decode each record independently so one malformed item cannot break the whole library.
+    if let lossy = try? c.decode([LossyDecodable<FileRecord>].self, forKey: .data) {
+      data = lossy.compactMap(\.value)
+    } else {
+      data = []
+    }
+
+    let rawCount = c.flexibleInt64(.count)
+    count = rawCount > 0 ? Int(clamping: rawCount) : data.count
+  }
+}
+
+private struct LossyDecodable<Value: Decodable>: Decodable {
+  let value: Value?
+
+  init(from decoder: Decoder) throws {
+    value = try? Value(from: decoder)
+  }
 }
 
 private struct FileRecord: Decodable {
@@ -403,6 +435,17 @@ extension JSONDecoder {
 }
 
 extension KeyedDecodingContainer {
+  fileprivate func flexibleBool(_ key: Key) -> Bool {
+    if let value = try? decode(Bool.self, forKey: key) { return value }
+    if let value = try? decode(Int.self, forKey: key) { return value != 0 }
+    if let value = try? decode(Int64.self, forKey: key) { return value != 0 }
+    if let value = try? decode(String.self, forKey: key) {
+      let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+      return normalized == "1" || normalized == "true" || normalized == "yes"
+    }
+    return false
+  }
+
   fileprivate func flexibleString(_ key: Key) -> String {
     if let value = try? decode(String.self, forKey: key) { return value }
     if let value = try? decode(Int64.self, forKey: key) { return String(value) }

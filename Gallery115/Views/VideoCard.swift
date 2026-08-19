@@ -153,7 +153,7 @@ struct VideoArtwork: View {
       }
     }
     .frame(maxWidth: .infinity)
-    .aspectRatio(1.60, contentMode: .fit)
+    .aspectRatio(16 / 9, contentMode: .fit)
     .clipped()
     .task(id: item.id) {
       if item.thumbnailURL == nil, generatedImage == nil {

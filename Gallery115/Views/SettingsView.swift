@@ -2,12 +2,12 @@ import SwiftUI
 
 struct SettingsView: View {
   @Environment(AppState.self) private var appState
-  @State private var accessToken = CredentialStore.shared.accessToken ?? ""
-  @State private var refreshToken = CredentialStore.shared.refreshToken ?? ""
-  @State private var rootFolderID = ""
+  @State private var authorizationSession: Cloud115AuthorizationSession?
   @State private var statusMessage: String?
-  @State private var isTesting = false
+  @State private var isConnecting = false
   @State private var isChangingFaceID = false
+  @State private var showAdvanced = false
+  @State private var rootFolderID = "0"
 
   var body: some View {
     @Bindable var appState = appState
@@ -21,7 +21,7 @@ struct SettingsView: View {
         }
         .pickerStyle(.segmented)
 
-        Picker("默认浏览方式", selection: $appState.browserLayout) {
+        Picker("浏览方式", selection: $appState.browserLayout) {
           ForEach(AppState.BrowserLayout.allCases) { layout in
             Label(layout.title, systemImage: layout.icon).tag(layout)
           }
@@ -35,19 +35,10 @@ struct SettingsView: View {
           }
         }
 
-        Picker("缩略图显示", selection: $appState.artworkMode) {
+        Picker("缩略图", selection: $appState.artworkMode) {
           ForEach(AppState.ArtworkMode.allCases) { mode in
             Text(mode.title).tag(mode)
           }
-        }
-
-        HStack(spacing: 8) {
-          Circle().fill(CinevaTheme.accentWarm).frame(width: 18, height: 18)
-          Circle().fill(CinevaTheme.accent).frame(width: 18, height: 18)
-          Circle().fill(CinevaTheme.accentRed).frame(width: 18, height: 18)
-          Text("Cineva 影院橙")
-            .font(.footnote)
-            .foregroundStyle(.secondary)
         }
       }
 
@@ -68,15 +59,10 @@ struct SettingsView: View {
           }
         }
 
-        Toggle("播放结束自动下一集", isOn: $appState.autoPlayNextEpisode)
-
-        LabeledContent("播放器", value: "AVPlayer")
-        LabeledContent("画中画", value: "支持")
-        LabeledContent("横竖屏", value: "自动适配")
-        LabeledContent("VLC 原画兜底", value: VLCAvailability.isAvailable ? "已启用" : "未安装")
+        Toggle("自动播放下一集", isOn: $appState.autoPlayNextEpisode)
       }
 
-      Section("隐私与安全") {
+      Section("隐私") {
         Toggle(
           "\(appState.biometricTitle)进入验证",
           isOn: Binding(
@@ -93,14 +79,6 @@ struct SettingsView: View {
         )
         .disabled(isChangingFaceID || (!appState.canUseBiometrics && !appState.faceIDEnabled))
 
-        Text(
-          appState.canUseBiometrics
-            ? "开启后，Cineva 从后台重新进入时会先验证身份。"
-            : "当前设备未检测到可用的面容 ID / 生物识别。"
-        )
-        .font(.footnote)
-        .foregroundStyle(.secondary)
-
         if let message = appState.biometricErrorMessage {
           Text(message)
             .font(.footnote)
@@ -108,36 +86,61 @@ struct SettingsView: View {
         }
       }
 
-      Section("115 连接") {
-        SecureField("Access Token", text: $accessToken)
-          .textInputAutocapitalization(.never)
-          .autocorrectionDisabled()
-        SecureField("Refresh Token", text: $refreshToken)
-          .textInputAutocapitalization(.never)
-          .autocorrectionDisabled()
-        TextField("根目录 ID", text: $rootFolderID)
-          .textInputAutocapitalization(.never)
-          .autocorrectionDisabled()
-
-        Button {
-          Task { await saveAndTest() }
-        } label: {
-          HStack {
-            Text("保存并测试连接")
-            Spacer()
-            if isTesting { ProgressView() }
+      Section("115 网盘") {
+        HStack(spacing: 10) {
+          Image(systemName: CredentialStore.shared.hasRefreshToken ? "checkmark.circle.fill" : "externaldrive.badge.icloud")
+            .foregroundStyle(CredentialStore.shared.hasRefreshToken ? .green : CinevaTheme.accent)
+          VStack(alignment: .leading, spacing: 2) {
+            Text(CredentialStore.shared.hasRefreshToken ? "115 已连接" : "未连接 115")
+              .font(.subheadline.weight(.semibold))
+            Text("登录凭据由 Cineva 自动获取并保存在本机 Keychain")
+              .font(.caption)
+              .foregroundStyle(.secondary)
           }
         }
-        .disabled(refreshToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isTesting)
+
+        Button(action: connect115) {
+          HStack {
+            Text(CredentialStore.shared.hasRefreshToken ? "检查连接" : "连接 115 网盘")
+            Spacer()
+            if isConnecting {
+              ProgressView()
+            } else {
+              Image(systemName: "chevron.right")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            }
+          }
+        }
+        .disabled(isConnecting)
+
+        DisclosureGroup("高级", isExpanded: $showAdvanced) {
+          TextField("根目录 ID", text: $rootFolderID)
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
+            .onSubmit {
+              appState.rootFolderID = rootFolderID.isEmpty ? "0" : rootFolderID
+            }
+
+          Text("默认 0 表示整个 115 网盘。通常无需修改。")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
 
         if let statusMessage {
           Text(statusMessage)
             .font(.footnote)
-            .foregroundStyle(statusMessage.contains("成功") || statusMessage.contains("已清除") ? .green : .red)
+            .foregroundStyle(statusMessage.contains("成功") || statusMessage.contains("正常") ? .green : .red)
+        }
+
+        if CredentialStore.shared.hasRefreshToken {
+          Button("断开 115", role: .destructive) {
+            appState.signOut()
+          }
         }
       }
 
-      Section("缓存与记录") {
+      Section("数据") {
         Button("清除封面缓存") {
           Task {
             await appState.thumbnailService.clearCache()
@@ -157,37 +160,81 @@ struct SettingsView: View {
             Text("115 云端影音播放器").font(.caption).foregroundStyle(.secondary)
           }
         }
-        LabeledContent("版本", value: "1.4")
-      }
-
-      Section {
-        Button("退出 115 授权", role: .destructive) {
-          appState.signOut()
-        }
+        LabeledContent("版本", value: "1.5")
       }
     }
     .navigationTitle("设置")
     .onAppear {
       rootFolderID = appState.rootFolderID
     }
+    .sheet(item: $authorizationSession) { session in
+      Cloud115AuthorizationSheet(session: session) { result in
+        authorizationSession = nil
+        handleAuthorizationResult(result)
+      }
+    }
   }
 
-  @MainActor
-  private func saveAndTest() async {
-    isTesting = true
-    defer { isTesting = false }
-    CredentialStore.shared.save(
-      accessToken: accessToken.isEmpty ? nil : accessToken,
-      refreshToken: refreshToken
-    )
-    do {
-      try await appState.api.validateCredentials()
-      appState.rootFolderID = rootFolderID.isEmpty ? "0" : rootFolderID
-      accessToken = CredentialStore.shared.accessToken ?? accessToken
-      refreshToken = CredentialStore.shared.refreshToken ?? refreshToken
-      statusMessage = "连接成功。"
-    } catch {
-      statusMessage = error.localizedDescription
+  private func connect115() {
+    guard !isConnecting else { return }
+    isConnecting = true
+    statusMessage = nil
+
+    Task {
+      if CredentialStore.shared.hasRefreshToken {
+        do {
+          try await appState.api.validateCredentials()
+          await MainActor.run {
+            statusMessage = "115 连接正常。"
+            isConnecting = false
+          }
+          return
+        } catch {
+          // Existing refresh token can no longer recover the session; fall through to login.
+        }
+      }
+
+      do {
+        let session = try await Cloud115AuthorizationClient.makeSession()
+        await MainActor.run {
+          authorizationSession = session
+          isConnecting = false
+        }
+      } catch {
+        await MainActor.run {
+          statusMessage = error.localizedDescription
+          isConnecting = false
+        }
+      }
+    }
+  }
+
+  private func handleAuthorizationResult(_ result: Result<Cloud115Credentials, Error>) {
+    switch result {
+    case .failure(let error):
+      if !(error is CancellationError) {
+        statusMessage = error.localizedDescription
+      }
+    case .success(let credentials):
+      isConnecting = true
+      CredentialStore.shared.save(
+        accessToken: credentials.accessToken,
+        refreshToken: credentials.refreshToken
+      )
+      Task {
+        do {
+          try await appState.api.validateCredentials()
+          await MainActor.run {
+            statusMessage = "115 连接成功。"
+            isConnecting = false
+          }
+        } catch {
+          await MainActor.run {
+            statusMessage = error.localizedDescription
+            isConnecting = false
+          }
+        }
+      }
     }
   }
 }

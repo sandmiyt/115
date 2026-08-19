@@ -258,6 +258,8 @@ private struct ContinueWatchingCard: View {
   let entry: PlaybackEntry
   let action: () -> Void
 
+  private let cardWidth: CGFloat = 150
+
   private var progress: Double {
     guard entry.item.duration > 0 else { return 0 }
     return min(max(entry.lastPosition / entry.item.duration, 0), 1)
@@ -265,35 +267,15 @@ private struct ContinueWatchingCard: View {
 
   var body: some View {
     Button(action: action) {
-      VStack(alignment: .leading, spacing: 8) {
-        ZStack(alignment: .bottom) {
-          VideoArtwork(item: entry.item)
-          GeometryReader { proxy in
-            VStack(spacing: 0) {
-              Spacer()
-              ZStack(alignment: .leading) {
-                Rectangle().fill(.white.opacity(0.20))
-                Rectangle()
-                  .fill(CinevaTheme.accent)
-                  .frame(width: proxy.size.width * progress)
-              }
-              .frame(height: 3)
-            }
-          }
-        }
-        .frame(width: 146)
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay {
-          RoundedRectangle(cornerRadius: 12, style: .continuous)
-            .stroke(.primary.opacity(0.08), lineWidth: 0.6)
-        }
-        .shadow(color: .black.opacity(0.10), radius: 4, y: 2)
+      VStack(alignment: .leading, spacing: 7) {
+        HomeLandscapeArtwork(item: entry.item, width: cardWidth, progress: progress)
 
         Text(entry.item.name)
           .font(.subheadline.weight(.semibold))
           .foregroundStyle(.primary)
           .lineLimit(1)
-          .frame(width: 146, alignment: .leading)
+          .frame(width: cardWidth, alignment: .leading)
+
         Text("继续 · \(formatTime(entry.lastPosition))")
           .font(.caption)
           .foregroundStyle(.secondary)
@@ -315,24 +297,96 @@ private struct CompactPosterCard: View {
   let item: CloudItem
   let action: () -> Void
 
+  private let cardWidth: CGFloat = 150
+
   var body: some View {
     Button(action: action) {
-      VStack(alignment: .leading, spacing: 8) {
-        VideoArtwork(item: item)
-          .frame(width: 136)
-          .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-          .overlay {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-              .stroke(.primary.opacity(0.08), lineWidth: 0.6)
-          }
-          .shadow(color: .black.opacity(0.10), radius: 4, y: 2)
+      VStack(alignment: .leading, spacing: 7) {
+        HomeLandscapeArtwork(item: item, width: cardWidth, progress: nil)
+
         Text(item.name)
           .font(.subheadline.weight(.semibold))
           .foregroundStyle(.primary)
           .lineLimit(1)
-          .frame(width: 136, alignment: .leading)
+          .frame(width: cardWidth, alignment: .leading)
+
+        HStack(spacing: 5) {
+          if !item.fileExtension.isEmpty {
+            Text(item.fileExtension.uppercased())
+          }
+          if !item.formattedDuration.isEmpty {
+            Text(item.formattedDuration)
+          }
+        }
+        .font(.caption2.weight(.medium))
+        .foregroundStyle(.secondary)
+        .frame(width: cardWidth, alignment: .leading)
       }
     }
     .buttonStyle(.plain)
   }
 }
+
+private struct HomeLandscapeArtwork: View {
+  let item: CloudItem
+  let width: CGFloat
+  let progress: Double?
+
+  var body: some View {
+    ZStack(alignment: .bottom) {
+      VideoArtwork(item: item)
+
+      LinearGradient(
+        colors: [.clear, .black.opacity(0.34)],
+        startPoint: .center,
+        endPoint: .bottom
+      )
+      .allowsHitTesting(false)
+
+      HStack {
+        if !item.fileExtension.isEmpty {
+          Text(item.fileExtension.uppercased())
+            .font(.system(size: 9, weight: .bold, design: .rounded))
+            .foregroundStyle(.white.opacity(0.95))
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(.black.opacity(0.56), in: Capsule())
+        }
+        Spacer(minLength: 5)
+        if !item.formattedDuration.isEmpty {
+          Text(item.formattedDuration)
+            .font(.caption2.monospacedDigit().weight(.semibold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(.black.opacity(0.66), in: Capsule())
+        }
+      }
+      .padding(6)
+
+      if let progress, progress > 0.002 {
+        GeometryReader { proxy in
+          VStack(spacing: 0) {
+            Spacer()
+            ZStack(alignment: .leading) {
+              Rectangle().fill(.white.opacity(0.22))
+              Rectangle()
+                .fill(CinevaTheme.accent)
+                .frame(width: max(2, proxy.size.width * progress))
+            }
+            .frame(height: 3)
+          }
+        }
+      }
+    }
+    .frame(width: width)
+    .aspectRatio(16 / 9, contentMode: .fit)
+    .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+    .overlay {
+      RoundedRectangle(cornerRadius: 13, style: .continuous)
+        .stroke(.primary.opacity(0.08), lineWidth: 0.6)
+    }
+    .shadow(color: .black.opacity(0.13), radius: 7, y: 3)
+  }
+}
+

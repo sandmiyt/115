@@ -49,6 +49,15 @@ struct PlayerScreen: View {
           .transition(.opacity)
         }
 
+        if model?.isBuffering == true {
+          ProgressView()
+            .controlSize(.large)
+            .tint(.white)
+            .padding(16)
+            .background(.black.opacity(0.38), in: Circle())
+            .allowsHitTesting(false)
+        }
+
         if let gestureHUD {
           Text(gestureHUD)
             .font(.subheadline.monospacedDigit().weight(.semibold))
@@ -132,8 +141,7 @@ struct PlayerScreen: View {
         .frame(width: proxy.size.width * 0.34)
       gestureSurface(isLeft: false, proxy: proxy)
     }
-    .padding(.top, max(proxy.safeAreaInsets.top + 64, 82))
-    .padding(.bottom, max(proxy.safeAreaInsets.bottom + 116, 140))
+    .ignoresSafeArea()
     .allowsHitTesting(!isLocked)
   }
 
@@ -202,7 +210,9 @@ struct PlayerScreen: View {
   }
 
   private func topOverlay(proxy: GeometryProxy) -> some View {
-    HStack(spacing: 10) {
+    let landscape = proxy.size.width > proxy.size.height
+
+    return HStack(spacing: landscape ? 9 : 8) {
       playerIconButton("xmark") {
         model?.pause()
         dismiss()
@@ -210,32 +220,24 @@ struct PlayerScreen: View {
 
       VStack(alignment: .leading, spacing: 2) {
         Text(currentItem.name)
-          .font(.subheadline.weight(.semibold))
+          .font(landscape ? .subheadline.weight(.semibold) : .caption.weight(.semibold))
           .foregroundStyle(.white)
           .lineLimit(1)
-        if proxy.size.width > 620, playlist.count > 1 {
-          Text("第 \(max(currentIndex + 1, 1)) / \(playlist.count) 个视频")
+        if landscape, playlist.count > 1 {
+          Text("\(max(currentIndex + 1, 1)) / \(playlist.count)")
             .font(.caption2)
             .foregroundStyle(.white.opacity(0.56))
         }
       }
+      .layoutPriority(1)
 
       Spacer(minLength: 4)
 
-      if let model {
-        qualityMenu(model: model, compact: proxy.size.width < 520)
+      if landscape, let model {
+        qualityMenu(model: model, compact: false)
       }
 
-      if proxy.size.width > 520 {
-        playerIconButton(videoLayout == .fit ? "arrow.up.left.and.arrow.down.right" : "rectangle.inset.filled") {
-          videoLayout = videoLayout == .fit ? .fill : .fit
-          showGestureHUD(videoLayout.title)
-        }
-
-        playerIconButton("rectangle.landscape.rotate") {
-          PlayerOrientation.toggle()
-        }
-
+      if landscape {
         playerIconButton("lock.fill") {
           isLocked = true
           controlsVisible = false
@@ -243,8 +245,71 @@ struct PlayerScreen: View {
         }
       }
 
-      Menu {
-        Button(videoLayout.title, systemImage: "rectangle.arrowtriangle.2.outward") {
+      playerMoreMenu(model: model, landscape: landscape)
+    }
+    .padding(.leading, max(proxy.safeAreaInsets.leading, 12))
+    .padding(.trailing, max(proxy.safeAreaInsets.trailing, 12))
+    .padding(.top, max(proxy.safeAreaInsets.top, 8) + 4)
+    .padding(.bottom, landscape ? 18 : 12)
+    .background(
+      LinearGradient(
+        colors: [.black.opacity(0.78), .clear],
+        startPoint: .top,
+        endPoint: .bottom
+      )
+    )
+  }
+
+  private func playerMoreMenu(model: PlayerModel?, landscape: Bool) -> some View {
+    Menu {
+      if !landscape, let model {
+        Section("清晰度") {
+          ForEach(model.sources) { source in
+            Button {
+              Task {
+                useVLC = shouldUseVLC(source)
+                await model.select(source)
+                model.setPlaybackRate(playbackRate)
+                applyAutomaticOrientation(for: model.videoDisplaySize)
+              }
+            } label: {
+              if model.selectedSource?.id == source.id {
+                Label(source.title, systemImage: "checkmark")
+              } else {
+                Text(source.title)
+              }
+            }
+          }
+        }
+
+        Section("播放速度") {
+          ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { rate in
+            Button(formatRate(rate)) {
+              playbackRate = Float(rate)
+              model.setPlaybackRate(Float(rate))
+            }
+          }
+        }
+
+        if !model.audioOptions.isEmpty {
+          Section("音轨") {
+            Button("自动") { model.selectAudio(nil) }
+            ForEach(model.audioOptions) { option in
+              Button(option.title) { model.selectAudio(option.id) }
+            }
+          }
+        }
+
+        Section("字幕") {
+          Button("关闭字幕") { model.selectSubtitle(nil) }
+          ForEach(model.subtitleOptions) { option in
+            Button(option.title) { model.selectSubtitle(option.id) }
+          }
+        }
+      }
+
+      Section("画面") {
+        Button(videoLayout == .fit ? "铺满屏幕" : "适应屏幕", systemImage: "rectangle.arrowtriangle.2.outward") {
           videoLayout = videoLayout == .fit ? .fill : .fit
           showGestureHUD(videoLayout.title)
         }
@@ -256,24 +321,20 @@ struct PlayerScreen: View {
           controlsVisible = false
           showGestureHUD("控制已锁定")
         }
-        Divider()
-        Button("播放详情", systemImage: "info.circle") {
-          showInfo = true
-        }
-      } label: {
-        playerIcon("ellipsis")
       }
+
+      if previousItem != nil {
+        Button("上一个视频", systemImage: "backward.end.fill") { playPreviousIfAvailable() }
+      }
+      if nextItem != nil {
+        Button("下一个视频", systemImage: "forward.end.fill") { playNextIfAvailable() }
+      }
+
+      Divider()
+      Button("播放详情", systemImage: "info.circle") { showInfo = true }
+    } label: {
+      playerIcon("ellipsis")
     }
-    .padding(.horizontal, 14)
-    .padding(.top, max(proxy.safeAreaInsets.top, 10))
-    .padding(.bottom, 18)
-    .background(
-      LinearGradient(
-        colors: [.black.opacity(0.78), .clear],
-        startPoint: .top,
-        endPoint: .bottom
-      )
-    )
   }
 
   private func qualityMenu(model: PlayerModel, compact: Bool) -> some View {
@@ -310,75 +371,125 @@ struct PlayerScreen: View {
   }
 
   private func bottomOverlay(proxy: GeometryProxy) -> some View {
-    VStack(spacing: 12) {
+    let landscape = proxy.size.width > proxy.size.height
+
+    return VStack(spacing: landscape ? 11 : 9) {
       if model?.didFallbackFromOriginal == true {
         Label("原画不可播，已自动切换最高转码", systemImage: "arrow.triangle.2.circlepath")
           .font(.caption.weight(.medium))
           .foregroundStyle(.white.opacity(0.86))
-          .padding(.horizontal, 12)
-          .padding(.vertical, 7)
+          .padding(.horizontal, 11)
+          .padding(.vertical, 6)
           .background(.black.opacity(0.58), in: Capsule())
       }
 
       if let model {
         timeline(model: model)
-
-        HStack(spacing: proxy.size.width < 430 ? 12 : 18) {
-          controlCircle("backward.end.fill", enabled: previousItem != nil) {
-            playPreviousIfAvailable()
-          }
-          controlCircle("gobackward.\(appState.doubleTapSeekSeconds)") {
-            seekBy(-Double(appState.doubleTapSeekSeconds))
-          }
-          Button {
-            model.togglePlayback()
-            controlsVisible = true
-            scheduleControlsHide()
-          } label: {
-            Image(systemName: model.isPlaying ? "pause.fill" : "play.fill")
-              .font(.system(size: 23, weight: .bold))
-              .foregroundStyle(.black)
-              .frame(width: 56, height: 56)
-              .background(.white, in: Circle())
-          }
-          .buttonStyle(.plain)
-          controlCircle("goforward.\(appState.doubleTapSeekSeconds)") {
-            seekBy(Double(appState.doubleTapSeekSeconds))
-          }
-          controlCircle("forward.end.fill", enabled: nextItem != nil) {
-            playNextIfAvailable()
-          }
-        }
-
-        HStack(spacing: 8) {
-          speedMenu(model: model)
-          audioMenu(model: model)
-          subtitleMenu(model: model)
-
-          Spacer(minLength: 4)
-
-          Button {
-            appState.libraryStore.toggleFavorite(currentItem)
-          } label: {
-            playerPill(
-              systemName: appState.libraryStore.isFavorite(currentItem) ? "heart.fill" : "heart",
-              text: appState.libraryStore.isFavorite(currentItem) ? "已收藏" : "收藏"
-            )
-          }
-          .buttonStyle(.plain)
+        if landscape {
+          landscapePlaybackControls(model: model)
+        } else {
+          portraitPlaybackControls(model: model)
         }
       }
     }
-    .padding(.horizontal, 14)
-    .padding(.top, 34)
-    .padding(.bottom, max(proxy.safeAreaInsets.bottom, 10))
+    .padding(.leading, max(proxy.safeAreaInsets.leading, 14))
+    .padding(.trailing, max(proxy.safeAreaInsets.trailing, 14))
+    .padding(.top, landscape ? 28 : 18)
+    .padding(.bottom, max(proxy.safeAreaInsets.bottom, 10) + (landscape ? 2 : 6))
     .background(
       LinearGradient(
-        colors: [.clear, .black.opacity(0.84)],
+        colors: [.clear, .black.opacity(0.86)],
         startPoint: .top,
         endPoint: .bottom
       )
     )
+  }
+
+  private func portraitPlaybackControls(model: PlayerModel) -> some View {
+    HStack(spacing: 24) {
+      controlCircle("gobackward.\(appState.doubleTapSeekSeconds)") {
+        seekBy(-Double(appState.doubleTapSeekSeconds))
+      }
+
+      Button {
+        model.togglePlayback()
+        controlsVisible = true
+        scheduleControlsHide()
+      } label: {
+        Image(systemName: model.isPlaying ? "pause.fill" : "play.fill")
+          .font(.system(size: 21, weight: .bold))
+          .foregroundStyle(.black)
+          .frame(width: 54, height: 54)
+          .background(.white, in: Circle())
+      }
+      .buttonStyle(.plain)
+
+      controlCircle("goforward.\(appState.doubleTapSeekSeconds)") {
+        seekBy(Double(appState.doubleTapSeekSeconds))
+      }
+    }
+  }
+
+  private func landscapePlaybackControls(model: PlayerModel) -> some View {
+    VStack(spacing: 10) {
+      HStack(spacing: 18) {
+        controlCircle("backward.end.fill", enabled: previousItem != nil) {
+          playPreviousIfAvailable()
+        }
+        controlCircle("gobackward.\(appState.doubleTapSeekSeconds)") {
+          seekBy(-Double(appState.doubleTapSeekSeconds))
+        }
+
+        Button {
+          model.togglePlayback()
+          controlsVisible = true
+          scheduleControlsHide()
+        } label: {
+          Image(systemName: model.isPlaying ? "pause.fill" : "play.fill")
+            .font(.system(size: 22, weight: .bold))
+            .foregroundStyle(.black)
+            .frame(width: 56, height: 56)
+            .background(.white, in: Circle())
+        }
+        .buttonStyle(.plain)
+
+        controlCircle("goforward.\(appState.doubleTapSeekSeconds)") {
+          seekBy(Double(appState.doubleTapSeekSeconds))
+        }
+        controlCircle("forward.end.fill", enabled: nextItem != nil) {
+          playNextIfAvailable()
+        }
+      }
+
+      HStack(spacing: 8) {
+        speedMenu(model: model)
+        audioMenu(model: model)
+        subtitleMenu(model: model)
+
+        Button {
+          videoLayout = videoLayout == .fit ? .fill : .fit
+          showGestureHUD(videoLayout.title)
+        } label: {
+          playerPill(
+            systemName: videoLayout == .fit ? "arrow.up.left.and.arrow.down.right" : "rectangle.inset.filled",
+            text: videoLayout.title
+          )
+        }
+        .buttonStyle(.plain)
+
+        Spacer(minLength: 4)
+
+        Button {
+          appState.libraryStore.toggleFavorite(currentItem)
+        } label: {
+          playerPill(
+            systemName: appState.libraryStore.isFavorite(currentItem) ? "heart.fill" : "heart",
+            text: appState.libraryStore.isFavorite(currentItem) ? "已收藏" : "收藏"
+          )
+        }
+        .buttonStyle(.plain)
+      }
+    }
   }
 
   private func timeline(model: PlayerModel) -> some View {
@@ -527,7 +638,10 @@ struct PlayerScreen: View {
 
   @MainActor
   private func prepareCurrentItem() async {
+    controlsTask?.cancel()
+    PlayerOrientation.request(.portrait)
     model?.pause()
+
     let newModel = PlayerModel(
       item: currentItem,
       api: appState.api,
@@ -537,13 +651,26 @@ struct PlayerScreen: View {
     model = newModel
     newModel.setPlaybackRate(playbackRate)
     await newModel.prepareAndPlay()
+
     if let selected = newModel.selectedSource {
       useVLC = shouldUseVLC(selected)
     } else {
       useVLC = false
     }
+
+    applyAutomaticOrientation(for: newModel.videoDisplaySize)
     controlsVisible = true
     scheduleControlsHide()
+  }
+
+  @MainActor
+  private func applyAutomaticOrientation(for size: CGSize?) {
+    guard let size, size.width > 0, size.height > 0 else {
+      PlayerOrientation.request(.portrait)
+      return
+    }
+    let ratio = size.width / max(size.height, 1)
+    PlayerOrientation.request(ratio > 1.12 ? .landscape : .portrait)
   }
 
   @MainActor
@@ -626,7 +753,7 @@ struct PlayerScreen: View {
     controlsTask?.cancel()
     guard model?.isPlaying == true, !isLocked, !isScrubbing else { return }
     controlsTask = Task { @MainActor in
-      try? await Task.sleep(for: .seconds(3.4))
+      try? await Task.sleep(for: .seconds(1.0))
       guard !Task.isCancelled else { return }
       withAnimation(.easeIn(duration: 0.22)) {
         controlsVisible = false
