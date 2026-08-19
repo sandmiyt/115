@@ -29,69 +29,21 @@ private struct AppLockView: View {
   @State private var isAuthenticating = false
 
   var body: some View {
-    ZStack {
-      LinearGradient(
-        colors: [CinevaTheme.darkBackground, .black],
-        startPoint: .topLeading,
-        endPoint: .bottomTrailing
-      )
+    Color.black
       .ignoresSafeArea()
-
-      VStack(spacing: 24) {
-        Spacer()
-        CinevaLogoMark(size: 104)
-
-        VStack(spacing: 7) {
-          Text("Cineva")
-            .font(.system(size: 38, weight: .bold, design: .rounded))
-            .foregroundStyle(.white)
-          Text("私人影音库已锁定")
-            .font(.subheadline)
-            .foregroundStyle(.white.opacity(0.58))
-        }
-
-        Button {
-          guard !isAuthenticating else { return }
-          isAuthenticating = true
-          Task {
-            await appState.authenticateIfNeeded()
-            isAuthenticating = false
-          }
-        } label: {
-          HStack(spacing: 10) {
-            if isAuthenticating {
-              ProgressView().tint(.white)
-            } else {
-              Image(systemName: "faceid")
-            }
-            Text("使用\(appState.biometricTitle)解锁")
-              .fontWeight(.semibold)
-          }
-          .frame(maxWidth: .infinity)
-          .frame(height: 52)
-          .background(CinevaTheme.brandGradient, in: RoundedRectangle(cornerRadius: 17, style: .continuous))
-          .foregroundStyle(.white)
-        }
-        .padding(.horizontal, 34)
-
-        if let message = appState.biometricErrorMessage {
-          Text(message)
-            .font(.footnote)
-            .multilineTextAlignment(.center)
-            .foregroundStyle(.white.opacity(0.60))
-            .padding(.horizontal, 36)
-        }
-
-        Spacer()
-        Label("本机生物识别保护", systemImage: "lock.shield")
-          .font(.caption)
-          .foregroundStyle(.white.opacity(0.34))
-          .padding(.bottom, 22)
+      .contentShape(Rectangle())
+      .onTapGesture {
+        authenticate()
       }
-    }
-    .task {
-      guard !isAuthenticating else { return }
-      isAuthenticating = true
+      .task {
+        authenticate()
+      }
+  }
+
+  private func authenticate() {
+    guard !isAuthenticating else { return }
+    isAuthenticating = true
+    Task {
       await appState.authenticateIfNeeded()
       isAuthenticating = false
     }
@@ -147,7 +99,7 @@ private struct HomeView: View {
         if !appState.libraryStore.recents.isEmpty {
           mediaSection(title: "继续观看", subtitle: "从上次的位置继续") {
             ScrollView(.horizontal) {
-              LazyHStack(spacing: 14) {
+              LazyHStack(spacing: 11) {
                 ForEach(appState.libraryStore.recents.prefix(12)) { entry in
                   ContinueWatchingCard(entry: entry) {
                     selectedVideo = entry.item
@@ -165,7 +117,7 @@ private struct HomeView: View {
         if !appState.libraryStore.favorites.isEmpty {
           mediaSection(title: "我的收藏", subtitle: "随时回到喜欢的内容") {
             ScrollView(.horizontal) {
-              LazyHStack(spacing: 14) {
+              LazyHStack(spacing: 11) {
                 ForEach(appState.libraryStore.favorites.prefix(12)) { item in
                   CompactPosterCard(item: item) {
                     selectedVideo = item
@@ -178,7 +130,6 @@ private struct HomeView: View {
           }
         }
 
-        playbackSummary
       }
       .padding(.horizontal, 16)
       .padding(.top, 8)
@@ -240,39 +191,6 @@ private struct HomeView: View {
         }
       }
     }
-  }
-
-  private var playbackSummary: some View {
-    VStack(alignment: .leading, spacing: 12) {
-      Text("播放能力")
-        .font(.title3.bold())
-
-      HStack(spacing: 0) {
-        summaryCell(icon: "4k.tv", title: "原画 / 4K", subtitle: "自动转码")
-        Divider().frame(height: 48)
-        summaryCell(icon: "captions.bubble", title: "字幕 / 音轨", subtitle: "内嵌切换")
-        Divider().frame(height: 48)
-        summaryCell(icon: "hand.tap", title: "手势控制", subtitle: "亮度 · 音量")
-      }
-      .padding(.vertical, 13)
-      .background(panelBackground, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-    }
-  }
-
-  private func summaryCell(icon: String, title: String, subtitle: String) -> some View {
-    VStack(spacing: 5) {
-      Image(systemName: icon)
-        .font(.headline)
-        .foregroundStyle(CinevaTheme.accent)
-      Text(title)
-        .font(.caption.weight(.semibold))
-        .lineLimit(1)
-      Text(subtitle)
-        .font(.caption2)
-        .foregroundStyle(.secondary)
-        .lineLimit(1)
-    }
-    .frame(maxWidth: .infinity)
   }
 
   private var pageBackground: Color {
@@ -363,14 +281,19 @@ private struct ContinueWatchingCard: View {
             }
           }
         }
-        .frame(width: 214)
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .frame(width: 146)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+          RoundedRectangle(cornerRadius: 12, style: .continuous)
+            .stroke(.primary.opacity(0.08), lineWidth: 0.6)
+        }
+        .shadow(color: .black.opacity(0.10), radius: 4, y: 2)
 
         Text(entry.item.name)
           .font(.subheadline.weight(.semibold))
           .foregroundStyle(.primary)
           .lineLimit(1)
-          .frame(width: 214, alignment: .leading)
+          .frame(width: 146, alignment: .leading)
         Text("继续 · \(formatTime(entry.lastPosition))")
           .font(.caption)
           .foregroundStyle(.secondary)
@@ -396,13 +319,18 @@ private struct CompactPosterCard: View {
     Button(action: action) {
       VStack(alignment: .leading, spacing: 8) {
         VideoArtwork(item: item)
-          .frame(width: 184)
-          .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+          .frame(width: 136)
+          .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+          .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+              .stroke(.primary.opacity(0.08), lineWidth: 0.6)
+          }
+          .shadow(color: .black.opacity(0.10), radius: 4, y: 2)
         Text(item.name)
           .font(.subheadline.weight(.semibold))
           .foregroundStyle(.primary)
           .lineLimit(1)
-          .frame(width: 184, alignment: .leading)
+          .frame(width: 136, alignment: .leading)
       }
     }
     .buttonStyle(.plain)

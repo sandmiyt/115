@@ -138,8 +138,13 @@ final class AppState {
 
   init() {
     let defaults = UserDefaults.standard
-    let storedColumns = defaults.object(forKey: Keys.gridColumns) as? Int ?? 2
-    gridColumns = min(max(storedColumns, 2), 4)
+    let storedColumns = defaults.object(forKey: Keys.gridColumns) as? Int ?? 3
+    if defaults.bool(forKey: Keys.compactArtworkMigration) == false {
+      gridColumns = storedColumns == 2 ? 3 : min(max(storedColumns, 2), 4)
+      defaults.set(true, forKey: Keys.compactArtworkMigration)
+    } else {
+      gridColumns = min(max(storedColumns, 2), 4)
+    }
     artworkMode =
       ArtworkMode(rawValue: defaults.string(forKey: Keys.artworkMode) ?? "") ?? .fit
     browserLayout =
@@ -261,6 +266,7 @@ final class AppState {
     static let gridColumns = "gallery115.gridColumns"
     static let artworkMode = "gallery115.artworkMode"
     static let browserLayout = "gallery115.browserLayout"
+    static let compactArtworkMigration = "cineva.compactArtworkMigration.v1"
     static let defaultQuality = "gallery115.defaultQuality"
     static let colorScheme = "gallery115.colorScheme"
     static let rootFolderID = "gallery115.rootFolderID"

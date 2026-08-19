@@ -98,7 +98,7 @@ struct FolderView: View {
     switch appState.browserLayout {
     case .grid:
       ScrollView {
-        LazyVGrid(columns: columns, spacing: 18) {
+        LazyVGrid(columns: columns, spacing: 11) {
           ForEach(filteredItems) { item in
             if item.isDirectory {
               NavigationLink(value: item) {
@@ -112,7 +112,7 @@ struct FolderView: View {
             }
           }
         }
-        .padding(.horizontal, 14)
+        .padding(.horizontal, 10)
         .padding(.top, 10)
         .padding(.bottom, 30)
       }
@@ -159,7 +159,7 @@ struct FolderView: View {
 
   private var columns: [GridItem] {
     Array(
-      repeating: GridItem(.flexible(), spacing: 11, alignment: .top),
+      repeating: GridItem(.flexible(), spacing: 9, alignment: .top),
       count: appState.gridColumns
     )
   }
@@ -213,7 +213,7 @@ private struct FolderCard: View {
           .padding(14)
       }
       .aspectRatio(16 / 9, contentMode: .fit)
-      .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+      .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
 
       Text(item.name)
         .font(.subheadline.weight(.semibold))
@@ -280,8 +280,8 @@ private struct VideoListRow: View {
           }
         }
       }
-      .frame(width: 112, height: 63)
-      .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+      .frame(width: 82, height: 48)
+      .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
 
       VStack(alignment: .leading, spacing: 5) {
         Text(item.name)

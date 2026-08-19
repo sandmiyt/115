@@ -7,7 +7,7 @@ struct VideoCard: View {
 
   var body: some View {
     Button(action: onOpen) {
-      VStack(alignment: .leading, spacing: 8) {
+      VStack(alignment: .leading, spacing: 5) {
         ZStack(alignment: .bottom) {
           VideoArtwork(item: item)
 
@@ -57,14 +57,14 @@ struct VideoCard: View {
             .allowsHitTesting(false)
           }
         }
-        .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay {
-          RoundedRectangle(cornerRadius: 13, style: .continuous)
-            .stroke(.primary.opacity(0.06), lineWidth: 0.5)
+          RoundedRectangle(cornerRadius: 12, style: .continuous)
+            .stroke(.primary.opacity(0.08), lineWidth: 0.6)
         }
 
         Text(item.name)
-          .font(.subheadline.weight(.semibold))
+          .font(.caption.weight(.semibold))
           .foregroundStyle(.primary)
           .lineLimit(2)
           .multilineTextAlignment(.leading)
@@ -153,7 +153,7 @@ struct VideoArtwork: View {
       }
     }
     .frame(maxWidth: .infinity)
-    .aspectRatio(16.0 / 9.0, contentMode: .fit)
+    .aspectRatio(1.60, contentMode: .fit)
     .clipped()
     .task(id: item.id) {
       if item.thumbnailURL == nil, generatedImage == nil {
