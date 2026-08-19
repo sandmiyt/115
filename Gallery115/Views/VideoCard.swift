@@ -115,46 +115,54 @@ struct VideoArtwork: View {
   @State private var serverThumbnailFailed = false
 
   var body: some View {
-    ZStack {
-      artworkBackground
+    GeometryReader { proxy in
+      ZStack {
+        artworkBackground
+          .frame(width: proxy.size.width, height: proxy.size.height)
 
-      if let generatedImage {
-        artwork(Image(uiImage: generatedImage))
-      } else if let url = item.thumbnailURL, !serverThumbnailFailed {
-        AsyncImage(
-          url: url,
-          transaction: Transaction(animation: .easeInOut(duration: 0.16))
-        ) { phase in
-          switch phase {
-          case .success(let image):
-            artwork(image)
-          case .failure:
-            placeholder
-              .onAppear { serverThumbnailFailed = true }
-          case .empty:
-            ZStack {
+        if let generatedImage {
+          artwork(Image(uiImage: generatedImage), in: proxy.size)
+        } else if let url = item.thumbnailURL, !serverThumbnailFailed {
+          AsyncImage(
+            url: url,
+            transaction: Transaction(animation: .easeInOut(duration: 0.16))
+          ) { phase in
+            switch phase {
+            case .success(let image):
+              artwork(image, in: proxy.size)
+            case .failure:
               placeholder
-              ProgressView().controlSize(.small)
+                .frame(width: proxy.size.width, height: proxy.size.height)
+                .onAppear { serverThumbnailFailed = true }
+            case .empty:
+              ZStack {
+                placeholder
+                ProgressView().controlSize(.small)
+              }
+              .frame(width: proxy.size.width, height: proxy.size.height)
+            @unknown default:
+              placeholder
+                .frame(width: proxy.size.width, height: proxy.size.height)
             }
-          @unknown default:
-            placeholder
           }
+          .frame(width: proxy.size.width, height: proxy.size.height)
+        } else {
+          placeholder
+            .frame(width: proxy.size.width, height: proxy.size.height)
+            .task {
+              if generatedImage == nil {
+                generatedImage = await appState.thumbnailService.generatedThumbnail(
+                  for: item,
+                  api: appState.api
+                )
+              }
+            }
         }
-      } else {
-        placeholder
-          .task {
-            if generatedImage == nil {
-              generatedImage = await appState.thumbnailService.generatedThumbnail(
-                for: item,
-                api: appState.api
-              )
-            }
-          }
       }
+      .frame(width: proxy.size.width, height: proxy.size.height)
+      .clipped()
     }
-    .frame(maxWidth: .infinity)
     .aspectRatio(16 / 9, contentMode: .fit)
-    .clipped()
     .task(id: item.id) {
       if item.thumbnailURL == nil, generatedImage == nil {
         generatedImage = await appState.thumbnailService.generatedThumbnail(
@@ -166,26 +174,37 @@ struct VideoArtwork: View {
   }
 
   @ViewBuilder
-  private func artwork(_ image: Image) -> some View {
+  private func artwork(_ image: Image, in size: CGSize) -> some View {
     switch appState.artworkMode {
     case .fit:
       ZStack {
+        // Fill the full 16:9 card with a soft background, but never crop
+        // the actual thumbnail. This keeps ultrawide / landscape frames
+        // centered and guarantees the complete card remains visible.
         image
           .resizable()
           .scaledToFill()
-          .blur(radius: 18)
-          .opacity(0.38)
+          .frame(width: size.width, height: size.height)
           .clipped()
+          .blur(radius: 18)
+          .opacity(0.34)
+
+        Color.black.opacity(0.08)
+          .frame(width: size.width, height: size.height)
+
         image
           .resizable()
           .scaledToFit()
-          .frame(maxWidth: .infinity, maxHeight: .infinity)
+          .frame(width: size.width, height: size.height, alignment: .center)
       }
+      .frame(width: size.width, height: size.height)
+      .clipped()
+
     case .fill:
       image
         .resizable()
         .scaledToFill()
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(width: size.width, height: size.height, alignment: .center)
         .clipped()
     }
   }
