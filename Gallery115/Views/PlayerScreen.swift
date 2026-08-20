@@ -52,9 +52,6 @@ struct PlayerScreen: View {
   @State private var selectedExternalSubtitleID: String?
   @State private var externalSubtitleCues: [SubtitleCue] = []
   @State private var sidecarChapters: [PlayerChapter] = []
-  @State private var timelinePreviewImage: UIImage?
-  @State private var timelinePreviewBucket = -1
-  @State private var timelinePreviewTask: Task<Void, Never>?
   @State private var subtitleLoadTask: Task<Void, Never>?
   @State private var auxiliaryLoadTask: Task<Void, Never>?
 
@@ -102,7 +99,7 @@ struct PlayerScreen: View {
         } else {
           playerChrome(proxy: proxy)
             .simultaneousGesture(controlsInteractionGesture)
-            .opacity(chromeShouldBeVisible && !isDismissDragging ? 1 : 0)
+            .opacity(chromeShouldBeVisible ? interactiveDismissChromeOpacity : 0)
             .allowsHitTesting(chromeShouldBeVisible && !isDismissDragging && !showSettingsPanel && !showSpeedPanel && !showQueuePanel)
             .accessibilityHidden(!chromeShouldBeVisible || isDismissDragging)
         }
@@ -315,7 +312,6 @@ struct PlayerScreen: View {
     hudTask?.cancel()
     favoriteHUDTask?.cancel()
     controlsTask?.cancel()
-    timelinePreviewTask?.cancel()
     subtitleLoadTask?.cancel()
     auxiliaryLoadTask?.cancel()
     dismissRestoreTask?.cancel()
@@ -382,20 +378,27 @@ struct PlayerScreen: View {
 
   private var interactiveDismissProgress: CGFloat {
     let distance = hypot(dismissDragOffset.width, dismissDragOffset.height)
-    return min(max(distance / 240.0, 0), 1)
+    return min(max(distance / 260.0, 0), 1)
   }
 
   private var interactiveDismissMediaScale: CGFloat {
-    1.0 - interactiveDismissProgress * 0.18
+    // Photos-like movement stays visually grounded: the media follows the
+    // finger almost 1:1 and only shrinks subtly as the library is revealed.
+    1.0 - interactiveDismissProgress * 0.10
   }
 
   private var interactiveDismissCornerRadius: CGFloat {
-    interactiveDismissProgress * 24.0
+    interactiveDismissProgress * 26.0
   }
 
   private var interactiveDismissBackdropOpacity: Double {
-    guard isDismissDragging else { return 1 }
-    return max(0.06, 1.0 - Double(interactiveDismissProgress) * 0.94)
+    // Derive directly from displacement even during the spring-back animation.
+    // This prevents the black backdrop from snapping back before the video does.
+    max(0.08, 1.0 - Double(interactiveDismissProgress) * 0.92)
+  }
+
+  private var interactiveDismissChromeOpacity: Double {
+    max(0, 1.0 - Double(interactiveDismissProgress) * 2.35)
   }
 
   private func interactionLayer(proxy: GeometryProxy) -> some View {
@@ -526,7 +529,7 @@ struct PlayerScreen: View {
     let availableWidth = max(proxy.size.width, 1)
     let isLandscape = availableWidth > availableHeight
 
-    return DragGesture(minimumDistance: 12)
+    return DragGesture(minimumDistance: 4)
       .onChanged { value in
         guard appState.playerGesturesEnabled, !isPinchInteracting else { return }
         guard ProcessInfo.processInfo.systemUptime >= singleFingerGestureSuppressedUntil else { return }
@@ -647,54 +650,73 @@ struct PlayerScreen: View {
       controlsTask?.cancel()
       hudTask?.cancel()
       gestureHUD = nil
-      withAnimation(.easeOut(duration: 0.10)) {
-        controlsVisible = false
-      }
     }
 
-    // Keep downward/sideways movement exactly under the finger. Upward travel
-    // has a light rubber-band resistance because upward motion is not a dismiss
-    // direction, but it still feels free rather than being hard-clamped.
-    let y = value.translation.height >= 0
-      ? value.translation.height
-      : value.translation.height * 0.32
-    dismissDragOffset = CGSize(width: value.translation.width, height: y)
+    // True two-dimensional Photos-style drag: no directional lock and no
+    // upward resistance. The current video stays directly under the finger in
+    // every direction; distance only changes scale/backdrop/chrome progress.
+    dismissDragOffset = value.translation
   }
 
   @MainActor
   private func finishPortraitDismissDrag(_ value: DragGesture.Value, viewport: CGSize) {
     guard isDismissDragging else { return }
 
+    let width = max(viewport.width, 1)
     let height = max(viewport.height, 1)
-    let dismissDistance = min(max(height * 0.18, 120), 170)
-    let movedDown = value.translation.height > dismissDistance
-    let flickedDown = value.translation.height > 36
-      && value.predictedEndTranslation.height > dismissDistance * 1.35
+    let diagonal = hypot(width, height)
+    let actualDistance = hypot(value.translation.width, value.translation.height)
+    let projectedDistance = hypot(value.predictedEndTranslation.width, value.predictedEndTranslation.height)
+    let dismissDistance = min(max(min(width, height) * 0.28, 92), 138)
+    let projectedThreshold = dismissDistance * 1.55
+    let shouldDismiss = actualDistance >= dismissDistance || projectedDistance >= projectedThreshold
 
-    if movedDown || flickedDown {
+    if shouldDismiss {
       dismissRestoreTask?.cancel()
       UIImpactFeedbackGenerator(style: .soft).impactOccurred()
-      // Keep the interactive transform intact until the presentation controller
-      // takes over. The underlying FolderView was never rebuilt, so dismissal
-      // returns to exactly the library position the user came from.
-      dismiss()
+
+      // Continue in the user's own two-dimensional escape direction instead
+      // of snapping to a fixed edge. Predicted translation captures a quick
+      // flick; the fallback uses the actual drag vector for slow releases.
+      let vector = projectedDistance > actualDistance
+        ? value.predictedEndTranslation
+        : value.translation
+      let magnitude = max(hypot(vector.width, vector.height), 1)
+      let escapeDistance = diagonal * 0.78
+      let target = CGSize(
+        width: vector.width / magnitude * escapeDistance,
+        height: vector.height / magnitude * escapeDistance
+      )
+
+      withAnimation(.spring(response: 0.26, dampingFraction: 0.92, blendDuration: 0.06)) {
+        dismissDragOffset = target
+      }
+
+      dismissRestoreTask = Task { @MainActor in
+        try? await Task.sleep(for: .milliseconds(105))
+        guard !Task.isCancelled else { return }
+        dismiss()
+      }
       return
     }
 
-    isDismissDragging = false
-    withAnimation(.spring(response: 0.38, dampingFraction: 0.84, blendDuration: 0.10)) {
+    // Keep the interaction state alive during the return spring so the video,
+    // corner radius, chrome and backdrop all travel home on the same curve.
+    withAnimation(.spring(response: 0.34, dampingFraction: 0.88, blendDuration: 0.08)) {
       dismissDragOffset = .zero
     }
 
     let shouldRestoreControls = dismissControlsWereVisible
     dismissRestoreTask?.cancel()
     dismissRestoreTask = Task { @MainActor in
-      try? await Task.sleep(for: .milliseconds(120))
-      guard !Task.isCancelled, !isDismissDragging else { return }
+      try? await Task.sleep(for: .milliseconds(300))
+      guard !Task.isCancelled else { return }
+      isDismissDragging = false
       if shouldRestoreControls {
-        showControls(animated: true)
-      } else {
+        controlsVisible = true
         scheduleControlsHide()
+      } else {
+        controlsVisible = false
       }
     }
   }
@@ -1598,27 +1620,27 @@ struct PlayerScreen: View {
         .frame(maxHeight: .infinity)
         .contentShape(Rectangle())
         .overlay(alignment: .top) {
-          if isScrubbing,
-            appState.timelinePreviewEnabled,
-            !useVLC,
-            let timelinePreviewImage
-          {
+          if isScrubbing, appState.timelinePreviewEnabled, !useVLC {
+            let previewWidth: CGFloat = 168
+            let clampedCenterX = min(max(playedX, previewWidth * 0.5), max(width - previewWidth * 0.5, previewWidth * 0.5))
+
             VStack(spacing: 5) {
-              Image(uiImage: timelinePreviewImage)
-                .resizable()
-                .scaledToFill()
-                .frame(width: 168, height: 94)
+              // Mirror the exact frame currently presented by the main AVPlayer
+              // layer. Unlike AVAssetImageGenerator this cannot drift to a
+              // neighboring timestamp and it creates zero extra Range requests.
+              SystemPlayerScrubPreviewView(presentationController: systemPresentationController)
+                .frame(width: previewWidth, height: 94)
                 .clipped()
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
               Text(formatTime(scrubValue))
                 .font(.caption2.monospacedDigit().weight(.semibold))
                 .foregroundStyle(.white.opacity(0.86))
             }
             .padding(6)
             .background(.black.opacity(0.78), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
-            .offset(y: -118)
+            .offset(x: clampedCenterX - width * 0.5, y: -118)
             .allowsHitTesting(false)
-            .transition(.opacity)
           }
         }
         .gesture(
@@ -1644,7 +1666,6 @@ struct PlayerScreen: View {
               } else {
                 model.interactiveScrub(to: scrubValue)
               }
-              requestTimelinePreview(at: scrubValue)
             }
             .onEnded { value in
               let x = min(max(value.location.x, 0), width)
@@ -1656,9 +1677,6 @@ struct PlayerScreen: View {
               }
               scrubWasPlaying = false
               isScrubbing = false
-              timelinePreviewTask?.cancel()
-              timelinePreviewImage = nil
-              timelinePreviewBucket = -1
               updateRemotePlaybackInfo()
               scheduleControlsHide()
             }
@@ -1790,11 +1808,8 @@ struct PlayerScreen: View {
   @MainActor
   private func prepareCurrentItem() async {
     controlsTask?.cancel()
-    timelinePreviewTask?.cancel()
     subtitleLoadTask?.cancel()
     auxiliaryLoadTask?.cancel()
-    timelinePreviewImage = nil
-    timelinePreviewBucket = -1
     externalSubtitleTracks = []
     selectedExternalSubtitleID = nil
     externalSubtitleCues = []
@@ -2182,31 +2197,6 @@ struct PlayerScreen: View {
   private func chapterMatches(_ chapter: PlayerChapter, keywords: [String]) -> Bool {
     let value = " \(chapter.title.lowercased()) "
     return keywords.contains { value.contains($0) }
-  }
-
-  @MainActor
-  private func requestTimelinePreview(at seconds: Double) {
-    guard appState.timelinePreviewEnabled, !useVLC, let model else { return }
-    let bucket = max(0, Int((seconds / 5).rounded(.down)) * 5)
-    guard bucket != timelinePreviewBucket else { return }
-    timelinePreviewBucket = bucket
-    timelinePreviewImage = nil
-    timelinePreviewTask?.cancel()
-    let expectedID = currentItem.id
-
-    timelinePreviewTask = Task { @MainActor in
-      // Don't let AVAssetImageGenerator compete with rapid live seek traffic.
-      // A short settle delay means quick swipes prioritize the real video frame;
-      // the floating thumbnail appears only when the finger lingers briefly.
-      try? await Task.sleep(for: .milliseconds(120))
-      guard !Task.isCancelled else { return }
-      let image = await model.timelinePreview(at: seconds)
-      guard !Task.isCancelled,
-        currentItem.id == expectedID,
-        timelinePreviewBucket == bucket
-      else { return }
-      timelinePreviewImage = image
-    }
   }
 
   @MainActor

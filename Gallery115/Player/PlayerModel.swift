@@ -203,6 +203,8 @@ final class PlayerModel: PlaybackEngineControlling {
   private var scrubChaseTime: CMTime = .invalid
   private var scrubFinalTarget: CMTime?
   private var scrubResumeAfterFinish = false
+  private var scrubLiveToleranceSeconds: Double = 0.10
+  private var scrubGeneration = 0
 
   init(
     item: CloudItem, api: APIClient, libraryStore: LibraryStore,
@@ -331,6 +333,11 @@ final class PlayerModel: PlaybackEngineControlling {
     isBuffering = false
     scrubFinalTarget = nil
     scrubResumeAfterFinish = false
+    scrubLiveToleranceSeconds = 0.08
+    scrubGeneration &+= 1
+    player.currentItem?.cancelPendingSeeks()
+    scrubSeekInProgress = false
+    scrubChaseTime = .invalid
     return shouldResume
   }
 
@@ -342,6 +349,27 @@ final class PlayerModel: PlaybackEngineControlling {
   func interactiveScrub(to seconds: Double) {
     let target = clampedSeekTarget(seconds)
     currentTime = target
+
+    // Adapt tolerance to finger speed in timeline-space. Large jumps should
+    // land on a nearby decodable frame immediately; fine movements tighten the
+    // tolerance so slow scrubbing still feels precise. The release pass below
+    // always performs a near-frame-accurate commit.
+    if scrubChaseTime.isValid {
+      let previous = scrubChaseTime.seconds
+      if previous.isFinite {
+        let delta = abs(target - previous)
+        switch delta {
+        case 12...: scrubLiveToleranceSeconds = 0.42
+        case 4..<12: scrubLiveToleranceSeconds = 0.24
+        case 1..<4: scrubLiveToleranceSeconds = 0.12
+        case 0.25..<1: scrubLiveToleranceSeconds = 0.065
+        default: scrubLiveToleranceSeconds = 0.035
+        }
+      }
+    } else {
+      scrubLiveToleranceSeconds = 0.08
+    }
+
     scrubChaseTime = CMTime(seconds: target, preferredTimescale: 600)
     scrubFinalTarget = nil
     if !scrubSeekInProgress { performInteractiveScrubSeek() }
@@ -371,8 +399,9 @@ final class PlayerModel: PlaybackEngineControlling {
     }
 
     let target = scrubChaseTime
+    let generation = scrubGeneration
     let isFinalPass = scrubFinalTarget.map { CMTimeCompare($0, target) == 0 } ?? false
-    let toleranceSeconds = isFinalPass ? (1.0 / 60.0) : 0.12
+    let toleranceSeconds = isFinalPass ? (1.0 / 120.0) : scrubLiveToleranceSeconds
     let tolerance = CMTime(seconds: toleranceSeconds, preferredTimescale: 600)
     scrubSeekInProgress = true
 
@@ -382,7 +411,7 @@ final class PlayerModel: PlaybackEngineControlling {
       toleranceAfter: tolerance
     ) { [weak self] _ in
       Task { @MainActor in
-        guard let self else { return }
+        guard let self, self.scrubGeneration == generation else { return }
 
         // The finger moved while this seek was decoding. Skip all stale targets
         // and immediately chase the newest one.
