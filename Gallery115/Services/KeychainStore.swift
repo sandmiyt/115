@@ -4,12 +4,37 @@ import Security
 struct Cloud115Session: Codable, Equatable, Sendable {
   let accessToken: String
   let refreshToken: String
+  let accessTokenExpiresAt: Date?
   let updatedAt: Date
 
-  init(accessToken: String, refreshToken: String, updatedAt: Date = Date()) {
+  init(
+    accessToken: String,
+    refreshToken: String,
+    expiresIn: TimeInterval? = nil,
+    accessTokenExpiresAt: Date? = nil,
+    updatedAt: Date = Date()
+  ) {
     self.accessToken = accessToken.trimmingCharacters(in: .whitespacesAndNewlines)
     self.refreshToken = refreshToken.trimmingCharacters(in: .whitespacesAndNewlines)
+    if let accessTokenExpiresAt {
+      self.accessTokenExpiresAt = accessTokenExpiresAt
+    } else if let expiresIn, expiresIn > 0 {
+      self.accessTokenExpiresAt = updatedAt.addingTimeInterval(expiresIn)
+    } else {
+      self.accessTokenExpiresAt = nil
+    }
     self.updatedAt = updatedAt
+  }
+
+  /// 115 Open access tokens are currently refreshed on roughly a two-hour cadence.
+  /// Prefer the server-provided expires_in value; old sessions without it use a
+  /// conservative fallback so Cineva refreshes before playback hits a 401.
+  func needsAccessTokenRefresh(now: Date = Date()) -> Bool {
+    guard !accessToken.isEmpty else { return true }
+    if let accessTokenExpiresAt {
+      return now >= accessTokenExpiresAt.addingTimeInterval(-5 * 60)
+    }
+    return now.timeIntervalSince(updatedAt) >= 105 * 60
   }
 }
 
@@ -37,8 +62,14 @@ final class Cloud115SessionStore: @unchecked Sendable {
     return !token.isEmpty
   }
 
-  func save(accessToken: String, refreshToken: String) {
-    save(Cloud115Session(accessToken: accessToken, refreshToken: refreshToken))
+  func save(accessToken: String, refreshToken: String, expiresIn: TimeInterval? = nil) {
+    save(
+      Cloud115Session(
+        accessToken: accessToken,
+        refreshToken: refreshToken,
+        expiresIn: expiresIn
+      )
+    )
   }
 
   func save(_ session: Cloud115Session) {
@@ -170,6 +201,66 @@ final class CredentialStore: @unchecked Sendable {
 
   func clear() {
     store.clear()
+  }
+}
+
+
+
+enum MediaSourceKind: String, Codable, Sendable {
+  case webDAV
+  case cloud115
+
+  var title: String {
+    switch self {
+    case .webDAV: return "OpenList / AList"
+    case .cloud115: return "115 网盘"
+    }
+  }
+
+  var systemImage: String {
+    switch self {
+    case .webDAV: return "externaldrive.connected.to.line.below"
+    case .cloud115: return "externaldrive.badge.icloud"
+    }
+  }
+}
+
+final class MediaSourceSelectionStore: @unchecked Sendable {
+  static let shared = MediaSourceSelectionStore()
+
+  private let key = "cineva.mediaSource.active.v1"
+  private init() {}
+
+  var activeSource: MediaSourceKind {
+    get {
+      if let raw = UserDefaults.standard.string(forKey: key),
+        let stored = MediaSourceKind(rawValue: raw)
+      {
+        return stored
+      }
+      if CredentialStore.shared.hasRefreshToken { return .cloud115 }
+      // New Cineva installs use 115 Open API as the only user-facing media source.
+      // WebDAV remains readable only as a legacy compatibility path.
+      return .cloud115
+    }
+    set {
+      UserDefaults.standard.set(newValue.rawValue, forKey: key)
+    }
+  }
+
+  func isConfigured(_ source: MediaSourceKind) -> Bool {
+    switch source {
+    case .webDAV: return WebDAVCredentialStore.shared.isConfigured
+    case .cloud115: return CredentialStore.shared.hasRefreshToken
+    }
+  }
+
+  var resolvedSource: MediaSourceKind {
+    let stored = activeSource
+    if isConfigured(stored) { return stored }
+    if CredentialStore.shared.hasRefreshToken { return .cloud115 }
+    if WebDAVCredentialStore.shared.isConfigured { return .webDAV }
+    return stored
   }
 }
 
