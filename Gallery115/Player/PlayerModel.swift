@@ -414,9 +414,25 @@ final class PlayerModel: PlaybackEngineControlling {
     let asset = AVURLAsset(url: source.url, options: assetOptions)
     activeAsset = asset
 
-    let playerItem = AVPlayerItem(asset: asset)
+    // Keep first-frame startup lean: AVPlayerItem(asset:) implicitly asks the
+    // asset to load duration before the item becomes ready. Cineva already
+    // loads duration/tracks asynchronously after playback starts, so avoid
+    // duplicating that work on the critical startup path.
+    let playerItem = AVPlayerItem(asset: asset, automaticallyLoadedAssetKeys: [])
     playerItem.preferredForwardBufferDuration = fastStartEnabled ? 3 : 20
+
+    // Maximum-fidelity policy with no extra decode/filter stage. A zero bit-rate
+    // or resolution value means "no cap" for adaptive/HLS assets, including on
+    // expensive networks. Direct OpenList files remain byte-for-byte originals.
     playerItem.preferredPeakBitRate = 0
+    playerItem.preferredMaximumResolution = .zero
+    playerItem.preferredPeakBitRateForExpensiveNetworks = 0
+    playerItem.preferredMaximumResolutionForExpensiveNetworks = .zero
+
+    // Preserve dynamic HDR metadata when the source/device supports it. This
+    // stays on AVFoundation's native hardware presentation path and does not add
+    // a custom video compositor, so PiP/AirPlay/fast start remain untouched.
+    playerItem.appliesPerFrameHDRDisplayMetadata = true
     installItemObservers(for: playerItem)
     player.replaceCurrentItem(with: playerItem)
 
