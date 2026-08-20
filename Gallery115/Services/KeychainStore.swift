@@ -1,41 +1,92 @@
 import Foundation
 import Security
 
-final class CredentialStore: @unchecked Sendable {
-  static let shared = CredentialStore()
+struct Cloud115Session: Codable, Equatable, Sendable {
+  let accessToken: String
+  let refreshToken: String
+  let updatedAt: Date
+
+  init(accessToken: String, refreshToken: String, updatedAt: Date = Date()) {
+    self.accessToken = accessToken.trimmingCharacters(in: .whitespacesAndNewlines)
+    self.refreshToken = refreshToken.trimmingCharacters(in: .whitespacesAndNewlines)
+    self.updatedAt = updatedAt
+  }
+}
+
+/// Stores the complete 115 OAuth session as one Keychain value.
+/// A rotating refresh token is therefore never persisted separately from its matching access token.
+final class Cloud115SessionStore: @unchecked Sendable {
+  static let shared = Cloud115SessionStore()
 
   private let service = "com.xiaocai.gallery115.credentials"
-  private let accessAccount = "access-token"
-  private let refreshAccount = "refresh-token"
+  private let sessionAccount = "oauth-session-v2"
+  private let legacyAccessAccount = "access-token"
+  private let legacyRefreshAccount = "refresh-token"
+  private let lock = NSLock()
 
   private init() {}
 
-  var accessToken: String? {
-    get { read(account: accessAccount) }
-    set { write(newValue, account: accessAccount) }
-  }
-
-  var refreshToken: String? {
-    get { read(account: refreshAccount) }
-    set { write(newValue, account: refreshAccount) }
+  var session: Cloud115Session? {
+    lock.lock()
+    defer { lock.unlock() }
+    return readSessionLocked() ?? migrateLegacySessionLocked()
   }
 
   var hasRefreshToken: Bool {
-    guard let refreshToken else { return false }
-    return !refreshToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    guard let token = session?.refreshToken else { return false }
+    return !token.isEmpty
   }
 
-  func save(accessToken: String?, refreshToken: String) {
-    self.accessToken = accessToken?.trimmingCharacters(in: .whitespacesAndNewlines)
-    self.refreshToken = refreshToken.trimmingCharacters(in: .whitespacesAndNewlines)
+  func save(accessToken: String, refreshToken: String) {
+    save(Cloud115Session(accessToken: accessToken, refreshToken: refreshToken))
+  }
+
+  func save(_ session: Cloud115Session) {
+    guard !session.refreshToken.isEmpty else { return }
+    lock.lock()
+    defer { lock.unlock() }
+    writeSessionLocked(session)
   }
 
   func clear() {
-    accessToken = nil
-    refreshToken = nil
+    lock.lock()
+    defer { lock.unlock() }
+    delete(account: sessionAccount)
+    delete(account: legacyAccessAccount)
+    delete(account: legacyRefreshAccount)
   }
 
-  private func read(account: String) -> String? {
+  private func readSessionLocked() -> Cloud115Session? {
+    guard let data = readData(account: sessionAccount) else { return nil }
+    return try? JSONDecoder().decode(Cloud115Session.self, from: data)
+  }
+
+  @discardableResult
+  private func migrateLegacySessionLocked() -> Cloud115Session? {
+    guard let refreshData = readData(account: legacyRefreshAccount),
+      let refresh = String(data: refreshData, encoding: .utf8)?
+        .trimmingCharacters(in: .whitespacesAndNewlines),
+      !refresh.isEmpty
+    else {
+      return nil
+    }
+
+    let access = readData(account: legacyAccessAccount)
+      .flatMap { String(data: $0, encoding: .utf8) }?
+      .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let migrated = Cloud115Session(accessToken: access, refreshToken: refresh)
+    writeSessionLocked(migrated)
+    delete(account: legacyAccessAccount)
+    delete(account: legacyRefreshAccount)
+    return migrated
+  }
+
+  private func writeSessionLocked(_ session: Cloud115Session) {
+    guard let data = try? JSONEncoder().encode(session) else { return }
+    writeData(data, account: sessionAccount)
+  }
+
+  private func readData(account: String) -> Data? {
     let query: [String: Any] = [
       kSecClass as String: kSecClassGenericPassword,
       kSecAttrService as String: service,
@@ -46,28 +97,16 @@ final class CredentialStore: @unchecked Sendable {
 
     var result: CFTypeRef?
     let status = SecItemCopyMatching(query as CFDictionary, &result)
-    guard status == errSecSuccess,
-      let data = result as? Data,
-      let value = String(data: data, encoding: .utf8)
-    else {
-      return nil
-    }
-    return value
+    guard status == errSecSuccess else { return nil }
+    return result as? Data
   }
 
-  private func write(_ value: String?, account: String) {
+  private func writeData(_ data: Data, account: String) {
     let baseQuery: [String: Any] = [
       kSecClass as String: kSecClassGenericPassword,
       kSecAttrService as String: service,
       kSecAttrAccount as String: account,
     ]
-
-    guard let value, !value.isEmpty else {
-      SecItemDelete(baseQuery as CFDictionary)
-      return
-    }
-
-    let data = Data(value.utf8)
     let update: [String: Any] = [kSecValueData as String: data]
     let status = SecItemUpdate(baseQuery as CFDictionary, update as CFDictionary)
 
@@ -77,5 +116,59 @@ final class CredentialStore: @unchecked Sendable {
       add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
       SecItemAdd(add as CFDictionary, nil)
     }
+  }
+
+  private func delete(account: String) {
+    let query: [String: Any] = [
+      kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: service,
+      kSecAttrAccount as String: account,
+    ]
+    SecItemDelete(query as CFDictionary)
+  }
+}
+
+/// Compatibility facade for existing views while the app is migrated to Cloud115Provider.
+final class CredentialStore: @unchecked Sendable {
+  static let shared = CredentialStore()
+  private let store = Cloud115SessionStore.shared
+
+  private init() {}
+
+  var accessToken: String? {
+    get {
+      let value = store.session?.accessToken ?? ""
+      return value.isEmpty ? nil : value
+    }
+    set {
+      guard let refresh = store.session?.refreshToken, !refresh.isEmpty else { return }
+      store.save(accessToken: newValue ?? "", refreshToken: refresh)
+    }
+  }
+
+  var refreshToken: String? {
+    get {
+      let value = store.session?.refreshToken ?? ""
+      return value.isEmpty ? nil : value
+    }
+    set {
+      guard let newValue = newValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+        !newValue.isEmpty
+      else {
+        store.clear()
+        return
+      }
+      store.save(accessToken: store.session?.accessToken ?? "", refreshToken: newValue)
+    }
+  }
+
+  var hasRefreshToken: Bool { store.hasRefreshToken }
+
+  func save(accessToken: String?, refreshToken: String) {
+    store.save(accessToken: accessToken ?? "", refreshToken: refreshToken)
+  }
+
+  func clear() {
+    store.clear()
   }
 }

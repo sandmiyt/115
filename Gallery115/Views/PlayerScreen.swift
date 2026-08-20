@@ -289,8 +289,9 @@ struct PlayerScreen: View {
     .padding(.trailing, max(proxy.safeAreaInsets.trailing, 12))
     .padding(
       .top,
-      (proxy.safeAreaInsets.top > 0 ? proxy.safeAreaInsets.top : (landscape ? 8 : 44))
-        + (landscape ? 10 : 16)
+      landscape
+        ? max(proxy.safeAreaInsets.top + 10, 24)
+        : max(proxy.safeAreaInsets.top + 20, 74)
     )
     .padding(.bottom, landscape ? 18 : 12)
     .background(
@@ -377,6 +378,7 @@ struct PlayerScreen: View {
     } label: {
       playerIcon("ellipsis")
     }
+    .simultaneousGesture(TapGesture().onEnded { holdControlsForMenu() })
   }
 
   private func qualityMenu(model: PlayerModel, compact: Bool) -> some View {
@@ -410,6 +412,7 @@ struct PlayerScreen: View {
         )
       }
     }
+    .simultaneousGesture(TapGesture().onEnded { holdControlsForMenu() })
   }
 
   private func bottomOverlay(proxy: GeometryProxy) -> some View {
@@ -588,6 +591,7 @@ struct PlayerScreen: View {
     } label: {
       playerPill(systemName: "speedometer", text: formatRate(Double(playbackRate)))
     }
+    .simultaneousGesture(TapGesture().onEnded { holdControlsForMenu() })
   }
 
   private func audioMenu(model: PlayerModel) -> some View {
@@ -612,6 +616,7 @@ struct PlayerScreen: View {
     } label: {
       playerPill(systemName: "waveform", text: "音轨")
     }
+    .simultaneousGesture(TapGesture().onEnded { holdControlsForMenu() })
   }
 
   private func subtitleMenu(model: PlayerModel) -> some View {
@@ -634,6 +639,7 @@ struct PlayerScreen: View {
     } label: {
       playerPill(systemName: "captions.bubble", text: "字幕")
     }
+    .simultaneousGesture(TapGesture().onEnded { holdControlsForMenu() })
   }
 
   private func controlCircle(
@@ -788,6 +794,12 @@ struct PlayerScreen: View {
     } else {
       controlsTask?.cancel()
     }
+  }
+
+  @MainActor
+  private func holdControlsForMenu() {
+    controlsTask?.cancel()
+    controlsVisible = true
   }
 
   @MainActor

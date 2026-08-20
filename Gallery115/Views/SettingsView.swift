@@ -100,7 +100,7 @@ struct SettingsView: View {
           VStack(alignment: .leading, spacing: 2) {
             Text(CredentialStore.shared.hasRefreshToken ? "115 已连接" : "未连接 115")
               .font(.subheadline.weight(.semibold))
-            Text("登录凭据由 Cineva 自动获取并保存在本机 Keychain")
+            Text("登录状态由 Cineva 自动维护并安全保存在本机 Keychain")
               .font(.caption)
               .foregroundStyle(.secondary)
           }
@@ -167,7 +167,7 @@ struct SettingsView: View {
             Text("115 云端影音播放器").font(.caption).foregroundStyle(.secondary)
           }
         }
-        LabeledContent("版本", value: "1.5")
+        LabeledContent("版本", value: "1.7")
       }
     }
     .navigationTitle("设置")

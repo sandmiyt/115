@@ -171,10 +171,6 @@ enum Cloud115AuthorizationError: LocalizedError {
 }
 
 enum Cloud115AuthorizationClient {
-  private struct LoginResponse: Decodable {
-    let text: String
-  }
-
   static func makeSession() async throws -> Cloud115AuthorizationSession {
     let endpoints = [
       "https://api.oplist.org/115cloud/requests",
@@ -197,15 +193,25 @@ enum Cloud115AuthorizationClient {
 
         var request = URLRequest(url: url)
         request.timeoutInterval = 20
-        request.setValue("Cineva-iOS/1.5", forHTTPHeaderField: "User-Agent")
+        request.setValue("Cineva-iOS/1.7", forHTTPHeaderField: "User-Agent")
 
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
           throw Cloud115AuthorizationError.invalidResponse
         }
 
-        let decoded = try JSONDecoder().decode(LoginResponse.self, from: data)
-        guard let loginURL = URL(string: decoded.text), loginURL.scheme == "https" else {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+          throw Cloud115AuthorizationError.invalidResponse
+        }
+        let loginURLText = cloud115String(object["text"])
+        guard let loginURL = URL(string: loginURLText), loginURL.scheme == "https" else {
+          let message = [
+            cloud115String(object["message"]),
+            cloud115String(object["error"]),
+          ].first(where: { !$0.isEmpty })
+          if let message {
+            throw Cloud115AuthorizationError.remote(message)
+          }
           throw Cloud115AuthorizationError.authorizationURLMissing
         }
 

@@ -347,10 +347,10 @@ private struct HomeLandscapeArtwork: View {
         if !item.fileExtension.isEmpty {
           Text(item.fileExtension.uppercased())
             .font(.system(size: 9, weight: .bold, design: .rounded))
-            .foregroundStyle(.white.opacity(0.95))
+            .foregroundStyle(.white.opacity(0.92))
             .padding(.horizontal, 6)
             .padding(.vertical, 3)
-            .background(.black.opacity(0.56), in: Capsule())
+            .background(.black.opacity(0.58), in: Capsule())
         }
         Spacer(minLength: 5)
         if !item.formattedDuration.isEmpty {
@@ -359,7 +359,7 @@ private struct HomeLandscapeArtwork: View {
             .foregroundStyle(.white)
             .padding(.horizontal, 6)
             .padding(.vertical, 3)
-            .background(.black.opacity(0.66), in: Capsule())
+            .background(.black.opacity(0.72), in: Capsule())
         }
       }
       .padding(6)
@@ -369,7 +369,7 @@ private struct HomeLandscapeArtwork: View {
           VStack(spacing: 0) {
             Spacer()
             ZStack(alignment: .leading) {
-              Rectangle().fill(.white.opacity(0.22))
+              Rectangle().fill(.white.opacity(0.24))
               Rectangle()
                 .fill(CinevaTheme.accent)
                 .frame(width: max(2, proxy.size.width * progress))
@@ -386,7 +386,6 @@ private struct HomeLandscapeArtwork: View {
       RoundedRectangle(cornerRadius: 12, style: .continuous)
         .stroke(.primary.opacity(0.08), lineWidth: 0.6)
     }
-    .shadow(color: .black.opacity(0.13), radius: 7, y: 3)
   }
 }
 
