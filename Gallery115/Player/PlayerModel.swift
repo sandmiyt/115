@@ -194,6 +194,11 @@ final class PlayerModel: PlaybackEngineControlling {
   private var lastTransferredBytes: Int64 = 0
   private var lastBandwidthSampleAt = Date()
   private var lastStallRecoveryAt = Date.distantPast
+  private var lastPlaybackProgressAt = Date()
+  private var lastPlaybackProgressTime: Double = 0
+  private var steadyPlaybackModeEnabled = false
+  private var interactiveScrubActive = false
+  private var stallProbeTask: Task<Void, Never>?
 
   // Interactive timeline scrubbing uses a single in-flight AVPlayer seek. While
   // that seek is running, finger movement only updates `scrubChaseTime`; when
@@ -327,6 +332,8 @@ final class PlayerModel: PlaybackEngineControlling {
   /// playback progression from fighting the seek chase while the thumb moves.
   @discardableResult
   func beginInteractiveScrub() -> Bool {
+    interactiveScrubActive = true
+    stallProbeTask?.cancel()
     let shouldResume = player.timeControlStatus == .playing || player.rate > 0
     if shouldResume { player.pause() }
     isPlaying = false
@@ -433,6 +440,9 @@ final class PlayerModel: PlaybackEngineControlling {
         self.scrubSeekInProgress = false
         if let final = self.scrubFinalTarget, CMTimeCompare(final, target) == 0 {
           self.scrubFinalTarget = nil
+          self.interactiveScrubActive = false
+          self.lastPlaybackProgressAt = Date()
+          self.lastPlaybackProgressTime = self.currentTime
           let shouldResume = self.scrubResumeAfterFinish
           self.scrubResumeAfterFinish = false
           if shouldResume {
@@ -532,6 +542,12 @@ final class PlayerModel: PlaybackEngineControlling {
     transferredMegabytes = 0
     lastTransferredBytes = 0
     lastBandwidthSampleAt = Date()
+    lastPlaybackProgressAt = Date()
+    lastPlaybackProgressTime = 0
+    steadyPlaybackModeEnabled = false
+    interactiveScrubActive = false
+    stallProbeTask?.cancel()
+    player.automaticallyWaitsToMinimizeStalling = !fastStartEnabled
 
     // Containers that AVPlayer commonly rejects should go straight to VLC when
     // the VLC runtime is actually bundled. MP4/MOV and other Apple-friendly
@@ -557,7 +573,11 @@ final class PlayerModel: PlaybackEngineControlling {
     // loads duration/tracks asynchronously after playback starts, so avoid
     // duplicating that work on the critical startup path.
     let playerItem = AVPlayerItem(asset: asset, automaticallyLoadedAssetKeys: [])
-    playerItem.preferredForwardBufferDuration = fastStartEnabled ? 3 : 20
+    // Startup stays aggressive for the first frame. Once frames are actually
+    // advancing, `enableSteadyPlaybackModeIfNeeded()` increases the forward
+    // buffer and lets AVPlayer wait intelligently, so startup is not slowed
+    // down just to gain long-play stability.
+    playerItem.preferredForwardBufferDuration = fastStartEnabled ? 1.5 : 20
 
     // Maximum-fidelity policy with no extra decode/filter stage. A zero bit-rate
     // or resolution value means "no cap" for adaptive/HLS assets, including on
@@ -596,7 +616,7 @@ final class PlayerModel: PlaybackEngineControlling {
       // same remote asset for duration/tracks/chapters. Those inspections can
       // otherwise compete with the first media ranges on slower OpenList links.
       if self.fastStartEnabled {
-        try? await Task.sleep(nanoseconds: 450_000_000)
+        try? await Task.sleep(nanoseconds: 900_000_000)
       }
       guard self.mediaInfoGeneration == generation, self.player.currentItem === playerItem else { return }
       async let durationTask = try? asset.load(.duration)
@@ -768,9 +788,29 @@ final class PlayerModel: PlaybackEngineControlling {
       Task { @MainActor [weak self] in
         guard let self else { return }
         let seconds = time.seconds.isFinite ? max(time.seconds, 0) : 0
+        let now = Date()
+        let progressed = seconds > self.lastPlaybackProgressTime + 0.08
+        if progressed {
+          self.lastPlaybackProgressTime = seconds
+          self.lastPlaybackProgressAt = now
+          if seconds > 0.15 {
+            self.enableSteadyPlaybackModeIfNeeded()
+          }
+        }
+
         self.currentTime = seconds
         self.isPlaying = self.player.timeControlStatus == .playing
         self.isBuffering = self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate
+
+        if self.networkAutoRecoveryEnabled,
+          !self.didReachEnd,
+          !self.interactiveScrubActive,
+          seconds > 0.5,
+          now.timeIntervalSince(self.lastPlaybackProgressAt) > 3.2,
+          (self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate || self.player.rate > 0)
+        {
+          self.requestStallRecoveryIfNeeded()
+        }
 
         if let range = self.player.currentItem?.loadedTimeRanges.last?.timeRangeValue {
           let end = CMTimeGetSeconds(CMTimeRangeGetEnd(range))
@@ -847,22 +887,66 @@ final class PlayerModel: PlaybackEngineControlling {
       queue: .main
     ) { [weak self] _ in
       Task { @MainActor [weak self] in
-        guard let self, self.networkAutoRecoveryEnabled, !self.didReachEnd else { return }
-        let now = Date()
-        guard now.timeIntervalSince(self.lastStallRecoveryAt) > 6 else { return }
-        self.lastStallRecoveryAt = now
-        self.isBuffering = true
-        let recoveryTime = max(self.player.currentTime().seconds, 0)
-        self.player.seek(
-          to: CMTime(seconds: recoveryTime, preferredTimescale: 600),
-          toleranceBefore: CMTime(seconds: 0.35, preferredTimescale: 600),
-          toleranceAfter: CMTime(seconds: 0.35, preferredTimescale: 600)
-        ) { [weak self] finished in
-          Task { @MainActor [weak self] in
-            guard let self, finished else { return }
-            self.player.playImmediately(atRate: self.player.defaultRate)
-            self.isBuffering = false
-          }
+        self?.requestStallRecoveryIfNeeded()
+      }
+    }
+  }
+
+  private func enableSteadyPlaybackModeIfNeeded() {
+    guard fastStartEnabled, !steadyPlaybackModeEnabled else { return }
+    steadyPlaybackModeEnabled = true
+    // First frame already arrived, so from this point prefer continuity over
+    // ultra-aggressive start behavior. This does not change bitrate, resolution
+    // or HDR; it only gives the original-quality stream a healthier runway.
+    player.automaticallyWaitsToMinimizeStalling = true
+    player.currentItem?.preferredForwardBufferDuration = 12
+  }
+
+  private func requestStallRecoveryIfNeeded() {
+    guard networkAutoRecoveryEnabled, !didReachEnd, !interactiveScrubActive else { return }
+    guard player.currentItem?.status == .readyToPlay else { return }
+    let now = Date()
+    guard now.timeIntervalSince(lastStallRecoveryAt) > 4 else { return }
+
+    lastStallRecoveryAt = now
+    isBuffering = true
+    let generation = mediaInfoGeneration
+    let stalledAt = max(player.currentTime().seconds.isFinite ? player.currentTime().seconds : currentTime, 0)
+
+    // Cheap first attempt: ask AVPlayer to resume without disturbing the
+    // timeline. This handles short CDN/WebDAV hiccups with no visible seek.
+    player.playImmediately(atRate: player.defaultRate)
+
+    stallProbeTask?.cancel()
+    stallProbeTask = Task { @MainActor [weak self] in
+      try? await Task.sleep(for: .milliseconds(950))
+      guard let self, !Task.isCancelled, self.mediaInfoGeneration == generation else { return }
+      guard !self.didReachEnd, !self.interactiveScrubActive else { return }
+
+      let nowTime = max(self.player.currentTime().seconds.isFinite ? self.player.currentTime().seconds : self.currentTime, 0)
+      if nowTime > stalledAt + 0.12 {
+        self.lastPlaybackProgressAt = Date()
+        self.lastPlaybackProgressTime = nowTime
+        self.isBuffering = false
+        return
+      }
+
+      // If playback is still frozen, nudge by only ~1/20 second with a relaxed
+      // tolerance. For remote OpenList/WebDAV files this is enough to force a
+      // fresh byte-range request when a connection died mid-file, while the
+      // time shift is visually imperceptible.
+      let upper = self.duration > 0 ? max(self.duration - 0.1, 0) : stalledAt + 1
+      let targetSeconds = min(stalledAt + 0.05, upper)
+      let target = CMTime(seconds: targetSeconds, preferredTimescale: 600)
+      let tolerance = CMTime(seconds: 0.4, preferredTimescale: 600)
+      self.player.currentItem?.cancelPendingSeeks()
+      self.player.seek(to: target, toleranceBefore: tolerance, toleranceAfter: tolerance) { [weak self] finished in
+        Task { @MainActor [weak self] in
+          guard let self, finished, self.mediaInfoGeneration == generation else { return }
+          self.lastPlaybackProgressAt = Date()
+          self.lastPlaybackProgressTime = targetSeconds
+          self.player.playImmediately(atRate: self.player.defaultRate)
+          self.isBuffering = self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate
         }
       }
     }

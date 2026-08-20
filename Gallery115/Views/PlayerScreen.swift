@@ -45,6 +45,7 @@ struct PlayerScreen: View {
   @State private var isPinchInteracting = false
   @State private var dismissDragOffset: CGSize = .zero
   @State private var isDismissDragging = false
+  @State private var isDismissSettling = false
   @State private var dismissControlsWereVisible = false
   @State private var dismissRestoreTask: Task<Void, Never>?
   @State private var singleFingerGestureSuppressedUntil: TimeInterval = 0
@@ -89,7 +90,7 @@ struct PlayerScreen: View {
 
         interactionLayer(proxy: proxy)
 
-        if !isLocked, appState.isAppUnlocked, !isDismissDragging {
+        if !isLocked, appState.isAppUnlocked, !isDismissMotionActive {
           skipSegmentOverlay(proxy: proxy)
             .zIndex(9)
         }
@@ -100,8 +101,8 @@ struct PlayerScreen: View {
           playerChrome(proxy: proxy)
             .simultaneousGesture(controlsInteractionGesture)
             .opacity(chromeShouldBeVisible ? interactiveDismissChromeOpacity : 0)
-            .allowsHitTesting(chromeShouldBeVisible && !isDismissDragging && !showSettingsPanel && !showSpeedPanel && !showQueuePanel)
-            .accessibilityHidden(!chromeShouldBeVisible || isDismissDragging)
+            .allowsHitTesting(chromeShouldBeVisible && !isDismissMotionActive && !showSettingsPanel && !showSpeedPanel && !showQueuePanel)
+            .accessibilityHidden(!chromeShouldBeVisible || isDismissMotionActive)
         }
 
         if showSettingsPanel, !isLocked {
@@ -131,7 +132,7 @@ struct PlayerScreen: View {
             .zIndex(15)
         }
 
-        if activeIsBuffering, !isDismissDragging {
+        if activeIsBuffering, !isDismissMotionActive {
           ProgressView()
             .controlSize(.large)
             .tint(.white)
@@ -369,11 +370,15 @@ struct PlayerScreen: View {
       )
     )
     .shadow(
-      color: .black.opacity(isDismissDragging ? 0.28 : 0),
-      radius: isDismissDragging ? 28 : 0,
-      y: isDismissDragging ? 12 : 0
+      color: .black.opacity(Double(interactiveDismissProgress) * 0.28),
+      radius: interactiveDismissProgress * 28,
+      y: interactiveDismissProgress * 12
     )
     .allowsHitTesting(false)
+  }
+
+  private var isDismissMotionActive: Bool {
+    isDismissDragging || isDismissSettling
   }
 
   private var interactiveDismissProgress: CGFloat {
@@ -502,7 +507,7 @@ struct PlayerScreen: View {
         bottomOverlay(proxy: proxy)
       }
 
-      if let model {
+      if let model, !isScrubbing {
         if landscape {
           landscapeCenterTransport(model: model)
         } else {
@@ -644,6 +649,7 @@ struct PlayerScreen: View {
     else { return }
 
     if !isDismissDragging {
+      isDismissSettling = false
       isDismissDragging = true
       dismissControlsWereVisible = controlsVisible
       dismissRestoreTask?.cancel()
@@ -671,13 +677,16 @@ struct PlayerScreen: View {
     let projectedThreshold = dismissDistance * 1.55
     let shouldDismiss = actualDistance >= dismissDistance || projectedDistance >= projectedThreshold
 
+    dismissRestoreTask?.cancel()
+    isDismissDragging = false
+    isDismissSettling = true
+
     if shouldDismiss {
-      dismissRestoreTask?.cancel()
       UIImpactFeedbackGenerator(style: .soft).impactOccurred()
 
-      // Continue in the user's own two-dimensional escape direction instead
-      // of snapping to a fixed edge. Predicted translation captures a quick
-      // flick; the fallback uses the actual drag vector for slow releases.
+      // Continue in the exact two-dimensional release direction. A short
+      // interactive spring keeps the hand-off from the finger into the escape
+      // animation continuous instead of restarting the motion from zero speed.
       let vector = projectedDistance > actualDistance
         ? value.predictedEndTranslation
         : value.translation
@@ -688,30 +697,32 @@ struct PlayerScreen: View {
         height: vector.height / magnitude * escapeDistance
       )
 
-      withAnimation(.spring(response: 0.26, dampingFraction: 0.92, blendDuration: 0.06)) {
+      withAnimation(.interactiveSpring(response: 0.24, dampingFraction: 0.94, blendDuration: 0.16)) {
         dismissDragOffset = target
       }
 
       dismissRestoreTask = Task { @MainActor in
-        try? await Task.sleep(for: .milliseconds(105))
+        try? await Task.sleep(for: .milliseconds(110))
         guard !Task.isCancelled else { return }
         dismiss()
       }
       return
     }
 
-    // Keep the interaction state alive during the return spring so the video,
-    // corner radius, chrome and backdrop all travel home on the same curve.
-    withAnimation(.spring(response: 0.34, dampingFraction: 0.88, blendDuration: 0.08)) {
+    // Cancelled dismiss: every visual property is driven only by the animated
+    // displacement. Keep a separate non-visual settling flag for hit testing
+    // so there is no second state flip at the end that can create a tiny snap.
+    // `interactiveSpring` is designed for gesture-driven motion and blends the
+    // release into the return instead of feeling like a fresh animation.
+    withAnimation(.interactiveSpring(response: 0.31, dampingFraction: 0.96, blendDuration: 0.18)) {
       dismissDragOffset = .zero
     }
 
     let shouldRestoreControls = dismissControlsWereVisible
-    dismissRestoreTask?.cancel()
     dismissRestoreTask = Task { @MainActor in
-      try? await Task.sleep(for: .milliseconds(300))
+      try? await Task.sleep(for: .milliseconds(430))
       guard !Task.isCancelled else { return }
-      isDismissDragging = false
+      isDismissSettling = false
       if shouldRestoreControls {
         controlsVisible = true
         scheduleControlsHide()
@@ -2347,6 +2358,7 @@ struct PlayerScreen: View {
     panStartOffset = .zero
     dismissDragOffset = .zero
     isDismissDragging = false
+    isDismissSettling = false
     dismissRestoreTask?.cancel()
     isPinchInteracting = false
     singleFingerGestureSuppressedUntil = 0
