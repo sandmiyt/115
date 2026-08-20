@@ -39,7 +39,10 @@ struct PlayerScreen: View {
   @State private var gestureStartVolume: Float?
   @State private var videoScale: CGFloat = 1.0
   @State private var pinchStartScale: CGFloat = 1.0
+  @State private var videoOffset: CGSize = .zero
+  @State private var panStartOffset: CGSize = .zero
   @State private var isPinchInteracting = false
+  @State private var singleFingerGestureSuppressedUntil: TimeInterval = 0
   @State private var externalSubtitleTracks: [ExternalSubtitleTrack] = []
   @State private var selectedExternalSubtitleID: String?
   @State private var externalSubtitleCues: [SubtitleCue] = []
@@ -77,6 +80,8 @@ struct PlayerScreen: View {
         playerLayer
           .frame(width: proxy.size.width, height: proxy.size.height)
           .scaleEffect(videoScale, anchor: .center)
+          .offset(videoOffset)
+          .frame(width: proxy.size.width, height: proxy.size.height)
           .background(Color.black)
           .clipped()
           .ignoresSafeArea()
@@ -355,40 +360,81 @@ struct PlayerScreen: View {
       gestureSurface(isLeft: false, proxy: proxy)
     }
     .ignoresSafeArea()
-    .highPriorityGesture(videoPinchGesture)
+    .highPriorityGesture(videoPinchGesture(proxy: proxy))
+    .simultaneousGesture(videoDragGesture(proxy: proxy))
     .allowsHitTesting(!isLocked)
   }
 
-  private var videoPinchGesture: some Gesture {
+  private func videoPinchGesture(proxy: GeometryProxy) -> some Gesture {
     MagnificationGesture()
       .onChanged { value in
         guard appState.playerGesturesEnabled, !isLocked else { return }
         if !isPinchInteracting {
           isPinchInteracting = true
-          pinchStartScale = videoScale
-          // A pinch is always a two-finger picture gesture. Clear any pending
-          // one-finger brightness/volume baseline so the two gesture families
-          // cannot keep updating each other during the same touch sequence.
+          pinchStartScale = max(videoScale, 1.0)
+          // Pinch always wins over the one-finger gesture family. A short
+          // suppression tail prevents one finger from a just-finished pinch
+          // being interpreted as brightness/volume or seek.
           gestureStartBrightness = nil
           gestureStartVolume = nil
           isGestureInteracting = false
           controlsTask?.cancel()
         }
-        let next = min(max(pinchStartScale * value, 0.75), 3.0)
-        videoScale = next
-        updateContinuousGestureHUD("画面  \(Int((next * 100).rounded()))%")
+
+        singleFingerGestureSuppressedUntil = ProcessInfo.processInfo.systemUptime + 0.22
+        let rawScale = pinchStartScale * value
+        let nextScale = rubberBandedVideoScale(rawScale)
+        videoScale = nextScale
+        videoOffset = clampedVideoOffset(videoOffset, scale: nextScale, viewport: proxy.size)
       }
       .onEnded { value in
         guard appState.playerGesturesEnabled, !isLocked else {
           isPinchInteracting = false
           return
         }
-        videoScale = min(max(pinchStartScale * value, 0.75), 3.0)
-        pinchStartScale = videoScale
+
+        singleFingerGestureSuppressedUntil = ProcessInfo.processInfo.systemUptime + 0.24
+        let rawScale = pinchStartScale * value
+        let targetScale = min(max(rawScale, 1.0), 3.0)
+        let targetOffset = clampedVideoOffset(videoOffset, scale: targetScale, viewport: proxy.size)
+
+        // iOS Photos-style rubber band: the picture may compress below its
+        // natural size while the fingers are still down, but it never rests
+        // there. Releasing below 1x springs both scale and position home.
+        withAnimation(.spring(response: 0.38, dampingFraction: 0.82, blendDuration: 0.12)) {
+          videoScale = targetScale
+          videoOffset = targetScale <= 1.001 ? .zero : targetOffset
+        }
+
+        pinchStartScale = targetScale
         isPinchInteracting = false
-        finishContinuousGestureHUD()
         scheduleControlsHide()
       }
+  }
+
+  private func rubberBandedVideoScale(_ rawScale: CGFloat) -> CGFloat {
+    if rawScale < 1.0 {
+      // Increasing resistance as the user squeezes past the natural size.
+      // The temporary floor is intentionally lower than the resting minimum
+      // so the release has a visible, premium-feeling spring-back distance.
+      let overshoot = min(1.0 - rawScale, 0.64)
+      return max(0.78, 1.0 - overshoot * 0.34)
+    }
+    if rawScale > 3.0 {
+      let overshoot = min(rawScale - 3.0, 1.5)
+      return min(3.24, 3.0 + overshoot * 0.16)
+    }
+    return rawScale
+  }
+
+  private func clampedVideoOffset(_ offset: CGSize, scale: CGFloat, viewport: CGSize) -> CGSize {
+    guard scale > 1.001 else { return .zero }
+    let maxX = max(0, viewport.width * (scale - 1.0) * 0.5)
+    let maxY = max(0, viewport.height * (scale - 1.0) * 0.5)
+    return CGSize(
+      width: min(max(offset.width, -maxX), maxX),
+      height: min(max(offset.height, -maxY), maxY)
+    )
   }
 
   @ViewBuilder
@@ -414,10 +460,7 @@ struct PlayerScreen: View {
   }
 
   private func gestureSurface(isLeft: Bool, proxy: GeometryProxy) -> some View {
-    let availableHeight = max(proxy.size.height, 1)
-    let availableWidth = max(proxy.size.width, 1)
-
-    return Color.clear
+    Color.clear
       .contentShape(Rectangle())
       .frame(maxWidth: .infinity)
       .onTapGesture { toggleControls() }
@@ -425,59 +468,103 @@ struct PlayerScreen: View {
         guard appState.playerGesturesEnabled else { return }
         seekBy(isLeft ? -Double(appState.doubleTapSeekSeconds) : Double(appState.doubleTapSeekSeconds))
       }
-      .simultaneousGesture(
-        DragGesture(minimumDistance: 16)
-          .onChanged { value in
-            guard appState.playerGesturesEnabled, !isPinchInteracting else { return }
-            let dx = value.translation.width
-            let dy = value.translation.height
-            guard abs(dy) >= abs(dx) else { return }
+  }
 
-            if !isGestureInteracting {
-              isGestureInteracting = true
-              controlsTask?.cancel()
-              gestureStartBrightness = UIScreen.main.brightness
-              gestureStartVolume = activeVolume
-            }
+  private func videoDragGesture(proxy: GeometryProxy) -> some Gesture {
+    let availableHeight = max(proxy.size.height, 1)
+    let availableWidth = max(proxy.size.width, 1)
+    let isLandscape = availableWidth > availableHeight
 
-            let normalizedDelta = -dy / availableHeight * 1.35
-            if isLeft {
-              let start = gestureStartBrightness ?? UIScreen.main.brightness
-              let next = min(max(start + normalizedDelta, 0), 1)
-              UIScreen.main.brightness = next
-              updateContinuousGestureHUD("亮度  \(Int((next * 100).rounded()))%")
-            } else {
-              let start = CGFloat(gestureStartVolume ?? activeVolume)
-              let next = min(max(start + normalizedDelta, 0), 1)
-              setActiveVolume(Float(next))
-              updateContinuousGestureHUD("音量  \(Int((next * 100).rounded()))%")
-            }
-          }
-          .onEnded { value in
-            guard appState.playerGesturesEnabled else { return }
-            if isPinchInteracting {
-              gestureStartBrightness = nil
-              gestureStartVolume = nil
-              isGestureInteracting = false
-              return
-            }
-            let dx = value.translation.width
-            let dy = value.translation.height
+    return DragGesture(minimumDistance: 16)
+      .onChanged { value in
+        guard appState.playerGesturesEnabled, !isPinchInteracting else { return }
+        guard ProcessInfo.processInfo.systemUptime >= singleFingerGestureSuppressedUntil else { return }
 
-            if abs(dx) > abs(dy) {
-              let delta = Double(dx / availableWidth) * 180
-              if abs(delta) > 2 {
-                seekBy(delta)
-              }
-            }
-
+        // Once zoomed, the entire screen becomes a free pan surface. This is
+        // deliberately global instead of being attached to the left/right
+        // brightness zones so the user can grab the picture from anywhere.
+        if videoScale > 1.001 {
+          if !isGestureInteracting {
+            isGestureInteracting = true
+            panStartOffset = videoOffset
             gestureStartBrightness = nil
             gestureStartVolume = nil
-            if isGestureInteracting { finishContinuousGestureHUD() }
-            isGestureInteracting = false
-            scheduleControlsHide()
+            controlsTask?.cancel()
           }
-      )
+          let candidate = CGSize(
+            width: panStartOffset.width + value.translation.width,
+            height: panStartOffset.height + value.translation.height
+          )
+          videoOffset = clampedVideoOffset(candidate, scale: videoScale, viewport: proxy.size)
+          return
+        }
+
+        let dx = value.translation.width
+        let dy = value.translation.height
+        guard abs(dy) >= abs(dx) else { return }
+
+        // Portrait intentionally has no vertical brightness/volume gesture.
+        // In landscape the starting finger position decides the channel once:
+        // left half = brightness, right half = volume.
+        guard isLandscape else { return }
+
+        if !isGestureInteracting {
+          isGestureInteracting = true
+          controlsTask?.cancel()
+          gestureStartBrightness = UIScreen.main.brightness
+          gestureStartVolume = activeVolume
+        }
+
+        let normalizedDelta = -dy / availableHeight * 1.35
+        if value.startLocation.x < availableWidth * 0.5 {
+          let start = gestureStartBrightness ?? UIScreen.main.brightness
+          let next = min(max(start + normalizedDelta, 0), 1)
+          UIScreen.main.brightness = next
+          updateContinuousGestureHUD("亮度  \(Int((next * 100).rounded()))%")
+        } else {
+          let start = CGFloat(gestureStartVolume ?? activeVolume)
+          let next = min(max(start + normalizedDelta, 0), 1)
+          setActiveVolume(Float(next))
+          updateContinuousGestureHUD("音量  \(Int((next * 100).rounded()))%")
+        }
+      }
+      .onEnded { value in
+        guard appState.playerGesturesEnabled else { return }
+        if isPinchInteracting || ProcessInfo.processInfo.systemUptime < singleFingerGestureSuppressedUntil {
+          gestureStartBrightness = nil
+          gestureStartVolume = nil
+          isGestureInteracting = false
+          return
+        }
+
+        if videoScale > 1.001 {
+          withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
+            videoOffset = clampedVideoOffset(videoOffset, scale: videoScale, viewport: proxy.size)
+          }
+          panStartOffset = videoOffset
+          gestureStartBrightness = nil
+          gestureStartVolume = nil
+          isGestureInteracting = false
+          scheduleControlsHide()
+          return
+        }
+
+        let dx = value.translation.width
+        let dy = value.translation.height
+
+        // Horizontal seek remains available in both orientations. Vertical
+        // gestures in portrait deliberately do nothing.
+        if abs(dx) > abs(dy) {
+          let delta = Double(dx / availableWidth) * 180
+          if abs(delta) > 2 { seekBy(delta) }
+        }
+
+        gestureStartBrightness = nil
+        gestureStartVolume = nil
+        if isGestureInteracting { finishContinuousGestureHUD() }
+        isGestureInteracting = false
+        scheduleControlsHide()
+      }
   }
 
   private func lockShield(proxy: GeometryProxy) -> some View {
@@ -2109,7 +2196,10 @@ struct PlayerScreen: View {
     localMetadata = nil
     videoScale = 1.0
     pinchStartScale = 1.0
+    videoOffset = .zero
+    panStartOffset = .zero
     isPinchInteracting = false
+    singleFingerGestureSuppressedUntil = 0
     if item.parentID != loadedPlaylistParentID {
       loadedPlaylistParentID = nil
     }
@@ -2356,8 +2446,10 @@ private struct PlayerInfoSheet: View {
           LabeledContent("双击快进/快退", value: "\(appState.doubleTapSeekSeconds) 秒")
           LabeledContent("左右滑动", value: "快进 / 快退")
           LabeledContent("画面中间长按", value: "收藏 / 取消收藏")
-          LabeledContent("左侧上下滑", value: "亮度")
-          LabeledContent("右侧上下滑", value: "播放音量")
+          LabeledContent("双指缩放", value: "放大 / 回弹")
+          LabeledContent("放大后拖动", value: "自由移动画面")
+          LabeledContent("横屏左侧上下滑", value: "亮度")
+          LabeledContent("横屏右侧上下滑", value: "播放音量")
         }
       }
       .navigationTitle("播放详情")

@@ -10,6 +10,11 @@ enum AppTab: Hashable {
 
 struct RootView: View {
   @Environment(AppState.self) private var appState
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
+  @State private var homeLogoFrame: CGRect = .zero
+  @State private var launchHeroProgress: CGFloat = 0
+  @State private var launchHeroVisible = true
+  @State private var launchHeroStarted = false
 
   private var isPrivacyLocked: Bool {
     appState.faceIDEnabled && !appState.isAppUnlocked
@@ -38,6 +43,99 @@ struct RootView: View {
           .zIndex(10_000)
       }
     }
+    .coordinateSpace(name: CinevaLaunchHeroSpace.name)
+    .onPreferenceChange(HomeLogoFramePreferenceKey.self) { frame in
+      guard frame.width > 1, frame.height > 1 else { return }
+      homeLogoFrame = frame
+      startLaunchHeroIfReady()
+    }
+    .onChange(of: appState.isAppUnlocked) { _, unlocked in
+      if unlocked { startLaunchHeroIfReady() }
+    }
+    .overlay {
+      if launchHeroVisible, appState.isAppUnlocked, homeLogoFrame.width > 1 {
+        LaunchHeroOverlay(destination: homeLogoFrame, progress: launchHeroProgress)
+          .allowsHitTesting(true)
+          .zIndex(20_000)
+      }
+    }
+  }
+
+  private func startLaunchHeroIfReady() {
+    guard launchHeroVisible, !launchHeroStarted, appState.isAppUnlocked, homeLogoFrame.width > 1 else { return }
+    launchHeroStarted = true
+
+    Task { @MainActor in
+      // Hold the first SwiftUI frame briefly so it visually continues the
+      // system launch screen instead of snapping immediately into motion.
+      try? await Task.sleep(for: .milliseconds(90))
+
+      if reduceMotion {
+        withAnimation(.easeOut(duration: 0.22)) { launchHeroProgress = 1 }
+        try? await Task.sleep(for: .milliseconds(240))
+      } else {
+        withAnimation(.spring(response: 0.72, dampingFraction: 0.88, blendDuration: 0.16)) {
+          launchHeroProgress = 1
+        }
+        try? await Task.sleep(for: .milliseconds(780))
+      }
+
+      launchHeroVisible = false
+    }
+  }
+}
+
+private enum CinevaLaunchHeroSpace {
+  static let name = "cineva.launch.hero.space"
+}
+
+private struct HomeLogoFramePreferenceKey: PreferenceKey {
+  static var defaultValue: CGRect = .zero
+
+  static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
+    let next = nextValue()
+    if next.width > 1, next.height > 1 { value = next }
+  }
+}
+
+private struct LaunchHeroOverlay: View {
+  let destination: CGRect
+  let progress: CGFloat
+
+  var body: some View {
+    GeometryReader { proxy in
+      let startCenter = CGPoint(x: proxy.size.width * 0.5, y: proxy.size.height * 0.5)
+      let endCenter = CGPoint(x: destination.midX, y: destination.midY)
+      let p = min(max(progress, 0), 1)
+      let center = CGPoint(
+        x: startCenter.x + (endCenter.x - startCenter.x) * p,
+        y: startCenter.y + (endCenter.y - startCenter.y) * p
+      )
+      let destinationSize = max(destination.width, 48)
+      let logoSize = 120 + (destinationSize - 120) * p
+      let backgroundOpacity = max(0, 1 - p * 1.18)
+      let logoOpacity = p < 0.84 ? 1 : max(0, 1 - (p - 0.84) / 0.16)
+
+      ZStack {
+        Color(uiColor: .systemBackground)
+          .opacity(backgroundOpacity)
+          .ignoresSafeArea()
+
+        // The runtime overlay uses the exact same asset as UILaunchScreen. At
+        // the final few frames it crossfades into the existing Home logo, so
+        // the Home UI itself does not need to change.
+        Image("LaunchLogo")
+          .resizable()
+          .interpolation(.high)
+          .scaledToFit()
+          .frame(width: logoSize, height: logoSize)
+          .position(center)
+          .opacity(logoOpacity)
+          .shadow(color: .black.opacity(0.10 * (1 - p)), radius: 14 * (1 - p), y: 6 * (1 - p))
+      }
+      .frame(width: proxy.size.width, height: proxy.size.height)
+    }
+    .ignoresSafeArea()
   }
 }
 
@@ -153,6 +251,15 @@ private struct HomeView: View {
   private var header: some View {
     HStack(spacing: 12) {
       CinevaLogoMark(size: 48)
+        .background {
+          GeometryReader { logoProxy in
+            Color.clear
+              .preference(
+                key: HomeLogoFramePreferenceKey.self,
+                value: logoProxy.frame(in: .named(CinevaLaunchHeroSpace.name))
+              )
+          }
+        }
       VStack(alignment: .leading, spacing: 2) {
         Text("Cineva")
           .font(.system(size: 29, weight: .bold, design: .rounded))
