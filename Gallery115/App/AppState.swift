@@ -89,10 +89,10 @@ final class AppState {
 
     var title: String {
       switch self {
-      case .unknown: return "115 · 未检测"
-      case .connected: return "115 · 已连接"
-      case .cache: return "115 · 缓存"
-      case .offline: return "115 · 离线"
+      case .unknown: return "OpenList · WebDAV"
+      case .connected: return "OpenList · 已连接"
+      case .cache: return "OpenList · 缓存"
+      case .offline: return "OpenList · 离线"
       }
     }
 
@@ -110,8 +110,7 @@ final class AppState {
   let thumbnailService = ThumbnailService()
   let libraryStore = LibraryStore()
 
-  private(set) var mediaSourceKind: MediaSourceKind
-  var isConfigured: Bool
+  var isConfigured = WebDAVCredentialStore.shared.isConfigured
   var biometricErrorMessage: String?
   private(set) var isAppUnlocked: Bool
   private var biometricAuthenticationInProgress = false
@@ -197,64 +196,33 @@ final class AppState {
       ?? .highestTranscode
     colorSchemePreference =
       ColorSchemePreference(rawValue: defaults.string(forKey: Keys.colorScheme) ?? "") ?? .system
-    let sourceStore = MediaSourceSelectionStore.shared
-    let resolvedSource = sourceStore.resolvedSource
-    mediaSourceKind = resolvedSource
-    isConfigured = sourceStore.isConfigured(resolvedSource)
-    switch resolvedSource {
-    case .cloud115:
-      rootFolderID = "0"
-    case .webDAV:
-      rootFolderID = WebDAVCredentialStore.shared.configuration?.normalizedRootPath
-        ?? defaults.string(forKey: Keys.rootFolderID)
-        ?? "/115"
-    }
-    let storedFaceIDEnabled = defaults.object(forKey: Keys.faceIDEnabled) as? Bool
-    let resolvedFaceIDEnabled = storedFaceIDEnabled ?? Self.deviceSupportsBiometrics()
-    faceIDEnabled = resolvedFaceIDEnabled
+    rootFolderID = WebDAVCredentialStore.shared.configuration?.normalizedRootPath
+      ?? defaults.string(forKey: Keys.rootFolderID)
+      ?? "/115"
+    faceIDEnabled = defaults.bool(forKey: Keys.faceIDEnabled)
     playerGesturesEnabled = defaults.object(forKey: Keys.playerGesturesEnabled) as? Bool ?? true
     autoPlayNextEpisode = defaults.object(forKey: Keys.autoPlayNextEpisode) as? Bool ?? true
     let storedRate = defaults.object(forKey: Keys.preferredPlaybackRate) as? Double ?? 1.0
     preferredPlaybackRate = Float(min(max(storedRate, 0.5), 2.0))
     let storedSeek = defaults.object(forKey: Keys.doubleTapSeekSeconds) as? Int ?? 15
     doubleTapSeekSeconds = [10, 15, 30].contains(storedSeek) ? storedSeek : 15
-    isAppUnlocked = !resolvedFaceIDEnabled
-  }
-
-  func finishConfiguration(source: MediaSourceKind, rootFolderID: String) {
-    MediaSourceSelectionStore.shared.activeSource = source
-    mediaSourceKind = source
-
-    switch source {
-    case .cloud115:
-      self.rootFolderID = "0"
-    case .webDAV:
-      let trimmed = rootFolderID.trimmingCharacters(in: .whitespacesAndNewlines)
-      self.rootFolderID = trimmed.isEmpty ? "/115" : (trimmed.hasPrefix("/") ? trimmed : "/" + trimmed)
-    }
-
-    isConfigured = MediaSourceSelectionStore.shared.isConfigured(source)
-    mediaConnectionState = .unknown
+    isAppUnlocked = !defaults.bool(forKey: Keys.faceIDEnabled)
   }
 
   func finishConfiguration(rootFolderID: String) {
-    finishConfiguration(
-      source: MediaSourceSelectionStore.shared.resolvedSource,
-      rootFolderID: rootFolderID
-    )
+    let trimmed = rootFolderID.trimmingCharacters(in: .whitespacesAndNewlines)
+    self.rootFolderID = trimmed.isEmpty ? "/115" : (trimmed.hasPrefix("/") ? trimmed : "/" + trimmed)
+    isConfigured = WebDAVCredentialStore.shared.isConfigured
+    isAppUnlocked = true
   }
 
   func signOut() {
-    switch mediaSourceKind {
-    case .webDAV:
-      WebDAVCredentialStore.shared.clear()
-    case .cloud115:
-      CredentialStore.shared.clear()
-    }
+    WebDAVCredentialStore.shared.clear()
+    CredentialStore.shared.clear()
     libraryStore.clearSensitiveSessionData()
     Task { await api.clearMountCache() }
     isConfigured = false
-    mediaConnectionState = .unknown
+    isAppUnlocked = true
   }
 
   func lockForBackground() {
@@ -291,16 +259,6 @@ final class AppState {
     return success
   }
 
-  var mediaConnectionTitle: String {
-    let source = mediaSourceKind == .cloud115 ? "115" : "OpenList"
-    switch mediaConnectionState {
-    case .unknown: return "\(source) · 已挂载"
-    case .connected: return "\(source) · 已连接"
-    case .cache: return "\(source) · 缓存"
-    case .offline: return "\(source) · 离线"
-    }
-  }
-
   func markMediaConnected() {
     mediaConnectionState = .connected
   }
@@ -315,14 +273,10 @@ final class AppState {
     mediaConnectionState = .offline
   }
 
-  private static func deviceSupportsBiometrics() -> Bool {
+  var canUseBiometrics: Bool {
     let context = LAContext()
     var error: NSError?
     return context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error)
-  }
-
-  var canUseBiometrics: Bool {
-    Self.deviceSupportsBiometrics()
   }
 
   var biometricTitle: String {

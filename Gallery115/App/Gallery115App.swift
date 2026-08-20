@@ -15,7 +15,7 @@ struct Gallery115App: App {
           switch phase {
           case .active:
             Task { await appState.authenticateIfNeeded() }
-          case .background:
+          case .inactive, .background:
             appState.lockForBackground()
           default:
             break

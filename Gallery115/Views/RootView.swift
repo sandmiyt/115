@@ -11,14 +11,44 @@ enum AppTab: Hashable {
 struct RootView: View {
   @Environment(AppState.self) private var appState
 
+  private var isPrivacyLocked: Bool {
+    appState.faceIDEnabled && !appState.isAppUnlocked
+  }
+
   var body: some View {
     ZStack {
-      MainTabView()
-      if appState.faceIDEnabled && !appState.isAppUnlocked {
+      if isPrivacyLocked {
+        LockedPrivacyBackground()
+      } else {
+        MainTabView()
+      }
+
+      if isPrivacyLocked {
         AppLockView()
           .zIndex(10_000)
       }
     }
+    .animation(.easeOut(duration: 0.16), value: isPrivacyLocked)
+  }
+}
+
+private struct LockedPrivacyBackground: View {
+  var body: some View {
+    ZStack {
+      Color.black
+      LinearGradient(
+        colors: [
+          CinevaTheme.accent.opacity(0.20),
+          Color.black,
+          CinevaTheme.accentRed.opacity(0.12),
+        ],
+        startPoint: .topLeading,
+        endPoint: .bottomTrailing
+      )
+      .blur(radius: 34)
+      .scaleEffect(1.15)
+    }
+    .ignoresSafeArea()
   }
 }
 
@@ -27,7 +57,8 @@ private struct AppLockView: View {
   @State private var isAuthenticating = false
 
   var body: some View {
-    Color.black
+    Rectangle()
+      .fill(.ultraThinMaterial)
       .ignoresSafeArea()
       .contentShape(Rectangle())
       .onTapGesture {

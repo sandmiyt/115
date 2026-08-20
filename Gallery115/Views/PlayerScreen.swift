@@ -131,6 +131,15 @@ struct PlayerScreen: View {
             .allowsHitTesting(false)
             .zIndex(40)
         }
+
+        if appState.faceIDEnabled && !appState.isAppUnlocked {
+          Rectangle()
+            .fill(.ultraThinMaterial)
+            .ignoresSafeArea()
+            .contentShape(Rectangle())
+            .allowsHitTesting(true)
+            .zIndex(10_000)
+        }
       }
       .frame(width: proxy.size.width, height: proxy.size.height)
       .animation(.easeInOut(duration: chromeShouldBeVisible ? 0.18 : 0.26), value: chromeShouldBeVisible)
@@ -1012,7 +1021,11 @@ struct PlayerScreen: View {
         if landscape {
           landscapeUtilityBar(model: model)
         } else {
-          portraitUtilityBar(model: model)
+          // Portrait keeps only the timeline; the small spacer places it slightly lower
+          // without crowding the home indicator.
+          Color.clear
+            .frame(height: 18)
+            .allowsHitTesting(false)
         }
       }
     }
