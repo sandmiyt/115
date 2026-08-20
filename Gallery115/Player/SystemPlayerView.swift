@@ -40,7 +40,10 @@ final class SystemPlayerPresentationController: NSObject, AVPictureInPictureCont
     }
 
     if pictureInPictureController == nil {
-      let controller = AVPictureInPictureController(playerLayer: playerLayer)
+      guard let controller = AVPictureInPictureController(playerLayer: playerLayer) else {
+        isPictureInPictureSupported = false
+        return
+      }
       controller.delegate = self
       controller.canStartPictureInPictureAutomaticallyFromInline = true
       pictureInPictureController = controller

@@ -1362,6 +1362,16 @@ struct PlayerScreen: View {
   }
 
   @MainActor
+  private func applyAutomaticOrientation(for size: CGSize?) {
+    guard let size, size.width > 0, size.height > 0 else {
+      PlayerOrientation.request(.portrait)
+      return
+    }
+    let ratio = size.width / max(size.height, 1)
+    PlayerOrientation.request(ratio > 1.12 ? .landscape : .portrait)
+  }
+
+  @MainActor
   private func activatePlaybackEngine(for playerModel: PlayerModel) {
     guard let source = playerModel.selectedSource else {
       useVLC = false
