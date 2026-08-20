@@ -427,7 +427,7 @@ final class PlayerModel: PlaybackEngineControlling {
         to: CMTime(seconds: resumePosition, preferredTimescale: 600),
         toleranceBefore: CMTime(seconds: 1, preferredTimescale: 600),
         toleranceAfter: CMTime(seconds: 1, preferredTimescale: 600)
-      )
+      ) { _ in }
     } else {
       currentTime = 0
     }
@@ -699,7 +699,7 @@ final class PlayerModel: PlaybackEngineControlling {
         ) { [weak self] finished in
           Task { @MainActor [weak self] in
             guard let self, finished else { return }
-            self.player.playImmediately(atRate: self.playbackRate)
+            self.player.playImmediately(atRate: self.player.defaultRate)
             self.isBuffering = false
           }
         }

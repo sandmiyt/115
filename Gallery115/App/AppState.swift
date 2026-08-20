@@ -89,10 +89,10 @@ final class AppState {
 
     var title: String {
       switch self {
-      case .unknown: return "OpenList · WebDAV"
-      case .connected: return "OpenList · 已连接"
-      case .cache: return "OpenList · 缓存"
-      case .offline: return "OpenList · 离线"
+      case .unknown: return "115 · 未检测"
+      case .connected: return "115 · 已连接"
+      case .cache: return "115 · 缓存"
+      case .offline: return "115 · 离线"
       }
     }
 
@@ -110,7 +110,8 @@ final class AppState {
   let thumbnailService = ThumbnailService()
   let libraryStore = LibraryStore()
 
-  var isConfigured = WebDAVCredentialStore.shared.isConfigured
+  private(set) var mediaSourceKind: MediaSourceKind
+  var isConfigured: Bool
   var biometricErrorMessage: String?
   private(set) var isAppUnlocked: Bool
   private var biometricAuthenticationInProgress = false
@@ -174,6 +175,7 @@ final class AppState {
   var autoLoadExternalSubtitle: Bool {
     didSet { UserDefaults.standard.set(autoLoadExternalSubtitle, forKey: Keys.autoLoadExternalSubtitle) }
   }
+
   var autoLoadExternalSubtitles: Bool {
     get { autoLoadExternalSubtitle }
     set { autoLoadExternalSubtitle = newValue }
@@ -182,12 +184,15 @@ final class AppState {
   var subtitleFontScale: Double {
     didSet { UserDefaults.standard.set(min(max(subtitleFontScale, 0.8), 1.6), forKey: Keys.subtitleFontScale) }
   }
+
   var subtitleBottomPadding: Double {
     didSet { UserDefaults.standard.set(min(max(subtitleBottomPadding, 0.04), 0.28), forKey: Keys.subtitleBottomPadding) }
   }
+
   var subtitleDelaySeconds: Double {
     didSet { UserDefaults.standard.set(min(max(subtitleDelaySeconds, -10), 10), forKey: Keys.subtitleDelaySeconds) }
   }
+
   var subtitleTimeOffset: Double {
     get { subtitleDelaySeconds }
     set { subtitleDelaySeconds = newValue }
@@ -196,18 +201,28 @@ final class AppState {
   var chapterMarksEnabled: Bool {
     didSet { UserDefaults.standard.set(chapterMarksEnabled, forKey: Keys.chapterMarksEnabled) }
   }
+
+  var showChapterMarkers: Bool {
+    get { chapterMarksEnabled }
+    set { chapterMarksEnabled = newValue }
+  }
+
   var skipIntroEnabled: Bool {
     didSet { UserDefaults.standard.set(skipIntroEnabled, forKey: Keys.skipIntroEnabled) }
   }
+
   var introSkipSeconds: Int {
     didSet { UserDefaults.standard.set(min(max(introSkipSeconds, 10), 300), forKey: Keys.introSkipSeconds) }
   }
+
   var skipOutroEnabled: Bool {
     didSet { UserDefaults.standard.set(skipOutroEnabled, forKey: Keys.skipOutroEnabled) }
   }
+
   var outroSkipSeconds: Int {
     didSet { UserDefaults.standard.set(min(max(outroSkipSeconds, 10), 600), forKey: Keys.outroSkipSeconds) }
   }
+
   var outroPromptSeconds: Int {
     get { outroSkipSeconds }
     set { outroSkipSeconds = newValue }
@@ -216,19 +231,16 @@ final class AppState {
   var progressPreviewEnabled: Bool {
     didSet { UserDefaults.standard.set(progressPreviewEnabled, forKey: Keys.progressPreviewEnabled) }
   }
+
   var timelinePreviewEnabled: Bool {
     get { progressPreviewEnabled }
     set { progressPreviewEnabled = newValue }
   }
 
-  var showChapterMarkers: Bool {
-    get { chapterMarksEnabled }
-    set { chapterMarksEnabled = newValue }
-  }
-
   var networkAutoRecoveryEnabled: Bool {
     didSet { UserDefaults.standard.set(networkAutoRecoveryEnabled, forKey: Keys.networkAutoRecoveryEnabled) }
   }
+
   var fastStartEnabled: Bool {
     didSet { UserDefaults.standard.set(fastStartEnabled, forKey: Keys.fastStartEnabled) }
   }
@@ -258,10 +270,21 @@ final class AppState {
       ?? .highestTranscode
     colorSchemePreference =
       ColorSchemePreference(rawValue: defaults.string(forKey: Keys.colorScheme) ?? "") ?? .system
-    rootFolderID = WebDAVCredentialStore.shared.configuration?.normalizedRootPath
-      ?? defaults.string(forKey: Keys.rootFolderID)
-      ?? "/115"
-    faceIDEnabled = defaults.bool(forKey: Keys.faceIDEnabled)
+    let sourceStore = MediaSourceSelectionStore.shared
+    let resolvedSource = sourceStore.resolvedSource
+    mediaSourceKind = resolvedSource
+    isConfigured = sourceStore.isConfigured(resolvedSource)
+    switch resolvedSource {
+    case .cloud115:
+      rootFolderID = "0"
+    case .webDAV:
+      rootFolderID = WebDAVCredentialStore.shared.configuration?.normalizedRootPath
+        ?? defaults.string(forKey: Keys.rootFolderID)
+        ?? "/115"
+    }
+    let storedFaceIDEnabled = defaults.object(forKey: Keys.faceIDEnabled) as? Bool
+    let resolvedFaceIDEnabled = storedFaceIDEnabled ?? Self.deviceSupportsBiometrics()
+    faceIDEnabled = resolvedFaceIDEnabled
     playerGesturesEnabled = defaults.object(forKey: Keys.playerGesturesEnabled) as? Bool ?? true
     autoPlayNextEpisode = defaults.object(forKey: Keys.autoPlayNextEpisode) as? Bool ?? true
     autoLoadExternalSubtitle = defaults.object(forKey: Keys.autoLoadExternalSubtitle) as? Bool ?? true
@@ -280,23 +303,43 @@ final class AppState {
     preferredPlaybackRate = Float(min(max(storedRate, 0.5), 2.0))
     let storedSeek = defaults.object(forKey: Keys.doubleTapSeekSeconds) as? Int ?? 15
     doubleTapSeekSeconds = [10, 15, 30].contains(storedSeek) ? storedSeek : 15
-    isAppUnlocked = !defaults.bool(forKey: Keys.faceIDEnabled)
+    isAppUnlocked = !resolvedFaceIDEnabled
+  }
+
+  func finishConfiguration(source: MediaSourceKind, rootFolderID: String) {
+    MediaSourceSelectionStore.shared.activeSource = source
+    mediaSourceKind = source
+
+    switch source {
+    case .cloud115:
+      self.rootFolderID = "0"
+    case .webDAV:
+      let trimmed = rootFolderID.trimmingCharacters(in: .whitespacesAndNewlines)
+      self.rootFolderID = trimmed.isEmpty ? "/115" : (trimmed.hasPrefix("/") ? trimmed : "/" + trimmed)
+    }
+
+    isConfigured = MediaSourceSelectionStore.shared.isConfigured(source)
+    mediaConnectionState = .unknown
   }
 
   func finishConfiguration(rootFolderID: String) {
-    let trimmed = rootFolderID.trimmingCharacters(in: .whitespacesAndNewlines)
-    self.rootFolderID = trimmed.isEmpty ? "/115" : (trimmed.hasPrefix("/") ? trimmed : "/" + trimmed)
-    isConfigured = WebDAVCredentialStore.shared.isConfigured
-    isAppUnlocked = true
+    finishConfiguration(
+      source: MediaSourceSelectionStore.shared.resolvedSource,
+      rootFolderID: rootFolderID
+    )
   }
 
   func signOut() {
-    WebDAVCredentialStore.shared.clear()
-    CredentialStore.shared.clear()
+    switch mediaSourceKind {
+    case .webDAV:
+      WebDAVCredentialStore.shared.clear()
+    case .cloud115:
+      CredentialStore.shared.clear()
+    }
     libraryStore.clearSensitiveSessionData()
     Task { await api.clearMountCache() }
     isConfigured = false
-    isAppUnlocked = true
+    mediaConnectionState = .unknown
   }
 
   func lockForBackground() {
@@ -333,6 +376,16 @@ final class AppState {
     return success
   }
 
+  var mediaConnectionTitle: String {
+    let source = mediaSourceKind == .cloud115 ? "115" : "OpenList"
+    switch mediaConnectionState {
+    case .unknown: return "\(source) · 已挂载"
+    case .connected: return "\(source) · 已连接"
+    case .cache: return "\(source) · 缓存"
+    case .offline: return "\(source) · 离线"
+    }
+  }
+
   func markMediaConnected() {
     mediaConnectionState = .connected
   }
@@ -347,10 +400,14 @@ final class AppState {
     mediaConnectionState = .offline
   }
 
-  var canUseBiometrics: Bool {
+  private static func deviceSupportsBiometrics() -> Bool {
     let context = LAContext()
     var error: NSError?
     return context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error)
+  }
+
+  var canUseBiometrics: Bool {
+    Self.deviceSupportsBiometrics()
   }
 
   var biometricTitle: String {

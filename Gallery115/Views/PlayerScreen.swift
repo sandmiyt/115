@@ -62,6 +62,10 @@ struct PlayerScreen: View {
   }
 
   var body: some View {
+    playbackObservedView
+  }
+
+  private var playerBaseView: some View {
     GeometryReader { proxy in
       ZStack {
         Color.black.ignoresSafeArea()
@@ -181,6 +185,10 @@ struct PlayerScreen: View {
     .background(Color.black)
     .ignoresSafeArea()
     .statusBarHidden(true)
+  }
+
+  private var playerPresentationView: some View {
+    playerBaseView
     .sheet(isPresented: $showInfo) {
       PlayerInfoSheet(
         item: currentItem,
@@ -244,6 +252,10 @@ struct PlayerScreen: View {
     } message: {
       Text(model?.errorMessage ?? "未知错误")
     }
+  }
+
+  private var playbackObservedView: some View {
+    playerPresentationView
     .task(id: currentItem.id) {
       await prepareCurrentItem()
     }
@@ -281,21 +293,24 @@ struct PlayerScreen: View {
         }
       }
     }
-    .onDisappear {
-      showSettingsPanel = false
-      showSpeedPanel = false
-      showQueuePanel = false
-      isControlsInteractionActive = false
-      hudTask?.cancel()
-      favoriteHUDTask?.cancel()
-      controlsTask?.cancel()
-      timelinePreviewTask?.cancel()
-      subtitleLoadTask?.cancel()
-      pauseActivePlayer()
-      vlcController.stop()
-      RemotePlaybackCoordinator.shared.deactivate()
-      PlayerOrientation.request(.portrait)
-    }
+    .onDisappear(perform: handlePlayerDisappear)
+  }
+
+
+  private func handlePlayerDisappear() {
+    showSettingsPanel = false
+    showSpeedPanel = false
+    showQueuePanel = false
+    isControlsInteractionActive = false
+    hudTask?.cancel()
+    favoriteHUDTask?.cancel()
+    controlsTask?.cancel()
+    timelinePreviewTask?.cancel()
+    subtitleLoadTask?.cancel()
+    pauseActivePlayer()
+    vlcController.stop()
+    RemotePlaybackCoordinator.shared.deactivate()
+    PlayerOrientation.request(.portrait)
   }
 
   @ViewBuilder
