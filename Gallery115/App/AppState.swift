@@ -210,14 +210,15 @@ final class AppState {
         ?? "/115"
     }
     let storedFaceIDEnabled = defaults.object(forKey: Keys.faceIDEnabled) as? Bool
-    faceIDEnabled = storedFaceIDEnabled ?? Self.deviceSupportsBiometrics()
+    let resolvedFaceIDEnabled = storedFaceIDEnabled ?? Self.deviceSupportsBiometrics()
+    faceIDEnabled = resolvedFaceIDEnabled
     playerGesturesEnabled = defaults.object(forKey: Keys.playerGesturesEnabled) as? Bool ?? true
     autoPlayNextEpisode = defaults.object(forKey: Keys.autoPlayNextEpisode) as? Bool ?? true
     let storedRate = defaults.object(forKey: Keys.preferredPlaybackRate) as? Double ?? 1.0
     preferredPlaybackRate = Float(min(max(storedRate, 0.5), 2.0))
     let storedSeek = defaults.object(forKey: Keys.doubleTapSeekSeconds) as? Int ?? 15
     doubleTapSeekSeconds = [10, 15, 30].contains(storedSeek) ? storedSeek : 15
-    isAppUnlocked = !faceIDEnabled
+    isAppUnlocked = !resolvedFaceIDEnabled
   }
 
   func finishConfiguration(source: MediaSourceKind, rootFolderID: String) {
