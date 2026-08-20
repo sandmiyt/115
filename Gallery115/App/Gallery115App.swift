@@ -6,6 +6,7 @@ import UIKit
 struct Gallery115App: App {
   @Environment(\.scenePhase) private var scenePhase
   @State private var appState = AppState()
+  @State private var foregroundAuthenticationInProgress = false
 
   var body: some Scene {
     WindowGroup {
@@ -18,27 +19,26 @@ struct Gallery115App: App {
           // This is visual privacy only; Face ID remains untouched until .background.
           AppPrivacyShield.shared.show()
         }
+        .task {
+          // scenePhase normally transitions to .active after the root view mounts,
+          // but run the same guarded path for a cold launch that is already active.
+          if scenePhase == .active {
+            await handleForegroundActivation()
+          }
+        }
         .onChange(of: scenePhase) { _, phase in
           switch phase {
           case .active:
-            // If we really entered the background, convert the deferred lock
-            // now—not while Picture in Picture is running on the Home Screen.
-            // This keeps PiP uninterrupted but still guarantees Face ID when
-            // the user returns to Cineva from PiP or from the Home Screen.
-            appState.prepareForForegroundAuthentication()
             Task { @MainActor in
-              // Give SwiftUI one turn to mount its locked/blurred presentation
-              // before removing the window-level privacy glass.
-              await Task.yield()
-              AppPrivacyShield.shared.hide()
-              await appState.authenticateIfNeeded()
+              await handleForegroundActivation()
             }
           case .inactive:
-            // Only protect the system app-switcher snapshot here. Do not change
-            // Face ID state for Control Center, Notification Center, permission
-            // prompts, or other temporary inactive transitions.
+            // Protect the app-switcher snapshot immediately, but do not change
+            // the biometric lock state for Control Center / Notification Center.
             AppPrivacyShield.shared.show()
           case .background:
+            // Keep the privacy glass visible while PiP continues on the Home Screen.
+            // Face ID itself is deferred until the app becomes active again.
             AppPrivacyShield.shared.show()
             appState.lockForBackground()
           @unknown default:
@@ -46,6 +46,25 @@ struct Gallery115App: App {
           }
         }
     }
+  }
+
+  @MainActor
+  private func handleForegroundActivation() async {
+    guard !foregroundAuthenticationInProgress else { return }
+    foregroundAuthenticationInProgress = true
+    defer { foregroundAuthenticationInProgress = false }
+
+    // Convert a real background transition into the visible locked state while
+    // the window-level frosted glass is STILL covering the app. This prevents a
+    // single clear frame from appearing before Face ID is presented.
+    appState.prepareForForegroundAuthentication()
+    _ = await appState.authenticateIfNeeded()
+
+    // Keep the privacy glass until SwiftUI has committed either the fully
+    // unlocked hierarchy or the locked fallback after a cancelled/failed scan.
+    await Task.yield()
+    await Task.yield()
+    AppPrivacyShield.shared.hide()
   }
 }
 
@@ -59,7 +78,9 @@ private final class AppPrivacyShield {
 
   func show() {
     for case let scene as UIWindowScene in UIApplication.shared.connectedScenes {
-      for window in scene.windows where !window.isHidden && window.alpha > 0 {
+      for window in scene.windows
+      where !window.isHidden && window.alpha > 0 && window.windowLevel == .normal
+      {
         let key = ObjectIdentifier(window)
         guard shields[key] == nil else { continue }
 
@@ -67,17 +88,35 @@ private final class AppPrivacyShield {
         container.translatesAutoresizingMaskIntoConstraints = false
         container.isUserInteractionEnabled = true
         container.accessibilityViewIsModal = true
+        container.backgroundColor = .clear
+        container.clipsToBounds = true
 
-        let blur = UIVisualEffectView(effect: UIBlurEffect(style: .systemThickMaterial))
+        // Freeze the current app frame first, then blur that frozen frame. Using
+        // a snapshot behind the blur makes the app-switcher card look like real
+        // frosted glass and prevents live content from briefly peeking through
+        // while the scene is moving between active/background states.
+        if let snapshot = window.snapshotView(afterScreenUpdates: false) {
+          snapshot.translatesAutoresizingMaskIntoConstraints = false
+          snapshot.isUserInteractionEnabled = false
+          container.addSubview(snapshot)
+          NSLayoutConstraint.activate([
+            snapshot.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            snapshot.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            snapshot.topAnchor.constraint(equalTo: container.topAnchor),
+            snapshot.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+          ])
+        }
+
+        let blur = UIVisualEffectView(effect: UIBlurEffect(style: .systemMaterial))
         blur.translatesAutoresizingMaskIntoConstraints = false
         blur.isUserInteractionEnabled = false
         container.addSubview(blur)
 
+        // A light veil raises privacy without turning the effect into an opaque
+        // white/black plate; text and video remain visibly blurred underneath.
         let veil = UIView()
         veil.translatesAutoresizingMaskIntoConstraints = false
-        // A stronger frosted-glass veil keeps titles, thumbnails and video
-        // frames unreadable in the app switcher without changing Cineva's UI.
-        veil.backgroundColor = UIColor.systemBackground.withAlphaComponent(0.32)
+        veil.backgroundColor = UIColor.systemBackground.withAlphaComponent(0.18)
         veil.isUserInteractionEnabled = false
         container.addSubview(veil)
 
@@ -103,8 +142,10 @@ private final class AppPrivacyShield {
   }
 
   func hide() {
-    for shield in shields.values {
-      shield.removeFromSuperview()
+    UIView.performWithoutAnimation {
+      for shield in shields.values {
+        shield.removeFromSuperview()
+      }
     }
     shields.removeAll()
   }

@@ -415,7 +415,7 @@ final class PlayerModel: PlaybackEngineControlling {
     activeAsset = asset
 
     let playerItem = AVPlayerItem(asset: asset)
-    playerItem.preferredForwardBufferDuration = fastStartEnabled ? 8 : 20
+    playerItem.preferredForwardBufferDuration = fastStartEnabled ? 3 : 20
     playerItem.preferredPeakBitRate = 0
     installItemObservers(for: playerItem)
     player.replaceCurrentItem(with: playerItem)
@@ -437,7 +437,14 @@ final class PlayerModel: PlaybackEngineControlling {
 
     let generation = mediaInfoGeneration
     Task { @MainActor [weak self] in
-      guard let self, self.mediaInfoGeneration == generation, self.player.currentItem === playerItem else { return }
+      guard let self else { return }
+      // In fast-start mode, give AVPlayer a short head start before asking the
+      // same remote asset for duration/tracks/chapters. Those inspections can
+      // otherwise compete with the first media ranges on slower OpenList links.
+      if self.fastStartEnabled {
+        try? await Task.sleep(nanoseconds: 450_000_000)
+      }
+      guard self.mediaInfoGeneration == generation, self.player.currentItem === playerItem else { return }
       async let durationTask = try? asset.load(.duration)
       async let characteristicsTask = self.detectVideoCharacteristics(asset)
       async let selectionTask: Void = self.loadMediaSelectionOptions(asset: asset, playerItem: playerItem)

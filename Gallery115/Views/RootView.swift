@@ -38,7 +38,6 @@ struct RootView: View {
           .zIndex(10_000)
       }
     }
-    .animation(.easeOut(duration: 0.16), value: isPrivacyLocked)
   }
 }
 
@@ -52,9 +51,6 @@ private struct AppLockView: View {
       .ignoresSafeArea()
       .contentShape(Rectangle())
       .onTapGesture {
-        authenticate()
-      }
-      .task {
         authenticate()
       }
   }

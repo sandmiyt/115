@@ -45,6 +45,7 @@ struct PlayerScreen: View {
   @State private var timelinePreviewBucket = -1
   @State private var timelinePreviewTask: Task<Void, Never>?
   @State private var subtitleLoadTask: Task<Void, Never>?
+  @State private var auxiliaryLoadTask: Task<Void, Never>?
 
   init(item: CloudItem, playlist: [CloudItem] = []) {
     _currentItem = State(initialValue: item)
@@ -307,6 +308,7 @@ struct PlayerScreen: View {
     controlsTask?.cancel()
     timelinePreviewTask?.cancel()
     subtitleLoadTask?.cancel()
+    auxiliaryLoadTask?.cancel()
     pauseActivePlayer()
     vlcController.stop()
     RemotePlaybackCoordinator.shared.deactivate()
@@ -1506,6 +1508,7 @@ struct PlayerScreen: View {
     controlsTask?.cancel()
     timelinePreviewTask?.cancel()
     subtitleLoadTask?.cancel()
+    auxiliaryLoadTask?.cancel()
     timelinePreviewImage = nil
     timelinePreviewBucket = -1
     externalSubtitleTracks = []
@@ -1537,20 +1540,15 @@ struct PlayerScreen: View {
     model = newModel
     newModel.setPlaybackRate(playbackRate)
 
-    // Metadata, sidecar subtitles and chapters are independent of decoding.
-    // Start them in parallel, but never make the first video frame wait for them.
-    async let metadataTask = appState.api.localMetadata(for: expectedItem)
-    async let subtitleTracksTask: [ExternalSubtitleTrack] = (try? await appState.api.externalSubtitleTracks(for: expectedItem)) ?? []
-    async let sidecarChapterTask = appState.api.sidecarChapters(for: expectedItem)
-
+    // The first frame has strict priority. Do not even START NFO/poster,
+    // subtitle, chapter, or full-playlist requests until the playback engine has
+    // received its URL and begun opening the media connection.
     await newModel.prepareAndPlay()
     guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else {
       newModel.player.pause()
       return
     }
 
-    // VLC fallback is activated immediately after source preparation. Previously
-    // local NFO/poster loading could delay VLC playback even though the URL was ready.
     activatePlaybackEngine(for: newModel)
     applyPlaybackRate(playbackRate, persist: false)
     applyAutomaticOrientation(for: newModel.videoDisplaySize)
@@ -1559,20 +1557,39 @@ struct PlayerScreen: View {
     controlsVisible = true
     scheduleControlsHide()
 
-    let metadata = await metadataTask
-    guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else { return }
-    localMetadata = metadata
-    configureRemotePlayback()
+    auxiliaryLoadTask = Task { @MainActor in
+      // Give AVPlayer/VLC the network for a moment before sidecar discovery.
+      if appState.fastStartEnabled {
+        try? await Task.sleep(nanoseconds: 650_000_000)
+      }
+      guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else { return }
 
-    let tracks = await subtitleTracksTask
-    guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else { return }
-    externalSubtitleTracks = tracks
-    autoSelectExternalSubtitleIfNeeded()
+      async let subtitleTracksTask: [ExternalSubtitleTrack] =
+        (try? await appState.api.externalSubtitleTracks(for: expectedItem)) ?? []
+      async let sidecarChapterTask = appState.api.sidecarChapters(for: expectedItem)
 
-    sidecarChapters = await sidecarChapterTask
-    guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else { return }
+      let tracks = await subtitleTracksTask
+      guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else { return }
+      externalSubtitleTracks = tracks
+      autoSelectExternalSubtitleIfNeeded()
 
-    await ensureCompletePlaylist(for: expectedItem)
+      sidecarChapters = await sidecarChapterTask
+      guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else { return }
+
+      // Poster/NFO can be much larger than chapter/subtitle discovery. Load it
+      // after playback has had an additional head start so artwork never wins a
+      // bandwidth race against the first seconds of the movie.
+      if appState.fastStartEnabled {
+        try? await Task.sleep(nanoseconds: 700_000_000)
+      }
+      guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else { return }
+
+      localMetadata = await appState.api.localMetadata(for: expectedItem)
+      guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else { return }
+      configureRemotePlayback()
+
+      await ensureCompletePlaylist(for: expectedItem)
+    }
   }
 
   @MainActor

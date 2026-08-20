@@ -50,7 +50,7 @@ import SwiftUI
       lastSavedSecond = -1
 
       let media = VLCMedia(url: source.url)
-      let cacheMilliseconds = item.isDiscImage ? 4200 : (fastStartEnabled ? 900 : 1800)
+      let cacheMilliseconds = item.isDiscImage ? 4200 : (fastStartEnabled ? 650 : 1800)
       var options: [String: Any] = [
         "http-user-agent": APIClient.userAgent,
         "network-caching": cacheMilliseconds,
