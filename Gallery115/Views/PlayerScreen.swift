@@ -65,10 +65,12 @@ struct PlayerScreen: View {
 
         if isLocked {
           lockShield(proxy: proxy)
-        } else if controlsVisible {
+        } else {
           playerChrome(proxy: proxy)
             .simultaneousGesture(controlsInteractionGesture)
-            .transition(.opacity)
+            .opacity(chromeShouldBeVisible ? 1 : 0)
+            .allowsHitTesting(chromeShouldBeVisible && !showSettingsPanel && !showSpeedPanel && !showQueuePanel)
+            .accessibilityHidden(!chromeShouldBeVisible)
         }
 
         if showSettingsPanel, !isLocked {
@@ -119,7 +121,7 @@ struct PlayerScreen: View {
         }
       }
       .frame(width: proxy.size.width, height: proxy.size.height)
-      .animation(.easeInOut(duration: 0.20), value: controlsVisible)
+      .animation(.easeInOut(duration: chromeShouldBeVisible ? 0.18 : 0.26), value: chromeShouldBeVisible)
       .animation(.easeInOut(duration: 0.18), value: showPlaybackHUD)
     }
     .background(Color.black)
@@ -147,6 +149,18 @@ struct PlayerScreen: View {
       } else {
         scheduleControlsHide()
       }
+    }
+    .onChange(of: showSettingsPanel) { _, presented in
+      handleInteractiveOverlayChange(presented)
+    }
+    .onChange(of: showSpeedPanel) { _, presented in
+      handleInteractiveOverlayChange(presented)
+    }
+    .onChange(of: showQueuePanel) { _, presented in
+      handleInteractiveOverlayChange(presented)
+    }
+    .onChange(of: showPlaybackHUD) { _, presented in
+      handleInteractiveOverlayChange(presented)
     }
     .alert(
       "播放失败",
@@ -354,7 +368,7 @@ struct PlayerScreen: View {
   private func topOverlay(proxy: GeometryProxy) -> some View {
     let landscape = proxy.size.width > proxy.size.height
 
-    return HStack(spacing: landscape ? 10 : 9) {
+    return HStack(spacing: landscape ? 10 : 8) {
       playerIconButton("xmark") {
         pauseActivePlayer()
         dismiss()
@@ -362,39 +376,33 @@ struct PlayerScreen: View {
 
       VStack(alignment: .leading, spacing: 2) {
         Text(localMetadata?.displayTitle(fallback: currentItem.name) ?? currentItem.name)
-          .font(landscape ? .subheadline.weight(.semibold) : .subheadline.weight(.semibold))
+          .font(.subheadline.weight(.semibold))
           .foregroundStyle(.white)
           .lineLimit(1)
-        if landscape, playlist.count > 1 {
-          Text("\(max(currentIndex + 1, 1)) / \(playlist.count)")
-            .font(.caption2)
-            .foregroundStyle(.white.opacity(0.56))
+
+        if playlist.count > 1 {
+          Text("第 \(max(currentIndex + 1, 1)) / \(playlist.count) 个")
+            .font(.caption2.monospacedDigit())
+            .foregroundStyle(.white.opacity(0.52))
         }
       }
       .layoutPriority(1)
 
-      Spacer(minLength: 4)
+      Spacer(minLength: 6)
 
-      if let model, model.sources.count > 1 {
-        Button {
-          openSettingsPanel()
-        } label: {
-          if landscape {
-            playerPill(
-              systemName: "slider.horizontal.3",
-              text: model.selectedSource?.title ?? "清晰度"
-            )
+      if !useVLC {
+        AirPlayRoutePickerButton { presented in
+          isRoutePickerPresented = presented
+          if presented {
+            keepControlsDuringInteraction()
           } else {
-            playerIcon("slider.horizontal.3")
+            scheduleControlsHide()
           }
         }
-        .buttonStyle(.plain)
-      }
-
-      if playlist.count > 1 {
-        playerIconButton("rectangle.stack.badge.play") {
-          openQueuePanel()
-        }
+        .frame(width: 38, height: 38)
+        .background(.black.opacity(0.46), in: Circle())
+        .clipShape(Circle())
+        .accessibilityLabel("AirPlay")
       }
 
       if !useVLC, systemPresentationController.isPictureInPictureSupported {
@@ -407,32 +415,17 @@ struct PlayerScreen: View {
         }
       }
 
-      if !useVLC {
-        AirPlayRoutePickerButton { presented in
-          isRoutePickerPresented = presented
-          if presented {
-            keepControlsDuringInteraction()
-          } else {
-            scheduleControlsHide()
-          }
+      if playlist.count > 1 {
+        playerIconButton("rectangle.stack.badge.play") {
+          openQueuePanel()
         }
-        .frame(width: 38, height: 38)
-        .background(.black.opacity(0.50), in: Circle())
-        .clipShape(Circle())
-        .accessibilityLabel("AirPlay")
-      }
-
-      playerIconButton("rectangle.landscape.rotate") {
-        controlsTask?.cancel()
-        PlayerOrientation.request(landscape ? .portrait : .landscape)
-        showGestureHUD(landscape ? "竖屏" : "横屏")
-        scheduleControlsHide()
       }
 
       if landscape {
         playerIconButton("lock.fill") {
           showSettingsPanel = false
           showSpeedPanel = false
+          showQueuePanel = false
           isLocked = true
           controlsVisible = false
           controlsTask?.cancel()
@@ -444,18 +437,18 @@ struct PlayerScreen: View {
         openSettingsPanel()
       }
     }
-    .padding(.leading, max(proxy.safeAreaInsets.leading, 12))
-    .padding(.trailing, max(proxy.safeAreaInsets.trailing, 12))
+    .padding(.leading, max(proxy.safeAreaInsets.leading, landscape ? 18 : 12))
+    .padding(.trailing, max(proxy.safeAreaInsets.trailing, landscape ? 18 : 12))
     .padding(
       .top,
       landscape
-        ? max(proxy.safeAreaInsets.top + 8, 16)
+        ? max(proxy.safeAreaInsets.top + 10, 18)
         : max(proxy.safeAreaInsets.top + 12, 54)
     )
-    .padding(.bottom, landscape ? 18 : 12)
+    .padding(.bottom, landscape ? 20 : 12)
     .background(
       LinearGradient(
-        colors: [.black.opacity(landscape ? 0.50 : 0.64), .clear],
+        colors: [.black.opacity(landscape ? 0.44 : 0.58), .clear],
         startPoint: .top,
         endPoint: .bottom
       )
@@ -996,7 +989,7 @@ struct PlayerScreen: View {
   private func bottomOverlay(proxy: GeometryProxy) -> some View {
     let landscape = proxy.size.width > proxy.size.height
 
-    return VStack(spacing: landscape ? 8 : 10) {
+    return VStack(spacing: landscape ? 6 : 8) {
       if model?.didFallbackFromOriginal == true {
         Label("原画不可播，已自动切换最高转码", systemImage: "arrow.triangle.2.circlepath")
           .font(.caption.weight(.medium))
@@ -1017,11 +1010,11 @@ struct PlayerScreen: View {
     }
     .padding(.leading, max(proxy.safeAreaInsets.leading, landscape ? 24 : 16))
     .padding(.trailing, max(proxy.safeAreaInsets.trailing, landscape ? 24 : 16))
-    .padding(.top, landscape ? 42 : 34)
-    .padding(.bottom, max(proxy.safeAreaInsets.bottom, landscape ? 10 : 14) + 4)
+    .padding(.top, landscape ? 34 : 28)
+    .padding(.bottom, max(proxy.safeAreaInsets.bottom, landscape ? 8 : 12) + 2)
     .background(
       LinearGradient(
-        colors: [.clear, .black.opacity(landscape ? 0.66 : 0.76)],
+        colors: [.clear, .black.opacity(landscape ? 0.58 : 0.70)],
         startPoint: .top,
         endPoint: .bottom
       )
@@ -1029,8 +1022,12 @@ struct PlayerScreen: View {
   }
 
   private func portraitCenterTransport(model: PlayerModel) -> some View {
-    HStack(spacing: 34) {
-      centerTransportButton("gobackward.\(appState.doubleTapSeekSeconds)", size: 19) {
+    HStack(spacing: 14) {
+      centerTransportButton("backward.end.fill", enabled: previousItem != nil, size: 15) {
+        playPreviousIfAvailable()
+      }
+
+      centerTransportButton("gobackward.\(appState.doubleTapSeekSeconds)", size: 18) {
         seekBy(-Double(appState.doubleTapSeekSeconds))
       }
 
@@ -1048,8 +1045,12 @@ struct PlayerScreen: View {
       }
       .buttonStyle(.plain)
 
-      centerTransportButton("goforward.\(appState.doubleTapSeekSeconds)", size: 19) {
+      centerTransportButton("goforward.\(appState.doubleTapSeekSeconds)", size: 18) {
         seekBy(Double(appState.doubleTapSeekSeconds))
+      }
+
+      centerTransportButton("forward.end.fill", enabled: nextItem != nil, size: 15) {
+        playNextIfAvailable()
       }
     }
   }
@@ -1060,15 +1061,7 @@ struct PlayerScreen: View {
         openSpeedPanel()
       }
 
-      utilityIconButton("backward.end.fill", enabled: previousItem != nil) {
-        playPreviousIfAvailable()
-      }
-
-      utilityIconButton("forward.end.fill", enabled: nextItem != nil) {
-        playNextIfAvailable()
-      }
-
-      Spacer(minLength: 8)
+      Spacer(minLength: 12)
 
       utilityIconButton(appState.libraryStore.isFavorite(currentItem) ? "heart.fill" : "heart") {
         appState.libraryStore.toggleFavorite(currentItem)
@@ -1078,7 +1071,7 @@ struct PlayerScreen: View {
   }
 
   private func landscapeCenterTransport(model: PlayerModel) -> some View {
-    HStack(spacing: 30) {
+    HStack(spacing: 24) {
       centerTransportButton("backward.end.fill", enabled: previousItem != nil, size: 18) {
         playPreviousIfAvailable()
       }
@@ -1122,7 +1115,7 @@ struct PlayerScreen: View {
         .font(.system(size: size, weight: .semibold))
         .foregroundStyle(enabled ? .white : .white.opacity(0.24))
         .frame(width: 46, height: 46)
-        .background(.black.opacity(enabled ? 0.28 : 0.18), in: Circle())
+        .background(.black.opacity(enabled ? 0.20 : 0.12), in: Circle())
         .overlay {
           Circle().stroke(.white.opacity(enabled ? 0.08 : 0.04), lineWidth: 0.6)
         }
@@ -1137,9 +1130,6 @@ struct PlayerScreen: View {
       utilityButton(title: formatRate(Double(playbackRate)), systemName: "speedometer") {
         openSpeedPanel()
       }
-
-      utilityButton(title: "音轨", systemName: "waveform") { openSettingsPanel() }
-      utilityButton(title: "字幕", systemName: "captions.bubble") { openSettingsPanel() }
 
       Spacer(minLength: 12)
 
@@ -1292,6 +1282,22 @@ struct PlayerScreen: View {
     .padding(.horizontal, 10)
     .frame(height: 36)
     .background(.white.opacity(0.10), in: Capsule())
+  }
+
+  private var autoHideSuspended: Bool {
+    isScrubbing
+      || isGestureInteracting
+      || isControlsInteractionActive
+      || showSettingsPanel
+      || showSpeedPanel
+      || showQueuePanel
+      || showPlaybackHUD
+      || showInfo
+      || isRoutePickerPresented
+  }
+
+  private var chromeShouldBeVisible: Bool {
+    controlsVisible || autoHideSuspended
   }
 
   private var controlsInteractionGesture: some Gesture {
@@ -1551,6 +1557,16 @@ struct PlayerScreen: View {
   }
 
   @MainActor
+  private func handleInteractiveOverlayChange(_ presented: Bool) {
+    if presented {
+      controlsTask?.cancel()
+      controlsVisible = true
+    } else {
+      scheduleControlsHide()
+    }
+  }
+
+  @MainActor
   private func showControls(animated: Bool) {
     if animated {
       withAnimation(.easeOut(duration: 0.18)) { controlsVisible = true }
@@ -1697,33 +1713,17 @@ struct PlayerScreen: View {
   @MainActor
   private func scheduleControlsHide() {
     controlsTask?.cancel()
-    guard activeIsPlaying,
-      !isLocked,
-      !isScrubbing,
-      !isGestureInteracting,
-      !isControlsInteractionActive,
-      !showSettingsPanel,
-      !showSpeedPanel,
-      !showQueuePanel,
-      !showInfo,
-      !isRoutePickerPresented
-    else { return }
+    guard activeIsPlaying, !isLocked, !autoHideSuspended else { return }
 
     controlsTask = Task { @MainActor in
       try? await Task.sleep(for: .seconds(2.0))
       guard !Task.isCancelled,
         activeIsPlaying,
-        !showSettingsPanel,
-        !showSpeedPanel,
-        !showQueuePanel,
-        !showInfo,
-        !isRoutePickerPresented,
-        !isScrubbing,
-        !isGestureInteracting,
-        !isControlsInteractionActive
+        !isLocked,
+        !autoHideSuspended
       else { return }
 
-      withAnimation(.easeInOut(duration: 0.24)) {
+      withAnimation(.easeInOut(duration: 0.26)) {
         controlsVisible = false
       }
     }
