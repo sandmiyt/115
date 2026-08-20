@@ -16,12 +16,14 @@ struct PlayerScreen: View {
   @State private var playbackRate: Float = 1.0
   @State private var isLocked = false
   @State private var controlsVisible = true
+  @State private var showSettingsPanel = false
   @State private var gestureHUD: String?
   @State private var hudTask: Task<Void, Never>?
   @State private var controlsTask: Task<Void, Never>?
   @State private var scrubValue: Double = 0
   @State private var isScrubbing = false
   @State private var isGestureInteracting = false
+  @State private var isControlsInteractionActive = false
   @State private var gestureStartBrightness: CGFloat?
   @State private var gestureStartVolume: Float?
 
@@ -55,12 +57,16 @@ struct PlayerScreen: View {
         if isLocked {
           lockShield(proxy: proxy)
         } else if controlsVisible {
-          VStack(spacing: 0) {
-            topOverlay(proxy: proxy)
-            Spacer(minLength: 0)
-            bottomOverlay(proxy: proxy)
-          }
-          .transition(.opacity)
+          playerChrome(proxy: proxy)
+            .simultaneousGesture(controlsInteractionGesture)
+            .transition(.opacity)
+        }
+
+        if showSettingsPanel, !isLocked {
+          settingsOverlay(proxy: proxy)
+            .simultaneousGesture(controlsInteractionGesture)
+            .transition(.opacity.combined(with: .scale(scale: 0.985)))
+            .zIndex(20)
         }
 
         if model?.isBuffering == true {
@@ -99,6 +105,14 @@ struct PlayerScreen: View {
       .presentationDetents([.medium, .large])
       .presentationDragIndicator(.visible)
     }
+    .onChange(of: showInfo) { _, presented in
+      if presented {
+        controlsTask?.cancel()
+        controlsVisible = true
+      } else {
+        scheduleControlsHide()
+      }
+    }
     .alert(
       "播放失败",
       isPresented: Binding(
@@ -126,6 +140,8 @@ struct PlayerScreen: View {
       }
     }
     .onDisappear {
+      showSettingsPanel = false
+      isControlsInteractionActive = false
       hudTask?.cancel()
       controlsTask?.cancel()
       model?.pause()
@@ -164,6 +180,28 @@ struct PlayerScreen: View {
     }
     .ignoresSafeArea()
     .allowsHitTesting(!isLocked)
+  }
+
+  @ViewBuilder
+  private func playerChrome(proxy: GeometryProxy) -> some View {
+    let landscape = proxy.size.width > proxy.size.height
+
+    ZStack {
+      VStack(spacing: 0) {
+        topOverlay(proxy: proxy)
+        Spacer(minLength: 0)
+        bottomOverlay(proxy: proxy)
+      }
+
+      if let model {
+        if landscape {
+          landscapeCenterTransport(model: model)
+        } else {
+          portraitCenterTransport(model: model)
+            .offset(y: -8)
+        }
+      }
+    }
   }
 
   private func gestureSurface(isLeft: Bool, proxy: GeometryProxy) -> some View {
@@ -253,7 +291,7 @@ struct PlayerScreen: View {
   private func topOverlay(proxy: GeometryProxy) -> some View {
     let landscape = proxy.size.width > proxy.size.height
 
-    return HStack(spacing: landscape ? 9 : 8) {
+    return HStack(spacing: landscape ? 10 : 9) {
       playerIconButton("xmark") {
         model?.pause()
         dismiss()
@@ -261,7 +299,7 @@ struct PlayerScreen: View {
 
       VStack(alignment: .leading, spacing: 2) {
         Text(currentItem.name)
-          .font(landscape ? .subheadline.weight(.semibold) : .caption.weight(.semibold))
+          .font(landscape ? .subheadline.weight(.semibold) : .subheadline.weight(.semibold))
           .foregroundStyle(.white)
           .lineLimit(1)
         if landscape, playlist.count > 1 {
@@ -275,7 +313,19 @@ struct PlayerScreen: View {
       Spacer(minLength: 4)
 
       if let model, model.sources.count > 1 {
-        qualityMenu(model: model, compact: !landscape)
+        Button {
+          openSettingsPanel()
+        } label: {
+          if landscape {
+            playerPill(
+              systemName: "slider.horizontal.3",
+              text: model.selectedSource?.title ?? "清晰度"
+            )
+          } else {
+            playerIcon("slider.horizontal.3")
+          }
+        }
+        .buttonStyle(.plain)
       }
 
       playerIconButton("rectangle.landscape.rotate") {
@@ -293,176 +343,380 @@ struct PlayerScreen: View {
         }
       }
 
-      playerMoreMenu(model: model, landscape: landscape)
+      playerIconButton("ellipsis") {
+        openSettingsPanel()
+      }
     }
     .padding(.leading, max(proxy.safeAreaInsets.leading, 12))
     .padding(.trailing, max(proxy.safeAreaInsets.trailing, 12))
     .padding(
       .top,
       landscape
-        ? max(proxy.safeAreaInsets.top + 10, 24)
-        : max(proxy.safeAreaInsets.top + 20, 74)
+        ? max(proxy.safeAreaInsets.top + 8, 16)
+        : max(proxy.safeAreaInsets.top + 12, 54)
     )
     .padding(.bottom, landscape ? 18 : 12)
     .background(
       LinearGradient(
-        colors: [.black.opacity(0.78), .clear],
+        colors: [.black.opacity(landscape ? 0.50 : 0.64), .clear],
         startPoint: .top,
         endPoint: .bottom
       )
     )
   }
 
-  private func playerMoreMenu(model: PlayerModel?, landscape: Bool) -> some View {
-    Menu {
-      if !landscape, let model {
-        Section("清晰度") {
-          ForEach(model.sources) { source in
-            Button {
-              Task {
-                useVLC = shouldUseVLC(source)
-                await model.select(source)
-                model.setPlaybackRate(playbackRate)
-                applyAutomaticOrientation(for: model.videoDisplaySize)
-              }
-            } label: {
-              if model.selectedSource?.id == source.id {
-                Label(source.title, systemImage: "checkmark")
-              } else {
-                Text(source.title)
-              }
-            }
-          }
-        }
+  private func settingsOverlay(proxy: GeometryProxy) -> some View {
+    let landscape = proxy.size.width > proxy.size.height
 
-        Section("播放速度") {
-          ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { rate in
-            Button(formatRate(rate)) {
-              playbackRate = Float(rate)
-              model.setPlaybackRate(Float(rate))
-            }
-          }
-        }
+    return ZStack(alignment: landscape ? .trailing : .bottom) {
+      Color.black.opacity(0.30)
+        .ignoresSafeArea()
+        .contentShape(Rectangle())
+        .onTapGesture { closeSettingsPanel() }
 
-        if !model.audioOptions.isEmpty {
-          Section("音轨") {
-            Button("自动") { model.selectAudio(nil) }
-            ForEach(model.audioOptions) { option in
-              Button(option.title) { model.selectAudio(option.id) }
-            }
-          }
-        }
-
-        Section("字幕") {
-          Button("关闭字幕") { model.selectSubtitle(nil) }
-          ForEach(model.subtitleOptions) { option in
-            Button(option.title) { model.selectSubtitle(option.id) }
-          }
-        }
-      }
-
-      Section("画面") {
-        Button(videoLayout == .fit ? "铺满屏幕" : "适应屏幕", systemImage: "rectangle.arrowtriangle.2.outward") {
-          videoLayout = videoLayout == .fit ? .fill : .fit
-          showGestureHUD(videoLayout.title)
-        }
-        Button("旋转屏幕", systemImage: "rectangle.landscape.rotate") {
-          PlayerOrientation.toggle()
-        }
-        Button("锁定控制", systemImage: "lock.fill") {
-          isLocked = true
-          controlsVisible = false
-          showGestureHUD("控制已锁定")
-        }
-      }
-
-      if previousItem != nil {
-        Button("上一个视频", systemImage: "backward.end.fill") { playPreviousIfAvailable() }
-      }
-      if nextItem != nil {
-        Button("下一个视频", systemImage: "forward.end.fill") { playNextIfAvailable() }
-      }
-
-      Divider()
-      Button("播放详情", systemImage: "info.circle") { showInfo = true }
-    } label: {
-      playerIcon("ellipsis")
+      settingsPanel(proxy: proxy)
+        .padding(.trailing, landscape ? max(proxy.safeAreaInsets.trailing, 18) : 12)
+        .padding(.leading, landscape ? 12 : 12)
+        .padding(.bottom, landscape ? 0 : max(proxy.safeAreaInsets.bottom, 12))
     }
-    .simultaneousGesture(TapGesture().onEnded { holdControlsForMenu() })
+    .onTapGesture {
+      controlsTask?.cancel()
+      controlsVisible = true
+    }
   }
 
-  private func qualityMenu(model: PlayerModel, compact: Bool) -> some View {
-    Menu {
-      if model.sources.isEmpty {
-        Text("正在取得清晰度…")
-      } else {
+  private func settingsPanel(proxy: GeometryProxy) -> some View {
+    let landscape = proxy.size.width > proxy.size.height
+    let panelWidth = landscape ? min(340.0, proxy.size.width * 0.42) : max(proxy.size.width - 24, 280)
+    let panelHeight = landscape ? min(proxy.size.height * 0.82, 470) : min(proxy.size.height * 0.64, 560)
+
+    return VStack(spacing: 0) {
+      HStack(spacing: 10) {
+        VStack(alignment: .leading, spacing: 2) {
+          Text("播放设置")
+            .font(.headline.weight(.semibold))
+            .foregroundStyle(.white)
+          Text(currentItem.name)
+            .font(.caption)
+            .foregroundStyle(.white.opacity(0.54))
+            .lineLimit(1)
+        }
+        Spacer()
+        Button { closeSettingsPanel() } label: {
+          Image(systemName: "xmark")
+            .font(.system(size: 13, weight: .bold))
+            .foregroundStyle(.white.opacity(0.86))
+            .frame(width: 32, height: 32)
+            .background(.white.opacity(0.08), in: Circle())
+        }
+        .buttonStyle(.plain)
+      }
+      .padding(.horizontal, 18)
+      .padding(.top, 16)
+      .padding(.bottom, 12)
+
+      Divider().overlay(.white.opacity(0.08))
+
+      ScrollView(showsIndicators: false) {
+        VStack(alignment: .leading, spacing: 18) {
+          if let model {
+            settingsSpeedSection(model: model)
+
+            if model.sources.count > 1 {
+              settingsQualitySection(model: model)
+            }
+
+            settingsAudioSection(model: model)
+            settingsSubtitleSection(model: model)
+          }
+
+          settingsPictureSection()
+          settingsOtherSection()
+        }
+        .padding(18)
+      }
+    }
+    .frame(width: panelWidth, height: panelHeight)
+    .background(.black.opacity(0.88))
+    .background(.ultraThinMaterial)
+    .clipShape(RoundedRectangle(cornerRadius: landscape ? 20 : 24, style: .continuous))
+    .overlay {
+      RoundedRectangle(cornerRadius: landscape ? 20 : 24, style: .continuous)
+        .stroke(.white.opacity(0.10), lineWidth: 0.8)
+    }
+    .shadow(color: .black.opacity(0.35), radius: 26, y: 10)
+  }
+
+  private func settingsSpeedSection(model: PlayerModel) -> some View {
+    VStack(alignment: .leading, spacing: 10) {
+      settingsSectionTitle("播放速度")
+      LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 3), spacing: 8) {
+        ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { rate in
+          settingsChip(
+            formatRate(rate),
+            selected: abs(Double(playbackRate) - rate) < 0.001
+          ) {
+            playbackRate = Float(rate)
+            model.setPlaybackRate(Float(rate))
+            keepControlsDuringInteraction()
+          }
+        }
+      }
+    }
+  }
+
+  private func settingsQualitySection(model: PlayerModel) -> some View {
+    VStack(alignment: .leading, spacing: 10) {
+      settingsSectionTitle("清晰度")
+      VStack(spacing: 6) {
         ForEach(model.sources) { source in
-          Button {
-            Task {
+          settingsRow(
+            title: source.title,
+            systemName: source.isOriginal ? "sparkles.tv" : "play.rectangle",
+            selected: model.selectedSource?.id == source.id
+          ) {
+            keepControlsDuringInteraction()
+            Task { @MainActor in
               useVLC = shouldUseVLC(source)
               await model.select(source)
               model.setPlaybackRate(playbackRate)
-            }
-          } label: {
-            if model.selectedSource?.id == source.id {
-              Label(source.title, systemImage: "checkmark")
-            } else {
-              Text(source.title)
+              applyAutomaticOrientation(for: model.videoDisplaySize)
+              keepControlsDuringInteraction()
             }
           }
         }
       }
-    } label: {
-      if compact {
-        playerIcon("slider.horizontal.3")
+    }
+  }
+
+  private func settingsAudioSection(model: PlayerModel) -> some View {
+    VStack(alignment: .leading, spacing: 10) {
+      settingsSectionTitle("音轨")
+      if model.audioOptions.isEmpty {
+        settingsUnavailableRow("当前视频没有可切换音轨", systemName: "waveform")
       } else {
-        playerPill(
-          systemName: "slider.horizontal.3",
-          text: model.selectedSource?.title ?? "清晰度"
-        )
+        settingsRow(title: "自动", systemName: "waveform", selected: model.selectedAudioOptionID == nil) {
+          model.selectAudio(nil)
+          keepControlsDuringInteraction()
+        }
+        ForEach(model.audioOptions) { option in
+          settingsRow(
+            title: option.title,
+            systemName: "waveform",
+            selected: model.selectedAudioOptionID == option.id
+          ) {
+            model.selectAudio(option.id)
+            keepControlsDuringInteraction()
+          }
+        }
       }
     }
-    .simultaneousGesture(TapGesture().onEnded { holdControlsForMenu() })
+  }
+
+  private func settingsSubtitleSection(model: PlayerModel) -> some View {
+    VStack(alignment: .leading, spacing: 10) {
+      settingsSectionTitle("字幕")
+      settingsRow(title: "关闭字幕", systemName: "captions.bubble", selected: model.selectedSubtitleOptionID == nil) {
+        model.selectSubtitle(nil)
+        keepControlsDuringInteraction()
+      }
+      ForEach(model.subtitleOptions) { option in
+        settingsRow(
+          title: option.title,
+          systemName: "captions.bubble",
+          selected: model.selectedSubtitleOptionID == option.id
+        ) {
+          model.selectSubtitle(option.id)
+          keepControlsDuringInteraction()
+        }
+      }
+    }
+  }
+
+  private func settingsPictureSection() -> some View {
+    VStack(alignment: .leading, spacing: 10) {
+      settingsSectionTitle("画面")
+      HStack(spacing: 8) {
+        settingsActionButton(
+          videoLayout.title,
+          systemName: videoLayout == .fit ? "rectangle.inset.filled" : "arrow.up.left.and.arrow.down.right"
+        ) {
+          videoLayout = videoLayout == .fit ? .fill : .fit
+          keepControlsDuringInteraction()
+        }
+        settingsActionButton("旋转", systemName: "rectangle.landscape.rotate") {
+          PlayerOrientation.toggle()
+          keepControlsDuringInteraction()
+        }
+      }
+    }
+  }
+
+  private func settingsOtherSection() -> some View {
+    VStack(alignment: .leading, spacing: 10) {
+      settingsSectionTitle("更多")
+
+      if previousItem != nil || nextItem != nil {
+        HStack(spacing: 8) {
+          settingsActionButton("上一个", systemName: "backward.end.fill", enabled: previousItem != nil) {
+            closeSettingsPanel(scheduleHide: false)
+            playPreviousIfAvailable()
+          }
+          settingsActionButton("下一个", systemName: "forward.end.fill", enabled: nextItem != nil) {
+            closeSettingsPanel(scheduleHide: false)
+            playNextIfAvailable()
+          }
+        }
+      }
+
+      HStack(spacing: 8) {
+        settingsActionButton(
+          appState.libraryStore.isFavorite(currentItem) ? "已收藏" : "收藏",
+          systemName: appState.libraryStore.isFavorite(currentItem) ? "heart.fill" : "heart"
+        ) {
+          appState.libraryStore.toggleFavorite(currentItem)
+          keepControlsDuringInteraction()
+        }
+        settingsActionButton("详情", systemName: "info.circle") {
+          closeSettingsPanel(scheduleHide: false)
+          showInfo = true
+        }
+      }
+
+      settingsActionButton("锁定控制", systemName: "lock.fill") {
+        showSettingsPanel = false
+        isLocked = true
+        controlsVisible = false
+        controlsTask?.cancel()
+        showGestureHUD("控制已锁定")
+      }
+    }
+  }
+
+  private func settingsSectionTitle(_ title: String) -> some View {
+    Text(title)
+      .font(.caption.weight(.semibold))
+      .foregroundStyle(.white.opacity(0.56))
+  }
+
+  private func settingsChip(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
+    Button(action: action) {
+      Text(title)
+        .font(.caption.weight(.semibold))
+        .foregroundStyle(.white)
+        .frame(maxWidth: .infinity)
+        .frame(height: 36)
+        .background(selected ? .white.opacity(0.18) : .white.opacity(0.07), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay {
+          if selected {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+              .stroke(.white.opacity(0.22), lineWidth: 0.8)
+          }
+        }
+    }
+    .buttonStyle(.plain)
+  }
+
+  private func settingsRow(
+    title: String,
+    systemName: String,
+    selected: Bool,
+    action: @escaping () -> Void
+  ) -> some View {
+    Button(action: action) {
+      HStack(spacing: 11) {
+        Image(systemName: systemName)
+          .font(.system(size: 14, weight: .medium))
+          .frame(width: 20)
+        Text(title)
+          .font(.subheadline)
+          .lineLimit(1)
+        Spacer()
+        if selected {
+          Image(systemName: "checkmark")
+            .font(.system(size: 12, weight: .bold))
+        }
+      }
+      .foregroundStyle(.white.opacity(selected ? 1 : 0.86))
+      .padding(.horizontal, 12)
+      .frame(height: 42)
+      .background(selected ? .white.opacity(0.12) : .white.opacity(0.055), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+    .buttonStyle(.plain)
+  }
+
+  private func settingsUnavailableRow(_ title: String, systemName: String) -> some View {
+    HStack(spacing: 11) {
+      Image(systemName: systemName).frame(width: 20)
+      Text(title).lineLimit(1)
+      Spacer()
+    }
+    .font(.subheadline)
+    .foregroundStyle(.white.opacity(0.42))
+    .padding(.horizontal, 12)
+    .frame(height: 42)
+    .background(.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+  }
+
+  private func settingsActionButton(
+    _ title: String,
+    systemName: String,
+    enabled: Bool = true,
+    action: @escaping () -> Void
+  ) -> some View {
+    Button(action: action) {
+      HStack(spacing: 7) {
+        Image(systemName: systemName)
+        Text(title).lineLimit(1)
+      }
+      .font(.caption.weight(.semibold))
+      .foregroundStyle(enabled ? .white : .white.opacity(0.28))
+      .frame(maxWidth: .infinity)
+      .frame(height: 40)
+      .background(.white.opacity(enabled ? 0.075 : 0.035), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+    .buttonStyle(.plain)
+    .disabled(!enabled)
   }
 
   private func bottomOverlay(proxy: GeometryProxy) -> some View {
     let landscape = proxy.size.width > proxy.size.height
 
-    return VStack(spacing: landscape ? 11 : 9) {
+    return VStack(spacing: landscape ? 8 : 10) {
       if model?.didFallbackFromOriginal == true {
         Label("原画不可播，已自动切换最高转码", systemImage: "arrow.triangle.2.circlepath")
           .font(.caption.weight(.medium))
           .foregroundStyle(.white.opacity(0.86))
           .padding(.horizontal, 11)
           .padding(.vertical, 6)
-          .background(.black.opacity(0.58), in: Capsule())
+          .background(.black.opacity(0.50), in: Capsule())
       }
 
       if let model {
         timeline(model: model)
         if landscape {
-          landscapePlaybackControls(model: model)
+          landscapeUtilityBar(model: model)
         } else {
-          portraitPlaybackControls(model: model)
+          portraitUtilityBar(model: model)
         }
       }
     }
-    .padding(.leading, max(proxy.safeAreaInsets.leading, 14))
-    .padding(.trailing, max(proxy.safeAreaInsets.trailing, 14))
-    .padding(.top, landscape ? 28 : 18)
-    .padding(.bottom, max(proxy.safeAreaInsets.bottom, 10) + (landscape ? 2 : 6))
+    .padding(.leading, max(proxy.safeAreaInsets.leading, landscape ? 24 : 16))
+    .padding(.trailing, max(proxy.safeAreaInsets.trailing, landscape ? 24 : 16))
+    .padding(.top, landscape ? 42 : 34)
+    .padding(.bottom, max(proxy.safeAreaInsets.bottom, landscape ? 10 : 14) + 4)
     .background(
       LinearGradient(
-        colors: [.clear, .black.opacity(0.86)],
+        colors: [.clear, .black.opacity(landscape ? 0.66 : 0.76)],
         startPoint: .top,
         endPoint: .bottom
       )
     )
   }
 
-  private func portraitPlaybackControls(model: PlayerModel) -> some View {
-    HStack(spacing: 24) {
-      controlCircle("gobackward.\(appState.doubleTapSeekSeconds)") {
+  private func portraitCenterTransport(model: PlayerModel) -> some View {
+    HStack(spacing: 34) {
+      centerTransportButton("gobackward.\(appState.doubleTapSeekSeconds)", size: 19) {
         seekBy(-Double(appState.doubleTapSeekSeconds))
       }
 
@@ -472,79 +726,167 @@ struct PlayerScreen: View {
         scheduleControlsHide()
       } label: {
         Image(systemName: model.isPlaying ? "pause.fill" : "play.fill")
-          .font(.system(size: 21, weight: .bold))
+          .font(.system(size: 24, weight: .bold))
           .foregroundStyle(.black)
-          .frame(width: 54, height: 54)
+          .frame(width: 62, height: 62)
           .background(.white, in: Circle())
+          .shadow(color: .black.opacity(0.30), radius: 14, y: 5)
       }
       .buttonStyle(.plain)
 
-      controlCircle("goforward.\(appState.doubleTapSeekSeconds)") {
+      centerTransportButton("goforward.\(appState.doubleTapSeekSeconds)", size: 19) {
         seekBy(Double(appState.doubleTapSeekSeconds))
       }
     }
   }
 
-  private func landscapePlaybackControls(model: PlayerModel) -> some View {
-    VStack(spacing: 10) {
-      HStack(spacing: 18) {
-        controlCircle("backward.end.fill", enabled: previousItem != nil) {
-          playPreviousIfAvailable()
-        }
-        controlCircle("gobackward.\(appState.doubleTapSeekSeconds)") {
-          seekBy(-Double(appState.doubleTapSeekSeconds))
-        }
-
-        Button {
-          model.togglePlayback()
-          controlsVisible = true
-          scheduleControlsHide()
-        } label: {
-          Image(systemName: model.isPlaying ? "pause.fill" : "play.fill")
-            .font(.system(size: 22, weight: .bold))
-            .foregroundStyle(.black)
-            .frame(width: 56, height: 56)
-            .background(.white, in: Circle())
-        }
-        .buttonStyle(.plain)
-
-        controlCircle("goforward.\(appState.doubleTapSeekSeconds)") {
-          seekBy(Double(appState.doubleTapSeekSeconds))
-        }
-        controlCircle("forward.end.fill", enabled: nextItem != nil) {
-          playNextIfAvailable()
-        }
+  private func portraitUtilityBar(model: PlayerModel) -> some View {
+    HStack(spacing: 8) {
+      utilityButton(title: formatRate(Double(playbackRate)), systemName: "speedometer") {
+        openSettingsPanel()
       }
 
-      HStack(spacing: 8) {
-        speedMenu(model: model)
-        audioMenu(model: model)
-        subtitleMenu(model: model)
+      utilityIconButton("backward.end.fill", enabled: previousItem != nil) {
+        playPreviousIfAvailable()
+      }
 
-        Button {
-          videoLayout = videoLayout == .fit ? .fill : .fit
-          showGestureHUD(videoLayout.title)
-        } label: {
-          playerPill(
-            systemName: videoLayout == .fit ? "arrow.up.left.and.arrow.down.right" : "rectangle.inset.filled",
-            text: videoLayout.title
-          )
-        }
-        .buttonStyle(.plain)
+      utilityIconButton("forward.end.fill", enabled: nextItem != nil) {
+        playNextIfAvailable()
+      }
 
-        Spacer(minLength: 4)
+      Spacer(minLength: 8)
 
-        Button {
-          appState.libraryStore.toggleFavorite(currentItem)
-        } label: {
-          playerPill(
-            systemName: appState.libraryStore.isFavorite(currentItem) ? "heart.fill" : "heart",
-            text: appState.libraryStore.isFavorite(currentItem) ? "已收藏" : "收藏"
-          )
-        }
-        .buttonStyle(.plain)
+      utilityIconButton(videoLayout == .fit ? "rectangle.inset.filled" : "arrow.up.left.and.arrow.down.right") {
+        videoLayout = videoLayout == .fit ? .fill : .fit
+        showGestureHUD(videoLayout.title)
+        scheduleControlsHide()
+      }
+
+      utilityIconButton(appState.libraryStore.isFavorite(currentItem) ? "heart.fill" : "heart") {
+        appState.libraryStore.toggleFavorite(currentItem)
+        scheduleControlsHide()
+      }
+
+      utilityIconButton("ellipsis") {
+        openSettingsPanel()
       }
     }
+  }
+
+  private func landscapeCenterTransport(model: PlayerModel) -> some View {
+    HStack(spacing: 30) {
+      centerTransportButton("backward.end.fill", enabled: previousItem != nil, size: 18) {
+        playPreviousIfAvailable()
+      }
+
+      centerTransportButton("gobackward.\(appState.doubleTapSeekSeconds)", size: 20) {
+        seekBy(-Double(appState.doubleTapSeekSeconds))
+      }
+
+      Button {
+        model.togglePlayback()
+        controlsVisible = true
+        scheduleControlsHide()
+      } label: {
+        Image(systemName: model.isPlaying ? "pause.fill" : "play.fill")
+          .font(.system(size: 27, weight: .bold))
+          .foregroundStyle(.black)
+          .frame(width: 68, height: 68)
+          .background(.white, in: Circle())
+          .shadow(color: .black.opacity(0.34), radius: 16, y: 6)
+      }
+      .buttonStyle(.plain)
+
+      centerTransportButton("goforward.\(appState.doubleTapSeekSeconds)", size: 20) {
+        seekBy(Double(appState.doubleTapSeekSeconds))
+      }
+
+      centerTransportButton("forward.end.fill", enabled: nextItem != nil, size: 18) {
+        playNextIfAvailable()
+      }
+    }
+  }
+
+  private func centerTransportButton(
+    _ systemName: String,
+    enabled: Bool = true,
+    size: CGFloat = 20,
+    action: @escaping () -> Void
+  ) -> some View {
+    Button(action: action) {
+      Image(systemName: systemName)
+        .font(.system(size: size, weight: .semibold))
+        .foregroundStyle(enabled ? .white : .white.opacity(0.24))
+        .frame(width: 46, height: 46)
+        .background(.black.opacity(enabled ? 0.28 : 0.18), in: Circle())
+        .overlay {
+          Circle().stroke(.white.opacity(enabled ? 0.08 : 0.04), lineWidth: 0.6)
+        }
+        .contentShape(Circle())
+    }
+    .buttonStyle(.plain)
+    .disabled(!enabled)
+  }
+
+  private func landscapeUtilityBar(model: PlayerModel) -> some View {
+    HStack(spacing: 8) {
+      utilityButton(title: formatRate(Double(playbackRate)), systemName: "speedometer") {
+        openSettingsPanel()
+      }
+
+      utilityButton(title: "音轨", systemName: "waveform") { openSettingsPanel() }
+      utilityButton(title: "字幕", systemName: "captions.bubble") { openSettingsPanel() }
+
+      utilityIconButton(videoLayout == .fit ? "rectangle.inset.filled" : "arrow.up.left.and.arrow.down.right") {
+        videoLayout = videoLayout == .fit ? .fill : .fit
+        showGestureHUD(videoLayout.title)
+        scheduleControlsHide()
+      }
+
+      Spacer(minLength: 12)
+
+      utilityIconButton(appState.libraryStore.isFavorite(currentItem) ? "heart.fill" : "heart") {
+        appState.libraryStore.toggleFavorite(currentItem)
+        scheduleControlsHide()
+      }
+
+      utilityIconButton("info.circle") {
+        controlsTask?.cancel()
+        controlsVisible = true
+        showInfo = true
+      }
+    }
+  }
+
+  private func utilityButton(title: String, systemName: String, action: @escaping () -> Void) -> some View {
+    Button(action: action) {
+      HStack(spacing: 6) {
+        Image(systemName: systemName)
+        Text(title)
+      }
+      .font(.caption.weight(.semibold))
+      .foregroundStyle(.white.opacity(0.88))
+      .padding(.horizontal, 10)
+      .frame(height: 34)
+      .background(.white.opacity(0.075), in: Capsule())
+    }
+    .buttonStyle(.plain)
+  }
+
+  private func utilityIconButton(
+    _ systemName: String,
+    enabled: Bool = true,
+    action: @escaping () -> Void
+  ) -> some View {
+    Button(action: action) {
+      Image(systemName: systemName)
+        .font(.system(size: 14, weight: .semibold))
+        .foregroundStyle(enabled ? .white.opacity(0.88) : .white.opacity(0.24))
+        .frame(width: 34, height: 34)
+        .background(.white.opacity(enabled ? 0.07 : 0.035), in: Circle())
+    }
+    .buttonStyle(.plain)
+    .disabled(!enabled)
   }
 
   private func timeline(model: PlayerModel) -> some View {
@@ -554,8 +896,10 @@ struct PlayerScreen: View {
         let duration = max(model.duration, 1)
         let current = min(max(isScrubbing ? scrubValue : model.currentTime, 0), duration)
         let buffered = min(max(model.bufferedUntil, 0), duration)
-        let playedX = width * current / duration
-        let bufferedX = width * buffered / duration
+        let playedProgress = CGFloat(current / duration)
+        let bufferedProgress = CGFloat(buffered / duration)
+        let playedX = width * playedProgress
+        let bufferedX = width * bufferedProgress
 
         ZStack(alignment: .leading) {
           Capsule()
@@ -586,11 +930,11 @@ struct PlayerScreen: View {
                 controlsTask?.cancel()
               }
               let x = min(max(value.location.x, 0), width)
-              scrubValue = x / width * duration
+              scrubValue = Double(x / width) * duration
             }
             .onEnded { value in
               let x = min(max(value.location.x, 0), width)
-              scrubValue = x / width * duration
+              scrubValue = Double(x / width) * duration
               model.seek(to: scrubValue)
               isScrubbing = false
               scheduleControlsHide()
@@ -612,75 +956,6 @@ struct PlayerScreen: View {
       .font(.caption2.monospacedDigit().weight(.medium))
       .foregroundStyle(.white.opacity(0.72))
     }
-  }
-
-  private func speedMenu(model: PlayerModel) -> some View {
-    Menu {
-      ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { rate in
-        Button {
-          playbackRate = Float(rate)
-          model.setPlaybackRate(Float(rate))
-          showGestureHUD(formatRate(rate))
-        } label: {
-          if abs(Double(playbackRate) - rate) < 0.001 {
-            Label(formatRate(rate), systemImage: "checkmark")
-          } else {
-            Text(formatRate(rate))
-          }
-        }
-      }
-    } label: {
-      playerPill(systemName: "speedometer", text: formatRate(Double(playbackRate)))
-    }
-    .simultaneousGesture(TapGesture().onEnded { holdControlsForMenu() })
-  }
-
-  private func audioMenu(model: PlayerModel) -> some View {
-    Menu {
-      if model.audioOptions.isEmpty {
-        Text("当前视频没有可切换音轨")
-      } else {
-        Button("自动") { model.selectAudio(nil) }
-        Divider()
-        ForEach(model.audioOptions) { option in
-          Button {
-            model.selectAudio(option.id)
-          } label: {
-            if model.selectedAudioOptionID == option.id {
-              Label(option.title, systemImage: "checkmark")
-            } else {
-              Text(option.title)
-            }
-          }
-        }
-      }
-    } label: {
-      playerPill(systemName: "waveform", text: "音轨")
-    }
-    .simultaneousGesture(TapGesture().onEnded { holdControlsForMenu() })
-  }
-
-  private func subtitleMenu(model: PlayerModel) -> some View {
-    Menu {
-      Button("关闭字幕") { model.selectSubtitle(nil) }
-      if !model.subtitleOptions.isEmpty {
-        Divider()
-        ForEach(model.subtitleOptions) { option in
-          Button {
-            model.selectSubtitle(option.id)
-          } label: {
-            if model.selectedSubtitleOptionID == option.id {
-              Label(option.title, systemImage: "checkmark")
-            } else {
-              Text(option.title)
-            }
-          }
-        }
-      }
-    } label: {
-      playerPill(systemName: "captions.bubble", text: "字幕")
-    }
-    .simultaneousGesture(TapGesture().onEnded { holdControlsForMenu() })
   }
 
   private func controlCircle(
@@ -723,6 +998,29 @@ struct PlayerScreen: View {
     .padding(.horizontal, 10)
     .frame(height: 36)
     .background(.white.opacity(0.10), in: Capsule())
+  }
+
+  private var controlsInteractionGesture: some Gesture {
+    DragGesture(minimumDistance: 0)
+      .onChanged { _ in
+        beginControlsInteraction()
+      }
+      .onEnded { _ in
+        endControlsInteraction()
+      }
+  }
+
+  @MainActor
+  private func beginControlsInteraction() {
+    isControlsInteractionActive = true
+    controlsTask?.cancel()
+    controlsVisible = true
+  }
+
+  @MainActor
+  private func endControlsInteraction() {
+    isControlsInteractionActive = false
+    scheduleControlsHide()
   }
 
   @MainActor
@@ -789,6 +1087,7 @@ struct PlayerScreen: View {
   }
 
   private func switchTo(_ item: CloudItem) {
+    showSettingsPanel = false
     model?.pause()
     model = nil
     useVLC = false
@@ -820,7 +1119,26 @@ struct PlayerScreen: View {
   }
 
   @MainActor
-  private func holdControlsForMenu() {
+  private func openSettingsPanel() {
+    controlsTask?.cancel()
+    controlsVisible = true
+    withAnimation(.easeOut(duration: 0.18)) {
+      showSettingsPanel = true
+    }
+  }
+
+  @MainActor
+  private func closeSettingsPanel(scheduleHide: Bool = true) {
+    withAnimation(.easeIn(duration: 0.16)) {
+      showSettingsPanel = false
+    }
+    if scheduleHide {
+      scheduleControlsHide()
+    }
+  }
+
+  @MainActor
+  private func keepControlsDuringInteraction() {
     controlsTask?.cancel()
     controlsVisible = true
   }
@@ -828,10 +1146,10 @@ struct PlayerScreen: View {
   @MainActor
   private func scheduleControlsHide() {
     controlsTask?.cancel()
-    guard model?.isPlaying == true, !isLocked, !isScrubbing, !isGestureInteracting else { return }
+    guard model?.isPlaying == true, !isLocked, !isScrubbing, !isGestureInteracting, !isControlsInteractionActive, !showSettingsPanel, !showInfo else { return }
     controlsTask = Task { @MainActor in
       try? await Task.sleep(for: .seconds(2.0))
-      guard !Task.isCancelled else { return }
+      guard !Task.isCancelled, !showSettingsPanel, !showInfo, !isScrubbing, !isGestureInteracting, !isControlsInteractionActive else { return }
       withAnimation(.easeIn(duration: 0.22)) {
         controlsVisible = false
       }
