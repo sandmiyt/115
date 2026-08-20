@@ -85,7 +85,7 @@ final class SystemPlayerPresentationController: NSObject, AVPictureInPictureCont
   /// different timestamp or competes with the remote Range requests used by the
   /// real player.
   func displayedFrameImage(maximumDimension: CGFloat = 420) -> UIImage? {
-    guard let pixelBuffer = attachedLayer?.copyDisplayedPixelBuffer() else { return nil }
+    guard let pixelBuffer = attachedLayer?.displayedPixelBuffer() else { return nil }
 
     var image = CIImage(cvPixelBuffer: pixelBuffer)
     let extent = image.extent.integral
