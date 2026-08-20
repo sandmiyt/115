@@ -17,38 +17,28 @@ struct RootView: View {
 
   var body: some View {
     ZStack {
-      if isPrivacyLocked {
-        LockedPrivacyBackground()
-      } else {
-        MainTabView()
-      }
+      // Keep the main hierarchy alive while locked so returning from the
+      // background does not reset the selected tab, navigation stack, or an
+      // active full-screen player. Sensitive content is heavily blurred and
+      // cannot receive touches until biometric authentication succeeds.
+      MainTabView()
+        .blur(radius: isPrivacyLocked ? 28 : 0)
+        .scaleEffect(isPrivacyLocked ? 1.015 : 1)
+        .allowsHitTesting(!isPrivacyLocked)
+        .accessibilityHidden(isPrivacyLocked)
 
       if isPrivacyLocked {
+        Rectangle()
+          .fill(.regularMaterial)
+          .ignoresSafeArea()
+          .overlay(Color.black.opacity(0.12).ignoresSafeArea())
+          .zIndex(9_999)
+
         AppLockView()
           .zIndex(10_000)
       }
     }
     .animation(.easeOut(duration: 0.16), value: isPrivacyLocked)
-  }
-}
-
-private struct LockedPrivacyBackground: View {
-  var body: some View {
-    ZStack {
-      Color.black
-      LinearGradient(
-        colors: [
-          CinevaTheme.accent.opacity(0.20),
-          Color.black,
-          CinevaTheme.accentRed.opacity(0.12),
-        ],
-        startPoint: .topLeading,
-        endPoint: .bottomTrailing
-      )
-      .blur(radius: 34)
-      .scaleEffect(1.15)
-    }
-    .ignoresSafeArea()
   }
 }
 
@@ -152,8 +142,8 @@ private struct HomeView: View {
     .fullScreenCover(item: $selectedVideo) { item in
       PlayerScreen(item: item)
     }
-    .task {
-      guard !didCheckConnection, appState.isConfigured else { return }
+    .task(id: "\(appState.isConfigured)|\(appState.isAppUnlocked)") {
+      guard appState.isAppUnlocked, !didCheckConnection, appState.isConfigured else { return }
       didCheckConnection = true
       do {
         try await appState.api.validateCredentials()

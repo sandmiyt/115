@@ -173,22 +173,16 @@ struct VideoArtwork: View {
         } else {
           placeholder
             .frame(width: proxy.size.width, height: proxy.size.height)
-            .task {
-              if generatedImage == nil {
-                generatedImage = await appState.thumbnailService.generatedThumbnail(
-                  for: item,
-                  api: appState.api
-                )
-              }
-            }
         }
       }
       .frame(width: proxy.size.width, height: proxy.size.height)
       .clipped()
     }
     .aspectRatio(16 / 9, contentMode: .fit)
-    .task(id: item.id) {
-      if item.thumbnailURL == nil, generatedImage == nil {
+    .task(id: "\(item.id)|\(serverThumbnailFailed)") {
+      // One thumbnail task per card. Previously the no-server-thumbnail path
+      // could start the same expensive remote frame extraction twice.
+      if generatedImage == nil, item.thumbnailURL == nil || serverThumbnailFailed {
         generatedImage = await appState.thumbnailService.generatedThumbnail(
           for: item,
           api: appState.api

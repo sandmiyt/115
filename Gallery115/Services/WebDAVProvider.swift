@@ -164,7 +164,17 @@ actor WebDAVProvider: CloudProvider {
 
     let files = entries.filter { !$0.isDirectory }
     let stem = URL(fileURLWithPath: item.name).deletingPathExtension().lastPathComponent.lowercased()
-    let byName = Dictionary(uniqueKeysWithValues: files.map { ($0.name.lowercased(), $0) })
+    // Some WebDAV backends are case-sensitive and may legally contain both
+    // Poster.jpg and poster.jpg. Dictionary(uniqueKeysWithValues:) would trap
+    // at runtime after lowercasing those names, so keep the first matching file
+    // instead of allowing a duplicate-key crash while loading metadata.
+    var byName: [String: CloudItem] = [:]
+    for file in files {
+      let key = file.name.lowercased()
+      if byName[key] == nil {
+        byName[key] = file
+      }
+    }
 
     let nfoCandidates = ["\(stem).nfo", "movie.nfo", "tvshow.nfo"]
     let posterCandidates = [

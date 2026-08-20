@@ -46,21 +46,14 @@ struct CinevaLogoMark: View {
   var size: CGFloat = 44
 
   var body: some View {
-    ZStack {
-      RoundedRectangle(cornerRadius: size * 0.28, style: .continuous)
-        .fill(.white.opacity(0.98))
-
-      CinevaTheme.brandGradient
-        .mask {
-          Image(systemName: "play.fill")
-            .font(.system(size: size * 0.50, weight: .black))
-            .offset(x: size * 0.025)
-        }
-
-      RoundedRectangle(cornerRadius: size * 0.28, style: .continuous)
-        .stroke(.black.opacity(0.06), lineWidth: 0.7)
-    }
-    .frame(width: size, height: size)
-    .shadow(color: CinevaTheme.accent.opacity(0.24), radius: size * 0.20, y: size * 0.08)
+    CinevaTheme.brandGradient
+      .mask {
+        Image(systemName: "play.fill")
+          .font(.system(size: size * 0.68, weight: .black))
+          .offset(x: size * 0.035)
+      }
+      .frame(width: size, height: size)
+      .shadow(color: CinevaTheme.accent.opacity(0.28), radius: size * 0.16, y: size * 0.06)
+      .accessibilityHidden(true)
   }
 }

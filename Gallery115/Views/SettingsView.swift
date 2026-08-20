@@ -31,7 +31,7 @@ struct SettingsView: View {
           Button {
             showMediaSetup = true
           } label: {
-            Label("重新授权 / 更换 115 账号", systemImage: "externaldrive.badge.plus")
+            Label("更换媒体源", systemImage: "externaldrive.badge.plus")
           }
 
           Button("断开媒体源", role: .destructive) {
@@ -41,7 +41,7 @@ struct SettingsView: View {
           Button {
             showMediaSetup = true
           } label: {
-            Label("连接 115 网盘", systemImage: "externaldrive.badge.plus")
+            Label("连接 OpenList / AList", systemImage: "externaldrive.badge.plus")
           }
         }
 
@@ -165,17 +165,24 @@ struct SettingsView: View {
           CinevaLogoMark(size: 42)
           VStack(alignment: .leading, spacing: 2) {
             Text("Cineva").font(.headline)
-            Text("115 私人影音播放器")
+            Text("OpenList / AList 私人影音播放器")
               .font(.caption)
               .foregroundStyle(.secondary)
           }
         }
         LabeledContent("版本", value: "2.2.0")
-        LabeledContent("当前媒体源", value: appState.isConfigured ? appState.mediaSourceKind.title : "未连接")
+        LabeledContent("挂载协议", value: "WebDAV")
       }
     }
     .sheet(isPresented: $showMediaSetup) {
       SetupView()
+    }
+    .onChange(of: appState.isAppUnlocked) { _, unlocked in
+      if !unlocked {
+        showMediaSetup = false
+        showDisconnectConfirmation = false
+        showClearRecentsConfirmation = false
+      }
     }
     .confirmationDialog("断开当前媒体源？", isPresented: $showDisconnectConfirmation, titleVisibility: .visible) {
       Button("断开媒体源", role: .destructive) {
@@ -183,7 +190,7 @@ struct SettingsView: View {
       }
       Button("取消", role: .cancel) {}
     } message: {
-      Text("只会移除 Cineva 中保存的当前授权，不会删除 115 网盘中的任何文件。")
+      Text("只会移除 Cineva 保存的 WebDAV 登录信息，不会删除 OpenList 或 115 中的文件。")
     }
     .confirmationDialog("清除全部最近播放？", isPresented: $showClearRecentsConfirmation, titleVisibility: .visible) {
       Button("清除播放记录", role: .destructive) {
@@ -212,57 +219,32 @@ struct SettingsView: View {
 
   @ViewBuilder
   private var connectionSummary: some View {
-    if appState.isConfigured {
-      switch appState.mediaSourceKind {
-      case .cloud115:
-        HStack(spacing: 11) {
-          Image(systemName: "checkmark.circle.fill")
-            .font(.title3)
-            .foregroundStyle(.green)
+    if let configuration = WebDAVCredentialStore.shared.configuration {
+      HStack(spacing: 11) {
+        Image(systemName: "checkmark.circle.fill")
+          .font(.title3)
+          .foregroundStyle(.green)
 
-          VStack(alignment: .leading, spacing: 3) {
-            Text("115 网盘已授权")
-              .font(.subheadline.weight(.semibold))
-            Text("当前设备使用用户本人授权的 115 网盘")
-              .font(.caption)
-              .foregroundStyle(.secondary)
-          }
-        }
-
-        LabeledContent("读取方式", value: "115 Open API")
-        Text("访问凭据保存在本机 Keychain。Cineva 会在需要时自动刷新登录状态；网络波动、限流和服务端临时错误不会自动清除授权。")
-          .font(.caption)
-          .foregroundStyle(.secondary)
-
-      case .webDAV:
-        if let configuration = WebDAVCredentialStore.shared.configuration {
-          HStack(spacing: 11) {
-            Image(systemName: "checkmark.circle.fill")
-              .font(.title3)
-              .foregroundStyle(.green)
-
-            VStack(alignment: .leading, spacing: 3) {
-              Text("OpenList / AList 已连接")
-                .font(.subheadline.weight(.semibold))
-              Text("媒体库：\(configuration.normalizedRootPath)")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            }
-          }
-
-          LabeledContent("读取方式", value: "WebDAV 只读")
-          if configuration.normalizedWebDAVURL?.scheme?.lowercased() == "http" {
-            Label("当前连接使用 HTTP。若要使用 HTTPS，必须先在 OpenList 所在服务器或反向代理真正配置 TLS 和有效证书；仅把 http 改成 https 会直接导致 TLS 连接失败。使用 IP+端口时，证书还必须与该访问地址匹配。", systemImage: "exclamationmark.triangle.fill")
-              .font(.caption)
-              .foregroundStyle(.orange)
-          }
-          Text("服务器地址与账号信息不会在设置页展示。")
+        VStack(alignment: .leading, spacing: 3) {
+          Text("OpenList / AList 已连接")
+            .font(.subheadline.weight(.semibold))
+          Text("媒体库：\(configuration.normalizedRootPath)")
             .font(.caption)
             .foregroundStyle(.secondary)
         }
       }
+
+      LabeledContent("读取方式", value: "WebDAV 只读")
+      if configuration.normalizedWebDAVURL?.scheme?.lowercased() == "http" {
+        Label("当前连接使用 HTTP。若要使用 HTTPS，必须先在 OpenList 所在服务器或反向代理真正配置 TLS 和有效证书；仅把 http 改成 https 会直接导致 TLS 连接失败。使用 IP+端口时，证书还必须与该访问地址匹配。", systemImage: "exclamationmark.triangle.fill")
+          .font(.caption)
+          .foregroundStyle(.orange)
+      }
+      Text("服务器地址与账号信息不会在设置页展示。115 Token、刷新与限流继续由 OpenList / AList 服务器端处理。")
+        .font(.caption)
+        .foregroundStyle(.secondary)
     } else {
-      Label("尚未连接 115 网盘。", systemImage: "externaldrive.badge.xmark")
+      Label("未连接媒体源，可在进入软件后自行挂载。", systemImage: "externaldrive.badge.xmark")
         .foregroundStyle(.secondary)
     }
   }
@@ -275,7 +257,7 @@ struct SettingsView: View {
       do {
         try await appState.api.validateCredentials()
         await MainActor.run {
-          statusMessage = "\(appState.mediaSourceKind.title)连接正常。"
+          statusMessage = "OpenList / AList 连接正常。"
           appState.markMediaConnected()
           isCheckingConnection = false
         }

@@ -127,7 +127,13 @@ struct FolderView: View {
     .sheet(isPresented: $showMediaSetup) {
       SetupView()
     }
-    .task(id: "\(folderID)|\(appState.isConfigured)") {
+    .onChange(of: appState.isAppUnlocked) { _, unlocked in
+      if !unlocked {
+        showMediaSetup = false
+      }
+    }
+    .task(id: "\(folderID)|\(appState.isConfigured)|\(appState.isAppUnlocked)") {
+      guard appState.isAppUnlocked else { return }
       if appState.isConfigured {
         await loadFirstPage(forceRefresh: false)
       } else {
@@ -357,6 +363,10 @@ struct FolderView: View {
 
   @MainActor
   private func updateSearchResults() async {
+    guard appState.isAppUnlocked else {
+      searchItems = nil
+      return
+    }
     let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else {
       searchItems = nil

@@ -25,6 +25,7 @@ import SwiftUI
     private var lastSavedSecond = -1
     private var lastState: VLCMediaPlayerState = .stopped
     private var maxObservedTime: Double = 0
+    private var playbackGeneration = UUID()
 
     func configure(
       source: VideoSource,
@@ -33,6 +34,8 @@ import SwiftUI
       playbackRate: Float
     ) {
       stop(saveProgress: false)
+      let generation = UUID()
+      playbackGeneration = generation
       self.item = item
       self.libraryStore = libraryStore
       didReachEnd = false
@@ -41,6 +44,7 @@ import SwiftUI
       networkMbps = 0
       transferredMegabytes = 0
       maxObservedTime = 0
+      lastSavedSecond = -1
 
       let media = VLCMedia(url: source.url)
       let cacheMilliseconds = item.isDiscImage ? 5000 : 1800
@@ -67,9 +71,12 @@ import SwiftUI
       isBuffering = true
 
       let resume = libraryStore.resumePosition(for: item)
-      if resume > 2 {
+      if resume > 2, duration <= 0 || resume < duration - 15 {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-          guard let self else { return }
+          guard let self,
+            self.playbackGeneration == generation,
+            self.item?.id == item.id
+          else { return }
           self.seek(to: resume)
         }
       }
@@ -134,6 +141,9 @@ import SwiftUI
 
     func stop(saveProgress: Bool = true) {
       if saveProgress { self.saveProgress(force: true) }
+      // Invalidate delayed work (for example resume seeking) from the previous
+      // media item before the controller is reused for another episode.
+      playbackGeneration = UUID()
       pollTimer?.invalidate()
       pollTimer = nil
       player.stop()

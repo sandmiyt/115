@@ -133,12 +133,27 @@ struct PlayerScreen: View {
         }
 
         if appState.faceIDEnabled && !appState.isAppUnlocked {
-          Rectangle()
-            .fill(.ultraThinMaterial)
-            .ignoresSafeArea()
-            .contentShape(Rectangle())
-            .allowsHitTesting(true)
-            .zIndex(10_000)
+          ZStack {
+            Rectangle()
+              .fill(.regularMaterial)
+              .overlay(Color.black.opacity(0.12))
+              .ignoresSafeArea()
+
+            VStack(spacing: 12) {
+              Image(systemName: "faceid")
+                .font(.system(size: 34, weight: .medium))
+              Text("点击重新验证")
+                .font(.subheadline.weight(.semibold))
+            }
+            .foregroundStyle(.white.opacity(0.92))
+          }
+          .contentShape(Rectangle())
+          .onTapGesture {
+            Task { await appState.authenticateIfNeeded() }
+          }
+          .accessibilityElement(children: .combine)
+          .accessibilityLabel("Cineva 已锁定，点击重新验证")
+          .zIndex(10_000)
         }
       }
       .frame(width: proxy.size.width, height: proxy.size.height)
@@ -168,6 +183,23 @@ struct PlayerScreen: View {
         controlsTask?.cancel()
         controlsVisible = true
       } else {
+        scheduleControlsHide()
+      }
+    }
+    .onChange(of: appState.isAppUnlocked) { _, unlocked in
+      if !unlocked, appState.faceIDEnabled {
+        // A SwiftUI sheet is presented above the full-screen player. Dismiss it
+        // immediately when privacy lock engages so playback details cannot remain
+        // visible in the app switcher above the player's blur shield.
+        showInfo = false
+        showSettingsPanel = false
+        showSpeedPanel = false
+        showQueuePanel = false
+        showPlaybackHUD = false
+        controlsTask?.cancel()
+        controlsVisible = false
+      } else if unlocked {
+        showControls(animated: false)
         scheduleControlsHide()
       }
     }
@@ -1344,6 +1376,8 @@ struct PlayerScreen: View {
   @MainActor
   private func prepareCurrentItem() async {
     controlsTask?.cancel()
+    let expectedItem = currentItem
+    let expectedID = expectedItem.id
 
     if !didLoadPreferredRate {
       playbackRate = appState.preferredPlaybackRate
@@ -1356,7 +1390,7 @@ struct PlayerScreen: View {
     }
 
     let newModel = PlayerModel(
-      item: currentItem,
+      item: expectedItem,
       api: appState.api,
       libraryStore: appState.libraryStore,
       defaultQuality: appState.defaultQuality
@@ -1364,14 +1398,25 @@ struct PlayerScreen: View {
     model = newModel
     newModel.setPlaybackRate(playbackRate)
 
-    async let metadataTask = appState.api.localMetadata(for: currentItem)
+    async let metadataTask = appState.api.localMetadata(for: expectedItem)
     await newModel.prepareAndPlay()
-    localMetadata = await metadataTask
+    guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else {
+      newModel.player.pause()
+      return
+    }
+
+    let metadata = await metadataTask
+    guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else {
+      newModel.player.pause()
+      return
+    }
+    localMetadata = metadata
 
     activatePlaybackEngine(for: newModel)
     applyPlaybackRate(playbackRate, persist: false)
     applyAutomaticOrientation(for: newModel.videoDisplaySize)
-    await ensureCompletePlaylist()
+    await ensureCompletePlaylist(for: expectedItem)
+    guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else { return }
     configureRemotePlayback()
     updateRemotePlaybackInfo()
 
@@ -1381,10 +1426,11 @@ struct PlayerScreen: View {
 
   @MainActor
   private func applyAutomaticOrientation(for size: CGSize?) {
-    guard let size, size.width > 0, size.height > 0 else {
-      PlayerOrientation.request(.portrait)
-      return
-    }
+    // VLC fallback does not currently expose a reliable natural video size here.
+    // Do not force those videos back to portrait; preserve the user's/device's
+    // current orientation and keep the manual orientation button available.
+    guard !useVLC else { return }
+    guard let size, size.width > 0, size.height > 0 else { return }
     let ratio = size.width / max(size.height, 1)
     PlayerOrientation.request(ratio > 1.12 ? .landscape : .portrait)
   }
@@ -1414,24 +1460,26 @@ struct PlayerScreen: View {
   }
 
   @MainActor
-  private func ensureCompletePlaylist() async {
-    let parent = currentItem.parentID
+  private func ensureCompletePlaylist(for expectedItem: CloudItem) async {
+    let parent = expectedItem.parentID
     guard !parent.isEmpty, loadedPlaylistParentID != parent else { return }
 
     do {
       let all = try await appState.api.listFolder(id: parent)
+      guard !Task.isCancelled, currentItem.id == expectedItem.id else { return }
       var videos = all.filter { !$0.isDirectory && $0.isVideo }
-      if !videos.contains(where: { $0.id == currentItem.id }) {
-        videos.append(currentItem)
+      if !videos.contains(where: { $0.id == expectedItem.id }) {
+        videos.append(expectedItem)
       }
       videos.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
       playlist = videos
       loadedPlaylistParentID = parent
     } catch {
+      guard !Task.isCancelled, currentItem.id == expectedItem.id else { return }
       // Keep the playlist supplied by the source screen. Queue expansion is an
       // enhancement and must never make playback fail.
-      if !playlist.contains(where: { $0.id == currentItem.id }) {
-        playlist.append(currentItem)
+      if !playlist.contains(where: { $0.id == expectedItem.id }) {
+        playlist.append(expectedItem)
       }
     }
   }
