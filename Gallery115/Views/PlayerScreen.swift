@@ -21,6 +21,9 @@ struct PlayerScreen: View {
   @State private var controlsTask: Task<Void, Never>?
   @State private var scrubValue: Double = 0
   @State private var isScrubbing = false
+  @State private var isGestureInteracting = false
+  @State private var gestureStartBrightness: CGFloat?
+  @State private var gestureStartVolume: Float?
 
   init(item: CloudItem) {
     _currentItem = State(initialValue: item)
@@ -101,8 +104,16 @@ struct PlayerScreen: View {
       await loadPlaylistIfNeeded()
     }
     .onChange(of: model?.didReachEnd ?? false) { _, ended in
-      guard ended, appState.autoPlayNextEpisode else { return }
-      playNextIfAvailable()
+      guard ended else { return }
+      Task { @MainActor in
+        if appState.autoPlayNextEpisode, nextItem != nil {
+          playNextIfAvailable()
+        } else {
+          await model?.replay()
+          controlsVisible = true
+          scheduleControlsHide()
+        }
+      }
     }
     .onDisappear {
       hudTask?.cancel()
@@ -158,29 +169,49 @@ struct PlayerScreen: View {
         seekBy(isLeft ? -Double(appState.doubleTapSeekSeconds) : Double(appState.doubleTapSeekSeconds))
       }
       .simultaneousGesture(
-        DragGesture(minimumDistance: 22)
+        DragGesture(minimumDistance: 16)
+          .onChanged { value in
+            guard appState.playerGesturesEnabled else { return }
+            let dx = value.translation.width
+            let dy = value.translation.height
+            guard abs(dy) >= abs(dx) else { return }
+
+            if !isGestureInteracting {
+              isGestureInteracting = true
+              controlsTask?.cancel()
+              gestureStartBrightness = UIScreen.main.brightness
+              gestureStartVolume = model?.player.volume
+            }
+
+            let normalizedDelta = -dy / availableHeight * 1.35
+            if isLeft {
+              let start = gestureStartBrightness ?? UIScreen.main.brightness
+              let next = min(max(start + normalizedDelta, 0), 1)
+              UIScreen.main.brightness = next
+              showGestureHUD("亮度  \(Int(next * 100))%")
+            } else if let model {
+              let start = CGFloat(gestureStartVolume ?? model.player.volume)
+              let next = min(max(start + normalizedDelta, 0), 1)
+              model.player.volume = Float(next)
+              showGestureHUD("音量  \(Int(next * 100))%")
+            }
+          }
           .onEnded { value in
             guard appState.playerGesturesEnabled else { return }
             let dx = value.translation.width
             let dy = value.translation.height
+
             if abs(dx) > abs(dy) {
               let delta = Double(dx / availableWidth) * 180
               if abs(delta) > 2 {
                 seekBy(delta)
               }
-            } else {
-              let delta = -dy / availableHeight
-              if isLeft {
-                let next = min(max(UIScreen.main.brightness + delta, 0), 1)
-                UIScreen.main.brightness = next
-                showGestureHUD("亮度  \(Int(next * 100))%")
-              } else if let model {
-                let current = CGFloat(model.player.volume)
-                let next = min(max(current + delta, 0), 1)
-                model.player.volume = Float(next)
-                showGestureHUD("音量  \(Int(next * 100))%")
-              }
             }
+
+            gestureStartBrightness = nil
+            gestureStartVolume = nil
+            isGestureInteracting = false
+            scheduleControlsHide()
           }
       )
   }
@@ -233,8 +264,15 @@ struct PlayerScreen: View {
 
       Spacer(minLength: 4)
 
-      if landscape, let model {
-        qualityMenu(model: model, compact: false)
+      if let model {
+        qualityMenu(model: model, compact: !landscape)
+      }
+
+      playerIconButton("rectangle.landscape.rotate") {
+        controlsTask?.cancel()
+        PlayerOrientation.request(landscape ? .portrait : .landscape)
+        showGestureHUD(landscape ? "竖屏" : "横屏")
+        scheduleControlsHide()
       }
 
       if landscape {
@@ -249,7 +287,11 @@ struct PlayerScreen: View {
     }
     .padding(.leading, max(proxy.safeAreaInsets.leading, 12))
     .padding(.trailing, max(proxy.safeAreaInsets.trailing, 12))
-    .padding(.top, max(proxy.safeAreaInsets.top, 8) + 4)
+    .padding(
+      .top,
+      (proxy.safeAreaInsets.top > 0 ? proxy.safeAreaInsets.top : (landscape ? 8 : 44))
+        + (landscape ? 10 : 16)
+    )
     .padding(.bottom, landscape ? 18 : 12)
     .background(
       LinearGradient(
@@ -751,7 +793,7 @@ struct PlayerScreen: View {
   @MainActor
   private func scheduleControlsHide() {
     controlsTask?.cancel()
-    guard model?.isPlaying == true, !isLocked, !isScrubbing else { return }
+    guard model?.isPlaying == true, !isLocked, !isScrubbing, !isGestureInteracting else { return }
     controlsTask = Task { @MainActor in
       try? await Task.sleep(for: .seconds(2.0))
       guard !Task.isCancelled else { return }

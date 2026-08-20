@@ -113,6 +113,15 @@ final class PlayerModel {
     player.play()
     isPlaying = true
     isBuffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
+  }
+
+  func replay() async {
+    didReachEnd = false
+    currentTime = 0
+    bufferedUntil = max(bufferedUntil, 0)
+    await player.seek(to: .zero)
+    player.play()
+    isPlaying = true
     isBuffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
   }
 

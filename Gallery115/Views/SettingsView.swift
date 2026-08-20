@@ -60,6 +60,13 @@ struct SettingsView: View {
         }
 
         Toggle("自动播放下一集", isOn: $appState.autoPlayNextEpisode)
+        Text(
+          appState.autoPlayNextEpisode
+            ? "开启：优先播放下一集；已经是最后一个视频时自动重播。"
+            : "关闭：当前视频播放结束后自动从头重播。"
+        )
+        .font(.caption)
+        .foregroundStyle(.secondary)
       }
 
       Section("隐私") {

@@ -25,6 +25,7 @@ actor APIClient {
   private let authURL = URL(string: "https://passportapi.115.com")!
   private let session: URLSession
   private let credentials = CredentialStore.shared
+  private var refreshTask: Task<RefreshTokens, Error>?
 
   init() {
     let config = URLSessionConfiguration.default
@@ -82,11 +83,13 @@ actor APIClient {
   func videoSources(for item: CloudItem) async throws -> [VideoSource] {
     guard !item.pickCode.isEmpty else { return [] }
 
-    async let transcodesTask = transcodedSources(pickCode: item.pickCode)
-    async let originalTask = originalSource(pickCode: item.pickCode)
+    // Transcoded playback is the primary path. Do not swallow its errors: an expired
+    // session must be refreshed/retried instead of being misreported as "no quality".
+    let transcodes = try await transcodedSources(pickCode: item.pickCode)
 
-    let transcodes = (try? await transcodesTask) ?? []
-    let original = try? await originalTask
+    // Original quality is optional. A codec/original-link failure must not block a
+    // perfectly valid transcoded stream.
+    let original = try? await originalSource(pickCode: item.pickCode)
 
     var sources = transcodes.sorted { $0.definition > $1.definition }
     if let original {
@@ -190,13 +193,31 @@ actor APIClient {
     }
 
     let (data, response) = try await session.data(for: request)
-    guard let http = response as? HTTPURLResponse, (200..<500).contains(http.statusCode) else {
+    guard let http = response as? HTTPURLResponse else {
+      throw APIError.invalidResponse
+    }
+
+    // Some 115 auth failures arrive as HTTP 401 with a body that does not match the
+    // normal API envelope. Refresh before attempting to decode that body.
+    if http.statusCode == 401, allowRefresh {
+      try await refreshAccessToken()
+      return try await authorizedRequest(
+        path: path,
+        method: method,
+        query: query,
+        form: form,
+        extraHeaders: extraHeaders,
+        allowRefresh: false
+      )
+    }
+
+    guard (200..<500).contains(http.statusCode) else {
       throw APIError.invalidResponse
     }
 
     let status = try parseStatus(from: data)
     if !status.state {
-      if allowRefresh && (status.code == 99 || String(status.code).hasPrefix("401")) {
+      if allowRefresh && isAuthenticationCode(status.code) {
         try await refreshAccessToken()
         return try await authorizedRequest(
           path: path,
@@ -212,32 +233,144 @@ actor APIClient {
     return data
   }
 
+  private func isAuthenticationCode(_ code: Int64) -> Bool {
+    code == 99 || String(code).hasPrefix("401")
+  }
+
+  /// Single-flight refresh. If several thumbnails/player requests discover an expired
+  /// token together they all await the same refresh operation, so an old rotating
+  /// refresh token cannot be used concurrently by multiple requests.
   private func refreshAccessToken() async throws {
-    guard let refreshToken = credentials.refreshToken, !refreshToken.isEmpty else {
+    if let refreshTask {
+      let tokens = try await refreshTask.value
+      credentials.save(accessToken: tokens.accessToken, refreshToken: tokens.refreshToken)
+      return
+    }
+
+    guard let currentRefreshToken = credentials.refreshToken,
+      !currentRefreshToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    else {
       throw APIError.missingRefreshToken
     }
 
-    let url = authURL.appending(path: "/open/refreshToken")
-    var request = URLRequest(url: url)
-    request.httpMethod = "POST"
-    request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-    request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
-    request.httpBody = ["refresh_token": refreshToken].formEncoded.data(using: .utf8)
+    let session = self.session
+    let authURL = self.authURL
+    let userAgent = Self.userAgent
+    let task = Task<RefreshTokens, Error> {
+      try await Self.performRefresh(
+        refreshToken: currentRefreshToken,
+        session: session,
+        authURL: authURL,
+        userAgent: userAgent
+      )
+    }
+    refreshTask = task
+    defer { refreshTask = nil }
 
-    let (data, response) = try await session.data(for: request)
-    guard let http = response as? HTTPURLResponse, (200..<500).contains(http.statusCode) else {
-      throw APIError.invalidResponse
+    let tokens = try await task.value
+    // 115 rotates refresh_token. Persist the pair together immediately before any
+    // waiting request is allowed to retry.
+    credentials.save(accessToken: tokens.accessToken, refreshToken: tokens.refreshToken)
+  }
+
+  private static func performRefresh(
+    refreshToken: String,
+    session: URLSession,
+    authURL: URL,
+    userAgent: String
+  ) async throws -> RefreshTokens {
+    var lastError: Error?
+
+    // Primary path: 115 official refresh endpoint.
+    for attempt in 0..<2 {
+      do {
+        let url = authURL.appending(path: "/open/refreshToken")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 20
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        request.httpBody = ["refresh_token": refreshToken].formEncoded.data(using: .utf8)
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<500).contains(http.statusCode) else {
+          throw APIError.invalidResponse
+        }
+        return try parseRefreshTokens(data: data, fallbackRefreshToken: refreshToken)
+      } catch {
+        lastError = error
+        if attempt == 0 {
+          try? await Task.sleep(for: .milliseconds(450))
+        }
+      }
     }
 
-    let envelope = try JSONDecoder.gallery115.decode(AuthEnvelope<TokenPayload>.self, from: data)
-    guard envelope.state == 1,
-      let payload = envelope.data,
-      !payload.accessToken.isEmpty,
-      !payload.refreshToken.isEmpty
-    else {
-      throw APIError.remote(code: Int64(envelope.code), message: envelope.message)
+    // Fallback path matches Cineva's current OpenList-based login flow. This keeps
+    // existing users recoverable if the direct refresh endpoint is temporarily flaky.
+    for endpoint in [
+      "https://api.oplist.org/115cloud/renewapi",
+      "https://api-cn.oplist.org/115cloud/renewapi",
+    ] {
+      do {
+        guard var components = URLComponents(string: endpoint) else { continue }
+        components.queryItems = [URLQueryItem(name: "refresh_ui", value: refreshToken)]
+        guard let url = components.url else { continue }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 20
+        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+          throw APIError.invalidResponse
+        }
+        return try parseRefreshTokens(data: data, fallbackRefreshToken: refreshToken)
+      } catch {
+        lastError = error
+      }
     }
-    credentials.save(accessToken: payload.accessToken, refreshToken: payload.refreshToken)
+
+    throw lastError ?? APIError.invalidResponse
+  }
+
+  private static func parseRefreshTokens(
+    data: Data,
+    fallbackRefreshToken: String
+  ) throws -> RefreshTokens {
+    guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+      throw APIError.malformedData
+    }
+
+    let payload = (object["data"] as? [String: Any]) ?? object
+    let accessToken = stringValue(payload["access_token"])
+    let refreshToken = stringValue(payload["refresh_token"])
+
+    if !accessToken.isEmpty {
+      return RefreshTokens(
+        accessToken: accessToken,
+        refreshToken: refreshToken.isEmpty ? fallbackRefreshToken : refreshToken
+      )
+    }
+
+    let code = int64Value(object["code"])
+    let message = stringValue(object["message"])
+      .nonEmpty ?? stringValue(object["error"]).nonEmpty
+      ?? stringValue(object["text"]).nonEmpty ?? "115 登录状态续期失败。"
+    throw APIError.remote(code: code, message: message)
+  }
+
+  private static func stringValue(_ value: Any?) -> String {
+    switch value {
+    case let value as String: return value
+    case let value as NSNumber: return value.stringValue
+    default: return ""
+    }
+  }
+
+  private static func int64Value(_ value: Any?) -> Int64 {
+    switch value {
+    case let value as NSNumber: return value.int64Value
+    case let value as String: return Int64(value) ?? 0
+    default: return 0
+    }
   }
 
   private func parseStatus(from data: Data) throws -> APIStatus {
@@ -267,6 +400,15 @@ actor APIClient {
     default: return "清晰度 \(definition)"
     }
   }
+}
+
+private struct RefreshTokens: Sendable {
+  let accessToken: String
+  let refreshToken: String
+}
+
+private extension String {
+  var nonEmpty: String? { isEmpty ? nil : self }
 }
 
 private struct APIStatus {

@@ -381,9 +381,9 @@ private struct HomeLandscapeArtwork: View {
     }
     .frame(width: width)
     .aspectRatio(16 / 9, contentMode: .fit)
-    .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
     .overlay {
-      RoundedRectangle(cornerRadius: 13, style: .continuous)
+      RoundedRectangle(cornerRadius: 12, style: .continuous)
         .stroke(.primary.opacity(0.08), lineWidth: 0.6)
     }
     .shadow(color: .black.opacity(0.13), radius: 7, y: 3)
