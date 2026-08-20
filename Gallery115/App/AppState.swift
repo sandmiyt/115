@@ -171,6 +171,68 @@ final class AppState {
     didSet { UserDefaults.standard.set(autoPlayNextEpisode, forKey: Keys.autoPlayNextEpisode) }
   }
 
+  var autoLoadExternalSubtitle: Bool {
+    didSet { UserDefaults.standard.set(autoLoadExternalSubtitle, forKey: Keys.autoLoadExternalSubtitle) }
+  }
+  var autoLoadExternalSubtitles: Bool {
+    get { autoLoadExternalSubtitle }
+    set { autoLoadExternalSubtitle = newValue }
+  }
+
+  var subtitleFontScale: Double {
+    didSet { UserDefaults.standard.set(min(max(subtitleFontScale, 0.8), 1.6), forKey: Keys.subtitleFontScale) }
+  }
+  var subtitleBottomPadding: Double {
+    didSet { UserDefaults.standard.set(min(max(subtitleBottomPadding, 0.04), 0.28), forKey: Keys.subtitleBottomPadding) }
+  }
+  var subtitleDelaySeconds: Double {
+    didSet { UserDefaults.standard.set(min(max(subtitleDelaySeconds, -10), 10), forKey: Keys.subtitleDelaySeconds) }
+  }
+  var subtitleTimeOffset: Double {
+    get { subtitleDelaySeconds }
+    set { subtitleDelaySeconds = newValue }
+  }
+
+  var chapterMarksEnabled: Bool {
+    didSet { UserDefaults.standard.set(chapterMarksEnabled, forKey: Keys.chapterMarksEnabled) }
+  }
+  var skipIntroEnabled: Bool {
+    didSet { UserDefaults.standard.set(skipIntroEnabled, forKey: Keys.skipIntroEnabled) }
+  }
+  var introSkipSeconds: Int {
+    didSet { UserDefaults.standard.set(min(max(introSkipSeconds, 10), 300), forKey: Keys.introSkipSeconds) }
+  }
+  var skipOutroEnabled: Bool {
+    didSet { UserDefaults.standard.set(skipOutroEnabled, forKey: Keys.skipOutroEnabled) }
+  }
+  var outroSkipSeconds: Int {
+    didSet { UserDefaults.standard.set(min(max(outroSkipSeconds, 10), 600), forKey: Keys.outroSkipSeconds) }
+  }
+  var outroPromptSeconds: Int {
+    get { outroSkipSeconds }
+    set { outroSkipSeconds = newValue }
+  }
+
+  var progressPreviewEnabled: Bool {
+    didSet { UserDefaults.standard.set(progressPreviewEnabled, forKey: Keys.progressPreviewEnabled) }
+  }
+  var timelinePreviewEnabled: Bool {
+    get { progressPreviewEnabled }
+    set { progressPreviewEnabled = newValue }
+  }
+
+  var showChapterMarkers: Bool {
+    get { chapterMarksEnabled }
+    set { chapterMarksEnabled = newValue }
+  }
+
+  var networkAutoRecoveryEnabled: Bool {
+    didSet { UserDefaults.standard.set(networkAutoRecoveryEnabled, forKey: Keys.networkAutoRecoveryEnabled) }
+  }
+  var fastStartEnabled: Bool {
+    didSet { UserDefaults.standard.set(fastStartEnabled, forKey: Keys.fastStartEnabled) }
+  }
+
   var doubleTapSeekSeconds: Int {
     didSet {
       if ![10, 15, 30].contains(doubleTapSeekSeconds) { doubleTapSeekSeconds = 15 }
@@ -202,6 +264,18 @@ final class AppState {
     faceIDEnabled = defaults.bool(forKey: Keys.faceIDEnabled)
     playerGesturesEnabled = defaults.object(forKey: Keys.playerGesturesEnabled) as? Bool ?? true
     autoPlayNextEpisode = defaults.object(forKey: Keys.autoPlayNextEpisode) as? Bool ?? true
+    autoLoadExternalSubtitle = defaults.object(forKey: Keys.autoLoadExternalSubtitle) as? Bool ?? true
+    subtitleFontScale = min(max(defaults.object(forKey: Keys.subtitleFontScale) as? Double ?? 1.0, 0.8), 1.6)
+    subtitleBottomPadding = min(max(defaults.object(forKey: Keys.subtitleBottomPadding) as? Double ?? 0.10, 0.04), 0.28)
+    subtitleDelaySeconds = min(max(defaults.object(forKey: Keys.subtitleDelaySeconds) as? Double ?? 0, -10), 10)
+    chapterMarksEnabled = defaults.object(forKey: Keys.chapterMarksEnabled) as? Bool ?? true
+    skipIntroEnabled = defaults.object(forKey: Keys.skipIntroEnabled) as? Bool ?? false
+    introSkipSeconds = min(max(defaults.object(forKey: Keys.introSkipSeconds) as? Int ?? 90, 10), 300)
+    skipOutroEnabled = defaults.object(forKey: Keys.skipOutroEnabled) as? Bool ?? false
+    outroSkipSeconds = min(max(defaults.object(forKey: Keys.outroSkipSeconds) as? Int ?? 120, 10), 600)
+    progressPreviewEnabled = defaults.object(forKey: Keys.progressPreviewEnabled) as? Bool ?? true
+    networkAutoRecoveryEnabled = defaults.object(forKey: Keys.networkAutoRecoveryEnabled) as? Bool ?? true
+    fastStartEnabled = defaults.object(forKey: Keys.fastStartEnabled) as? Bool ?? true
     let storedRate = defaults.object(forKey: Keys.preferredPlaybackRate) as? Double ?? 1.0
     preferredPlaybackRate = Float(min(max(storedRate, 0.5), 2.0))
     let storedSeek = defaults.object(forKey: Keys.doubleTapSeekSeconds) as? Int ?? 15
@@ -337,6 +411,18 @@ final class AppState {
     static let faceIDEnabled = "gallery115.faceIDEnabled"
     static let playerGesturesEnabled = "gallery115.playerGesturesEnabled"
     static let autoPlayNextEpisode = "gallery115.autoPlayNextEpisode"
+    static let autoLoadExternalSubtitle = "cineva.subtitle.autoLoadExternal.v1"
+    static let subtitleFontScale = "cineva.subtitle.fontScale.v1"
+    static let subtitleBottomPadding = "cineva.subtitle.bottomPadding.v1"
+    static let subtitleDelaySeconds = "cineva.subtitle.delay.v1"
+    static let chapterMarksEnabled = "cineva.playback.chapterMarks.v1"
+    static let skipIntroEnabled = "cineva.playback.skipIntro.v1"
+    static let introSkipSeconds = "cineva.playback.introSeconds.v1"
+    static let skipOutroEnabled = "cineva.playback.skipOutro.v1"
+    static let outroSkipSeconds = "cineva.playback.outroSeconds.v1"
+    static let progressPreviewEnabled = "cineva.playback.progressPreview.v1"
+    static let networkAutoRecoveryEnabled = "cineva.network.autoRecovery.v1"
+    static let fastStartEnabled = "cineva.playback.fastStart.v1"
     static let doubleTapSeekSeconds = "gallery115.doubleTapSeekSeconds"
   }
 }

@@ -41,6 +41,26 @@ actor APIClient {
     await provider.localMetadata(for: item)
   }
 
+  func externalSubtitles(for item: CloudItem) async -> [ExternalSubtitleTrack] {
+    await provider.externalSubtitles(for: item)
+  }
+
+  func subtitleData(for track: ExternalSubtitleTrack) async throws -> Data {
+    try await provider.subtitleData(for: track)
+  }
+
+  func externalSubtitleTracks(for item: CloudItem) async throws -> [ExternalSubtitleTrack] {
+    try await provider.externalSubtitleTracks(for: item)
+  }
+
+  func subtitleCues(for track: ExternalSubtitleTrack) async throws -> [SubtitleCue] {
+    try await provider.subtitleCues(for: track)
+  }
+
+  func sidecarChapters(for item: CloudItem) async -> [PlayerChapter] {
+    await provider.sidecarChapters(for: item)
+  }
+
   func updateVideoHistory(pickCode: String, seconds: Int, watchEnd: Bool) async {
     await provider.updateVideoHistory(
       pickCode: pickCode,

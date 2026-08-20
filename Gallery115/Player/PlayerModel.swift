@@ -5,6 +5,135 @@ import Foundation
 import Observation
 import UIKit
 
+
+struct PlayerChapter: Identifiable, Hashable, Sendable {
+  let id: String
+  let title: String
+  let start: Double
+  let end: Double
+}
+
+struct SubtitleCue: Identifiable, Hashable, Sendable {
+  let id: Int
+  let start: Double
+  let end: Double
+  let text: String
+}
+
+@MainActor
+protocol PlaybackEngineControlling: AnyObject {
+  var currentTime: Double { get }
+  var duration: Double { get }
+  var bufferedUntil: Double { get }
+  var bufferedDuration: Double { get }
+  var isPlaying: Bool { get }
+  var isBuffering: Bool { get }
+  var didReachEnd: Bool { get }
+  var networkMbps: Double { get }
+  var transferredMegabytes: Double { get }
+  var volume: Float { get }
+  func pause()
+  func resume()
+  func togglePlayback()
+  func seek(to seconds: Double)
+  func setPlaybackRate(_ rate: Float)
+  func setVolume(_ value: Float)
+  func replayFromStart()
+}
+
+typealias CinevaPlaybackEngine = PlaybackEngineControlling
+
+@MainActor
+extension PlaybackEngineControlling {
+  func enginePause() { pause() }
+  func engineResume() { resume() }
+  func engineTogglePlayback() { togglePlayback() }
+  func engineSeek(to seconds: Double) { seek(to: seconds) }
+  func engineSetPlaybackRate(_ rate: Float) { setPlaybackRate(rate) }
+  func engineSetVolume(_ value: Float) { setVolume(value) }
+}
+
+enum ExternalSubtitleParser {
+  nonisolated static func parse(data: Data, fileExtension: String) -> [SubtitleCue] {
+    guard let text = decodeText(data) else { return [] }
+    return ["ass", "ssa"].contains(fileExtension.lowercased()) ? parseASS(text) : parseSRTLike(text)
+  }
+
+  nonisolated private static func decodeText(_ data: Data) -> String? {
+    if let value = String(data: data, encoding: .utf8) { return value }
+    if let value = String(data: data, encoding: .utf16) { return value }
+    if let value = String(data: data, encoding: .unicode) { return value }
+    if let value = String(data: data, encoding: .windowsCP1252) { return value }
+    return nil
+  }
+
+  nonisolated private static func parseSRTLike(_ text: String) -> [SubtitleCue] {
+    let cleaned = text.replacingOccurrences(of: "WEBVTT", with: "")
+      .replacingOccurrences(of: "\r\n", with: "\n")
+      .replacingOccurrences(of: "\r", with: "\n")
+    var cues: [SubtitleCue] = []
+    var identifier = 0
+    for block in cleaned.components(separatedBy: "\n\n") {
+      let lines = block.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+      guard let timingIndex = lines.firstIndex(where: { $0.contains("-->") }) else { continue }
+      let pair = lines[timingIndex].components(separatedBy: "-->")
+      guard pair.count == 2, let start = parseTimestamp(pair[0]), let end = parseTimestamp(pair[1]), end > start else { continue }
+      let body = lines.dropFirst(timingIndex + 1).joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !body.isEmpty else { continue }
+      cues.append(SubtitleCue(id: identifier, start: start, end: end, text: stripMarkup(body)))
+      identifier += 1
+    }
+    return cues
+  }
+
+  nonisolated private static func parseASS(_ text: String) -> [SubtitleCue] {
+    var format: [String] = []
+    var inEvents = false
+    var cues: [SubtitleCue] = []
+    var identifier = 0
+    for raw in text.replacingOccurrences(of: "\r\n", with: "\n").split(separator: "\n", omittingEmptySubsequences: false) {
+      let line = String(raw)
+      let lowered = line.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+      if lowered == "[events]" { inEvents = true; continue }
+      guard inEvents else { continue }
+      if lowered.hasPrefix("format:") {
+        format = line.dropFirst(7).split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+        continue
+      }
+      guard lowered.hasPrefix("dialogue:") else { continue }
+      let body = String(line.dropFirst(9)).trimmingCharacters(in: .whitespaces)
+      let splitCount = max(format.count - 1, 9)
+      let fields = body.split(separator: ",", maxSplits: splitCount, omittingEmptySubsequences: false).map(String.init)
+      let startIndex = format.firstIndex(of: "start") ?? 1
+      let endIndex = format.firstIndex(of: "end") ?? 2
+      let textIndex = format.firstIndex(of: "text") ?? min(9, max(fields.count - 1, 0))
+      guard fields.indices.contains(startIndex), fields.indices.contains(endIndex), fields.indices.contains(textIndex), let start = parseTimestamp(fields[startIndex]), let end = parseTimestamp(fields[endIndex]), end > start else { continue }
+      let subtitle = stripMarkup(fields[textIndex].replacingOccurrences(of: "\\N", with: "\n"))
+      guard !subtitle.isEmpty else { continue }
+      cues.append(SubtitleCue(id: identifier, start: start, end: end, text: subtitle))
+      identifier += 1
+    }
+    return cues
+  }
+
+  nonisolated private static func parseTimestamp(_ raw: String) -> Double? {
+    let token = raw.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: " ").first.map(String.init) ?? raw
+    let parts = token.replacingOccurrences(of: ",", with: ".").split(separator: ":")
+    guard parts.count >= 2 else { return nil }
+    let seconds = Double(String(parts.last!)) ?? 0
+    let minutes = Double(String(parts[parts.count - 2])) ?? 0
+    let hours = parts.count >= 3 ? (Double(String(parts[parts.count - 3])) ?? 0) : 0
+    return hours * 3600 + minutes * 60 + seconds
+  }
+
+  nonisolated private static func stripMarkup(_ value: String) -> String {
+    var output = value.replacingOccurrences(of: "<br>", with: "\n", options: .caseInsensitive)
+    output = output.replacingOccurrences(of: "\\{[^}]*\\}", with: "", options: .regularExpression)
+    output = output.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+    return output.trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+}
+
 struct PlayerMediaOption: Identifiable {
   let id: String
   let title: String
@@ -13,7 +142,7 @@ struct PlayerMediaOption: Identifiable {
 
 @MainActor
 @Observable
-final class PlayerModel {
+final class PlayerModel: PlaybackEngineControlling {
   private(set) var sources: [VideoSource] = []
   private(set) var selectedSource: VideoSource?
   private(set) var isPreparing = false
@@ -34,21 +163,29 @@ final class PlayerModel {
   private(set) var videoCodec = "读取中"
   private(set) var hdrFormat = "SDR"
   private(set) var nominalFrameRate: Float = 0
+  private(set) var chapters: [PlayerChapter] = []
 
   var errorMessage: String?
   var didFallbackFromOriginal = false
 
   let player = AVPlayer()
+  var volume: Float { player.volume }
 
   private let item: CloudItem
   private let api: APIClient
   private let libraryStore: LibraryStore
   private let defaultQuality: AppState.DefaultQuality
+  private let fastStartEnabled: Bool
+  private let networkAutoRecoveryEnabled: Bool
+  private var activeAsset: AVURLAsset?
+  private var previewCache: [Int: UIImage] = [:]
+  private var mediaInfoGeneration = UUID()
   private var audioGroup: AVMediaSelectionGroup?
   private var subtitleGroup: AVMediaSelectionGroup?
   nonisolated(unsafe) private var timeObserver: Any?
   nonisolated(unsafe) private var failureObserver: NSObjectProtocol?
   nonisolated(unsafe) private var endObserver: NSObjectProtocol?
+  nonisolated(unsafe) private var stallObserver: NSObjectProtocol?
   nonisolated(unsafe) private var interruptionObserver: NSObjectProtocol?
   nonisolated(unsafe) private var routeChangeObserver: NSObjectProtocol?
   private var lastSavedSecond = -1
@@ -56,17 +193,22 @@ final class PlayerModel {
   private var isFallingBack = false
   private var lastTransferredBytes: Int64 = 0
   private var lastBandwidthSampleAt = Date()
+  private var lastStallRecoveryAt = Date.distantPast
 
   init(
     item: CloudItem, api: APIClient, libraryStore: LibraryStore,
-    defaultQuality: AppState.DefaultQuality
+    defaultQuality: AppState.DefaultQuality,
+    fastStartEnabled: Bool = true,
+    networkAutoRecoveryEnabled: Bool = true
   ) {
     self.item = item
     self.api = api
     self.libraryStore = libraryStore
     self.defaultQuality = defaultQuality
+    self.fastStartEnabled = fastStartEnabled
+    self.networkAutoRecoveryEnabled = networkAutoRecoveryEnabled
     self.duration = max(item.duration, libraryStore.knownDuration(for: item))
-    player.automaticallyWaitsToMinimizeStalling = true
+    player.automaticallyWaitsToMinimizeStalling = !fastStartEnabled
     player.allowsExternalPlayback = true
     configureAudioSession()
     installAudioSessionObservers()
@@ -81,6 +223,9 @@ final class PlayerModel {
     }
     if let endObserver {
       NotificationCenter.default.removeObserver(endObserver)
+    }
+    if let stallObserver {
+      NotificationCenter.default.removeObserver(stallObserver)
     }
     if let interruptionObserver {
       NotificationCenter.default.removeObserver(interruptionObserver)
@@ -140,15 +285,17 @@ final class PlayerModel {
     isBuffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
   }
 
-  func replay() async {
+  func replayFromStart() {
     didReachEnd = false
     currentTime = 0
     bufferedUntil = max(bufferedUntil, 0)
-    await player.seek(to: .zero)
-    player.play()
+    player.seek(to: .zero)
+    player.playImmediately(atRate: player.defaultRate)
     isPlaying = true
     isBuffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
   }
+
+  func replay() async { replayFromStart() }
 
   func togglePlayback() {
     if player.timeControlStatus == .playing {
@@ -172,10 +319,10 @@ final class PlayerModel {
   func setPlaybackRate(_ rate: Float) {
     let safeRate = min(max(rate, 0.5), 2.0)
     player.defaultRate = safeRate
-    if player.timeControlStatus == .playing {
-      player.rate = safeRate
-    }
+    if player.timeControlStatus == .playing { player.rate = safeRate }
   }
+
+  func setVolume(_ value: Float) { player.volume = min(max(value, 0), 1) }
 
   func selectAudio(_ id: String?) {
     guard let playerItem = player.currentItem, let audioGroup else { return }
@@ -233,6 +380,10 @@ final class PlayerModel {
     videoCodec = "读取中"
     hdrFormat = "SDR"
     nominalFrameRate = 0
+    chapters = []
+    previewCache.removeAll(keepingCapacity: true)
+    mediaInfoGeneration = UUID()
+    activeAsset = nil
     audioOptions = []
     subtitleOptions = []
     audioGroup = nil
@@ -258,75 +409,86 @@ final class PlayerModel {
       return
     }
 
-    let asset: AVURLAsset
-    if source.headers.isEmpty {
-      asset = AVURLAsset(url: source.url)
-    } else {
-      asset = AVURLAsset(
-        url: source.url,
-        options: ["AVURLAssetHTTPHeaderFieldsKey": source.headers]
-      )
-    }
-
-    do {
-      let playable = try await asset.load(.isPlayable)
-      if !playable {
-        throw NSError(
-          domain: "Gallery115.Player", code: -1,
-          userInfo: [NSLocalizedDescriptionKey: "当前原画编码或容器无法由系统播放器直接打开。"])
-      }
-      let loadedDuration = try? await asset.load(.duration)
-      if let loadedDuration, loadedDuration.seconds.isFinite, loadedDuration.seconds > 0 {
-        duration = loadedDuration.seconds
-      }
-      let characteristics = await detectVideoCharacteristics(asset)
-      videoDisplaySize = characteristics.size
-      videoCodec = characteristics.codec
-      hdrFormat = characteristics.hdr
-      nominalFrameRate = characteristics.frameRate
-    } catch {
-      // Direct-play-first: preserve Apple's native HDR/Dolby Vision pipeline whenever
-      // AVPlayer can open the original. VLC is only used after the system player has
-      // actually rejected the original container/codec.
-      if source.isOriginal, VLCAvailability.isAvailable {
-        player.replaceCurrentItem(with: nil)
-        requiresVLC = true
-        isPlaying = false
-        isBuffering = false
-        videoCodec = item.fileExtension.uppercased()
-        hdrFormat = "由 VLC 解码"
-        errorMessage = nil
-        return
-      }
-      if source.isOriginal, allowFallback, let fallback = bestTranscode {
-        didFallbackFromOriginal = true
-        await play(fallback, allowFallback: false)
-        return
-      }
-      errorMessage = error.localizedDescription
-      isBuffering = false
-      return
-    }
+    var assetOptions: [String: Any] = [AVURLAssetPreferPreciseDurationAndTimingKey: false]
+    if !source.headers.isEmpty { assetOptions["AVURLAssetHTTPHeaderFieldsKey"] = source.headers }
+    let asset = AVURLAsset(url: source.url, options: assetOptions)
+    activeAsset = asset
 
     let playerItem = AVPlayerItem(asset: asset)
-    // Give remote WebDAV playback a modest forward buffer without capping bitrate.
-    // Original quality remains untouched; AVPlayer still chooses the native decode path.
-    playerItem.preferredForwardBufferDuration = 20
+    playerItem.preferredForwardBufferDuration = fastStartEnabled ? 8 : 20
+    playerItem.preferredPeakBitRate = 0
     installItemObservers(for: playerItem)
     player.replaceCurrentItem(with: playerItem)
-
-    await loadMediaSelectionOptions(asset: asset, playerItem: playerItem)
 
     let resumePosition = libraryStore.resumePosition(for: item)
     if resumePosition > 2, duration <= 0 || resumePosition < duration - 15 {
       currentTime = resumePosition
-      await player.seek(to: CMTime(seconds: resumePosition, preferredTimescale: 600))
+      player.seek(
+        to: CMTime(seconds: resumePosition, preferredTimescale: 600),
+        toleranceBefore: CMTime(seconds: 1, preferredTimescale: 600),
+        toleranceAfter: CMTime(seconds: 1, preferredTimescale: 600)
+      )
     } else {
       currentTime = 0
     }
-    player.play()
+    player.playImmediately(atRate: player.defaultRate)
     isPlaying = true
     isBuffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
+
+    let generation = mediaInfoGeneration
+    Task { @MainActor [weak self] in
+      guard let self, self.mediaInfoGeneration == generation, self.player.currentItem === playerItem else { return }
+      async let durationTask = try? asset.load(.duration)
+      async let characteristicsTask = self.detectVideoCharacteristics(asset)
+      async let selectionTask: Void = self.loadMediaSelectionOptions(asset: asset, playerItem: playerItem)
+      async let chapterTask = self.loadChapters(asset: asset)
+
+      if let loadedDuration = await durationTask, loadedDuration.seconds.isFinite, loadedDuration.seconds > 0, self.mediaInfoGeneration == generation {
+        self.duration = loadedDuration.seconds
+      }
+      let characteristics = await characteristicsTask
+      guard self.mediaInfoGeneration == generation, self.player.currentItem === playerItem else { return }
+      self.videoDisplaySize = characteristics.size
+      self.videoCodec = characteristics.codec
+      self.hdrFormat = characteristics.hdr
+      self.nominalFrameRate = characteristics.frameRate
+      _ = await selectionTask
+      let chapters = await chapterTask
+      if self.mediaInfoGeneration == generation { self.chapters = chapters }
+    }
+  }
+
+  func previewImage(at seconds: Double) async -> UIImage? {
+    guard let asset = activeAsset, seconds.isFinite, seconds >= 0 else { return nil }
+    let bucket = Int(seconds / 10)
+    if let cached = previewCache[bucket] { return cached }
+    let generator = AVAssetImageGenerator(asset: asset)
+    generator.appliesPreferredTrackTransform = true
+    generator.maximumSize = CGSize(width: 480, height: 270)
+    generator.requestedTimeToleranceBefore = CMTime(seconds: 1, preferredTimescale: 600)
+    generator.requestedTimeToleranceAfter = CMTime(seconds: 1, preferredTimescale: 600)
+    guard let result = try? await generator.image(at: CMTime(seconds: seconds, preferredTimescale: 600)) else { return nil }
+    let uiImage = UIImage(cgImage: result.image)
+    previewCache[bucket] = uiImage
+    if previewCache.count > 24 { previewCache.removeValue(forKey: previewCache.keys.min() ?? bucket) }
+    return uiImage
+  }
+
+  func timelinePreview(at seconds: Double) async -> UIImage? {
+    await previewImage(at: seconds)
+  }
+
+  private func loadChapters(asset: AVAsset) async -> [PlayerChapter] {
+    guard let locales = try? await asset.load(.availableChapterLocales), !locales.isEmpty else { return [] }
+    let groups = asset.chapterMetadataGroups(bestMatchingPreferredLanguages: locales.map(\.identifier))
+    return groups.enumerated().compactMap { index, group in
+      let start = group.timeRange.start.seconds
+      let end = CMTimeRangeGetEnd(group.timeRange).seconds
+      guard start.isFinite, end.isFinite, end > start else { return nil }
+      let titleItem = AVMetadataItem.metadataItems(from: group.items, filteredByIdentifier: .commonIdentifierTitle).first
+      let title = titleItem?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+      return PlayerChapter(id: "chapter-\(index)-\(start)", title: title?.isEmpty == false ? title! : "章节 \(index + 1)", start: start, end: end)
+    }
   }
 
   private func detectVideoCharacteristics(_ asset: AVAsset) async -> (
@@ -489,6 +651,9 @@ final class PlayerModel {
     if let endObserver {
       NotificationCenter.default.removeObserver(endObserver)
     }
+    if let stallObserver {
+      NotificationCenter.default.removeObserver(stallObserver)
+    }
 
     failureObserver = NotificationCenter.default.addObserver(
       forName: .AVPlayerItemFailedToPlayToEndTime,
@@ -512,6 +677,32 @@ final class PlayerModel {
         self.isPlaying = false
         self.didReachEnd = true
         self.saveProgress(force: true)
+      }
+    }
+
+    stallObserver = NotificationCenter.default.addObserver(
+      forName: .AVPlayerItemPlaybackStalled,
+      object: playerItem,
+      queue: .main
+    ) { [weak self] _ in
+      Task { @MainActor [weak self] in
+        guard let self, self.networkAutoRecoveryEnabled, !self.didReachEnd else { return }
+        let now = Date()
+        guard now.timeIntervalSince(self.lastStallRecoveryAt) > 6 else { return }
+        self.lastStallRecoveryAt = now
+        self.isBuffering = true
+        let recoveryTime = max(self.player.currentTime().seconds, 0)
+        self.player.seek(
+          to: CMTime(seconds: recoveryTime, preferredTimescale: 600),
+          toleranceBefore: CMTime(seconds: 0.35, preferredTimescale: 600),
+          toleranceAfter: CMTime(seconds: 0.35, preferredTimescale: 600)
+        ) { [weak self] finished in
+          Task { @MainActor [weak self] in
+            guard let self, finished else { return }
+            self.player.playImmediately(atRate: self.playbackRate)
+            self.isBuffering = false
+          }
+        }
       }
     }
   }

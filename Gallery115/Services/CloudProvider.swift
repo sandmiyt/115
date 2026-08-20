@@ -1,5 +1,12 @@
 import Foundation
 
+struct ExternalSubtitleTrack: Identifiable, Hashable, Sendable {
+  let id: String
+  let title: String
+  let logicalPath: String
+  let fileExtension: String
+}
+
 struct CloudFolderPage {
   let items: [CloudItem]
   let offset: Int

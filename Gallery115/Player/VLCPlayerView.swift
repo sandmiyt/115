@@ -8,7 +8,7 @@ import SwiftUI
 
   @MainActor
   @Observable
-  final class VLCPlaybackController {
+  final class VLCPlaybackController: PlaybackEngineControlling {
     private(set) var currentTime: Double = 0
     private(set) var duration: Double = 0
     private(set) var isPlaying = false
@@ -17,6 +17,8 @@ import SwiftUI
     private(set) var networkMbps: Double = 0
     private(set) var transferredMegabytes: Double = 0
     private(set) var volume: Float = 1
+    var bufferedUntil: Double { currentTime }
+    var bufferedDuration: Double { 0 }
 
     let player = VLCMediaPlayer()
     private var pollTimer: Timer?
@@ -31,7 +33,8 @@ import SwiftUI
       source: VideoSource,
       item: CloudItem,
       libraryStore: LibraryStore,
-      playbackRate: Float
+      playbackRate: Float,
+      fastStartEnabled: Bool
     ) {
       stop(saveProgress: false)
       let generation = UUID()
@@ -47,7 +50,7 @@ import SwiftUI
       lastSavedSecond = -1
 
       let media = VLCMedia(url: source.url)
-      let cacheMilliseconds = item.isDiscImage ? 5000 : 1800
+      let cacheMilliseconds = item.isDiscImage ? 4200 : (fastStartEnabled ? 900 : 1800)
       var options: [String: Any] = [
         "http-user-agent": APIClient.userAgent,
         "network-caching": cacheMilliseconds,
@@ -139,6 +142,8 @@ import SwiftUI
       resume()
     }
 
+    func replayFromStart() { replay() }
+
     func stop(saveProgress: Bool = true) {
       if saveProgress { self.saveProgress(force: true) }
       // Invalidate delayed work (for example resume seeking) from the previous
@@ -227,7 +232,7 @@ import SwiftUI
 #else
   @MainActor
   @Observable
-  final class VLCPlaybackController {
+  final class VLCPlaybackController: PlaybackEngineControlling {
     private(set) var currentTime: Double = 0
     private(set) var duration: Double = 0
     private(set) var isPlaying = false
@@ -236,12 +241,15 @@ import SwiftUI
     private(set) var networkMbps: Double = 0
     private(set) var transferredMegabytes: Double = 0
     private(set) var volume: Float = 1
+    var bufferedUntil: Double { currentTime }
+    var bufferedDuration: Double { 0 }
 
     func configure(
       source: VideoSource,
       item: CloudItem,
       libraryStore: LibraryStore,
-      playbackRate: Float
+      playbackRate: Float,
+      fastStartEnabled: Bool
     ) {}
     func pause() {}
     func resume() {}
@@ -251,6 +259,7 @@ import SwiftUI
     func setPlaybackRate(_ value: Float) {}
     func setVolume(_ value: Float) {}
     func replay() {}
+    func replayFromStart() {}
     func stop(saveProgress: Bool = true) {}
   }
 

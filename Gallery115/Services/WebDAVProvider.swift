@@ -230,6 +230,79 @@ actor WebDAVProvider: CloudProvider {
     return metadata
   }
 
+  func externalSubtitles(for item: CloudItem) async -> [ExternalSubtitleTrack] {
+    guard !item.isDirectory, let configuration = store.configuration else { return [] }
+    let parentPath = normalizeLogicalPath(item.parentID)
+    let entries: [CloudItem]
+    do {
+      entries = try await fetchDirectoryEntries(configuration: configuration, logicalPath: parentPath)
+    } catch {
+      return []
+    }
+
+    let stem = URL(fileURLWithPath: item.name).deletingPathExtension().lastPathComponent
+    let normalizedStem = stem.lowercased()
+    let supported: Set<String> = ["srt", "ass", "ssa", "vtt"]
+    return entries.compactMap { candidate in
+      guard !candidate.isDirectory, supported.contains(candidate.fileExtension.lowercased()) else { return nil }
+      let candidateStem = URL(fileURLWithPath: candidate.name).deletingPathExtension().lastPathComponent
+      let lower = candidateStem.lowercased()
+      guard lower == normalizedStem || lower.hasPrefix(normalizedStem + ".") || lower.hasPrefix(normalizedStem + "-") || lower.hasPrefix(normalizedStem + "_") else { return nil }
+      var suffix = String(candidateStem.dropFirst(min(candidateStem.count, stem.count)))
+      suffix = suffix.trimmingCharacters(in: CharacterSet(charactersIn: ".-_ "))
+      let ext = candidate.fileExtension.uppercased()
+      let title = suffix.isEmpty ? "外置字幕 · \(ext)" : "\(suffix) · \(ext)"
+      return ExternalSubtitleTrack(id: candidate.id, title: title, logicalPath: candidate.id, fileExtension: candidate.fileExtension.lowercased())
+    }.sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
+  }
+
+  func subtitleData(for track: ExternalSubtitleTrack) async throws -> Data {
+    guard let configuration = store.configuration else {
+      throw CloudProviderError.authenticationRequired("尚未连接 OpenList / AList 媒体源。")
+    }
+    return try await fetchResourceData(configuration: configuration, logicalPath: track.logicalPath, maximumBytes: 8_000_000)
+  }
+
+  func externalSubtitleTracks(for item: CloudItem) async throws -> [ExternalSubtitleTrack] {
+    await externalSubtitles(for: item)
+  }
+
+  func subtitleCues(for track: ExternalSubtitleTrack) async throws -> [SubtitleCue] {
+    let data = try await subtitleData(for: track)
+    return ExternalSubtitleParser.parse(data: data, fileExtension: track.fileExtension)
+  }
+
+  func sidecarChapters(for item: CloudItem) async -> [PlayerChapter] {
+    guard !item.isDirectory, let configuration = store.configuration else { return [] }
+    let parentPath = normalizeLogicalPath(item.parentID)
+    let entries: [CloudItem]
+    do { entries = try await fetchDirectoryEntries(configuration: configuration, logicalPath: parentPath) }
+    catch { return [] }
+
+    let stem = URL(fileURLWithPath: item.name).deletingPathExtension().lastPathComponent.lowercased()
+    let candidates = ["\(stem).chapters.txt", "chapters.txt"]
+    guard let sidecar = entries.first(where: { candidate in
+      !candidate.isDirectory && candidates.contains(candidate.name.lowercased())
+    }), let data = try? await fetchResourceData(configuration: configuration, logicalPath: sidecar.id, maximumBytes: 512_000),
+      let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .utf16)
+    else { return [] }
+
+    var raw: [(start: Double, title: String)] = []
+    for line in text.replacingOccurrences(of: "\r\n", with: "\n").split(separator: "\n") {
+      let value = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !value.isEmpty, !value.hasPrefix("#") else { continue }
+      let parts = value.split(separator: " ", maxSplits: 1).map(String.init)
+      guard let first = parts.first, let start = Self.parseChapterTimestamp(first) else { continue }
+      let title = parts.count > 1 ? parts[1] : "章节 \(raw.count + 1)"
+      raw.append((start, title))
+    }
+    raw.sort { $0.start < $1.start }
+    return raw.enumerated().map { index, entry in
+      let end = index + 1 < raw.count ? raw[index + 1].start : 0
+      return PlayerChapter(id: "sidecar-\(index)-\(entry.start)", title: entry.title, start: entry.start, end: end)
+    }
+  }
+
   func updateVideoHistory(pickCode: String, seconds: Int, watchEnd: Bool) async {
     // OpenList/AList WebDAV is intentionally read-only from Cineva.
     // Playback progress remains in Cineva's local LibraryStore.
@@ -288,6 +361,52 @@ actor WebDAVProvider: CloudProvider {
     return parser.items
   }
 
+  private func performDataRequestWithRecovery(
+    _ request: URLRequest,
+    acceptedStatusCodes: Set<Int>,
+    attempts: Int = 3
+  ) async throws -> (Data, HTTPURLResponse) {
+    var lastError: Error?
+    for attempt in 0..<max(1, attempts) {
+      do {
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+          throw CloudProviderError.network("OpenList / AList 没有返回有效网络响应。")
+        }
+        if acceptedStatusCodes.contains(http.statusCode) { return (data, http) }
+        let transient = http.statusCode == 408 || http.statusCode == 425 || http.statusCode == 429 || (500...599).contains(http.statusCode)
+        if transient, attempt + 1 < attempts {
+          let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init)
+          let backoff = retryAfter ?? min(pow(2.0, Double(attempt)) * 0.35, 1.4)
+          try await Task.sleep(for: .milliseconds(Int(backoff * 1000)))
+          continue
+        }
+        return (data, http)
+      } catch is CancellationError {
+        throw CancellationError()
+      } catch {
+        lastError = error
+        if attempt + 1 < attempts, isTransientNetworkError(error) {
+          let backoff = min(pow(2.0, Double(attempt)) * 0.30, 1.2)
+          try await Task.sleep(for: .milliseconds(Int(backoff * 1000)))
+          continue
+        }
+        throw error
+      }
+    }
+    throw lastError ?? CloudProviderError.network("网络连接异常，请稍后重试。")
+  }
+
+  private func isTransientNetworkError(_ error: Error) -> Bool {
+    guard let urlError = error as? URLError else { return false }
+    switch urlError.code {
+    case .timedOut, .cannotFindHost, .cannotConnectToHost, .networkConnectionLost, .dnsLookupFailed, .notConnectedToInternet, .internationalRoamingOff, .callIsActive, .dataNotAllowed, .resourceUnavailable:
+      return true
+    default:
+      return false
+    }
+  }
+
   private func fetchResourceData(
     configuration: WebDAVMountConfiguration,
     logicalPath: String,
@@ -305,9 +424,15 @@ actor WebDAVProvider: CloudProvider {
     if let authorization = configuration.authorizationHeader {
       request.setValue(authorization, forHTTPHeaderField: "Authorization")
     }
-    let (data, response) = try await session.data(for: request)
-    guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
-      throw CloudProviderError.network("本地元数据读取失败。")
+    let (data, http) = try await performDataRequestWithRecovery(request, acceptedStatusCodes: Set(200...299))
+    guard (200...299).contains(http.statusCode) else {
+      if http.statusCode == 401 || http.statusCode == 403 {
+        throw CloudProviderError.authenticationRequired("OpenList / AList 登录信息已失效或没有读取权限。")
+      }
+      if http.statusCode == 429 {
+        throw CloudProviderError.rateLimited("媒体服务器请求过于频繁，Cineva 已自动退避重试。")
+      }
+      throw CloudProviderError.network("本地元数据读取失败（\(http.statusCode)）。")
     }
     guard data.count <= maximumBytes else {
       throw CloudProviderError.invalidResponse("本地元数据文件过大")
@@ -334,10 +459,7 @@ actor WebDAVProvider: CloudProvider {
     }
     request.httpBody = Data(Self.propfindBody.utf8)
 
-    let (data, response) = try await session.data(for: request)
-    guard let http = response as? HTTPURLResponse else {
-      throw CloudProviderError.network("OpenList / AList 没有返回有效网络响应。")
-    }
+    let (data, http) = try await performDataRequestWithRecovery(request, acceptedStatusCodes: [200, 207])
 
     switch http.statusCode {
     case 200, 207:
@@ -420,6 +542,15 @@ actor WebDAVProvider: CloudProvider {
   private func writeDiskCache(_ items: [CloudItem], cacheKey: String) {
     guard let data = try? JSONEncoder().encode(items) else { return }
     try? data.write(to: cacheFileURL(cacheKey: cacheKey), options: .atomic)
+  }
+
+  private static func parseChapterTimestamp(_ raw: String) -> Double? {
+    let parts = raw.replacingOccurrences(of: ",", with: ".").split(separator: ":")
+    guard parts.count >= 2 else { return nil }
+    let seconds = Double(String(parts.last!)) ?? 0
+    let minutes = Double(String(parts[parts.count - 2])) ?? 0
+    let hours = parts.count >= 3 ? (Double(String(parts[parts.count - 3])) ?? 0) : 0
+    return hours * 3600 + minutes * 60 + seconds
   }
 
   private func stableHash(_ value: String) -> String {

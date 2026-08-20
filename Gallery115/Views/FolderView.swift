@@ -29,6 +29,8 @@ struct FolderView: View {
   @State private var transientMessage: String?
   @State private var query = ""
   @State private var searchItems: [CloudItem]?
+  @State private var displayItems: [CloudItem] = []
+  @State private var playlistItems: [CloudItem] = []
   @State private var didScheduleBackgroundRefresh = false
   @State private var sortMode: SortMode = .updated
   @State private var selectedVideo: CloudItem?
@@ -50,7 +52,7 @@ struct FolderView: View {
         } actions: {
           Button("重试") { Task { await loadFirstPage(forceRefresh: true) } }
         }
-      } else if filteredItems.isEmpty {
+      } else if displayItems.isEmpty {
         ContentUnavailableView(
           query.isEmpty ? "这里没有视频" : "没有搜索结果",
           systemImage: query.isEmpty ? "video.slash" : "magnifyingglass",
@@ -66,6 +68,8 @@ struct FolderView: View {
       FolderView(folderID: item.id, title: item.name)
     }
     .searchable(text: $query, prompt: "搜索当前目录")
+    .onChange(of: query) { _, _ in rebuildDisplayItems() }
+    .onChange(of: sortMode) { _, _ in rebuildDisplayItems() }
     .task(id: query) { await updateSearchResults() }
     .toolbar {
       ToolbarItemGroup(placement: .topBarTrailing) {
@@ -122,7 +126,7 @@ struct FolderView: View {
       }
     }
     .fullScreenCover(item: $selectedVideo) { item in
-      PlayerScreen(item: item, playlist: loadedVideoPlaylist)
+      PlayerScreen(item: item, playlist: playlistItems)
     }
     .sheet(isPresented: $showMediaSetup) {
       SetupView()
@@ -141,6 +145,8 @@ struct FolderView: View {
         isLoadingMore = false
         items = []
         searchItems = nil
+        displayItems = []
+        playlistItems = []
         errorMessage = nil
       }
     }
@@ -166,7 +172,7 @@ struct FolderView: View {
     case .grid:
       ScrollView {
         LazyVGrid(columns: columns, spacing: 11) {
-          ForEach(filteredItems) { item in
+          ForEach(displayItems) { item in
             if item.isDirectory {
               NavigationLink(value: item) {
                 FolderCard(item: item)
@@ -203,7 +209,7 @@ struct FolderView: View {
 
     case .list:
       List {
-        ForEach(filteredItems) { item in
+        ForEach(displayItems) { item in
           if item.isDirectory {
             NavigationLink(value: item) {
               FolderListRow(item: item)
@@ -277,13 +283,15 @@ struct FolderView: View {
     )
   }
 
-  private var filteredItems: [CloudItem] {
-    var output = searchItems ?? items
+  @MainActor
+  private func rebuildDisplayItems() {
+    let source = searchItems ?? items
     let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-    if !trimmed.isEmpty {
-      output = output.filter { $0.name.localizedCaseInsensitiveContains(trimmed) }
-    }
-    return output.sorted { lhs, rhs in
+    var output = trimmed.isEmpty
+      ? source
+      : source.filter { $0.name.localizedCaseInsensitiveContains(trimmed) }
+
+    output.sort { lhs, rhs in
       if lhs.isDirectory != rhs.isDirectory { return lhs.isDirectory }
       switch sortMode {
       case .updated:
@@ -294,10 +302,12 @@ struct FolderView: View {
         return lhs.size > rhs.size
       }
     }
-  }
+    displayItems = output
 
-  private var loadedVideoPlaylist: [CloudItem] {
-    (searchItems ?? items).filter { !$0.isDirectory && $0.isVideo }
+    // Build the queue only when the underlying directory changes instead of
+    // sorting the entire video list on every SwiftUI body invalidation.
+    playlistItems = source
+      .filter { !$0.isDirectory && $0.isVideo }
       .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
   }
 
@@ -317,6 +327,7 @@ struct FolderView: View {
       )
       items = page.items
       searchItems = nil
+      rebuildDisplayItems()
       nextOffset = page.limit
       hasMore = page.hasMore
       errorMessage = nil
@@ -348,6 +359,7 @@ struct FolderView: View {
         forceRefresh: true
       )
       items = page.items
+      rebuildDisplayItems()
       nextOffset = page.limit
       hasMore = page.hasMore
       if page.servedFromCache {
@@ -365,11 +377,13 @@ struct FolderView: View {
   private func updateSearchResults() async {
     guard appState.isAppUnlocked else {
       searchItems = nil
+      rebuildDisplayItems()
       return
     }
     let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else {
       searchItems = nil
+      rebuildDisplayItems()
       return
     }
 
@@ -379,9 +393,11 @@ struct FolderView: View {
       let all = try await appState.api.listFolder(id: folderID)
       guard !Task.isCancelled else { return }
       searchItems = all
+      rebuildDisplayItems()
     } catch {
       // Search the loaded page rather than failing the whole screen.
       searchItems = items
+      rebuildDisplayItems()
     }
   }
 
@@ -401,6 +417,7 @@ struct FolderView: View {
       var known = Set(items.map(\.id))
       let additions = page.items.filter { known.insert($0.id).inserted }
       items.append(contentsOf: additions)
+      rebuildDisplayItems()
       nextOffset += page.limit
       hasMore = page.hasMore
       if page.servedFromCache {

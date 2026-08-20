@@ -37,6 +37,14 @@ struct PlayerScreen: View {
   @State private var isControlsInteractionActive = false
   @State private var gestureStartBrightness: CGFloat?
   @State private var gestureStartVolume: Float?
+  @State private var externalSubtitleTracks: [ExternalSubtitleTrack] = []
+  @State private var selectedExternalSubtitleID: String?
+  @State private var externalSubtitleCues: [SubtitleCue] = []
+  @State private var sidecarChapters: [PlayerChapter] = []
+  @State private var timelinePreviewImage: UIImage?
+  @State private var timelinePreviewBucket = -1
+  @State private var timelinePreviewTask: Task<Void, Never>?
+  @State private var subtitleLoadTask: Task<Void, Never>?
 
   init(item: CloudItem, playlist: [CloudItem] = []) {
     _currentItem = State(initialValue: item)
@@ -64,6 +72,16 @@ struct PlayerScreen: View {
           .ignoresSafeArea()
 
         interactionLayer(proxy: proxy)
+
+        if let subtitleText = activeExternalSubtitleText {
+          externalSubtitleOverlay(text: subtitleText, proxy: proxy)
+            .zIndex(8)
+        }
+
+        if !isLocked, appState.isAppUnlocked {
+          skipSegmentOverlay(proxy: proxy)
+            .zIndex(9)
+        }
 
         if isLocked {
           lockShield(proxy: proxy)
@@ -271,6 +289,8 @@ struct PlayerScreen: View {
       hudTask?.cancel()
       favoriteHUDTask?.cancel()
       controlsTask?.cancel()
+      timelinePreviewTask?.cancel()
+      subtitleLoadTask?.cancel()
       pauseActivePlayer()
       vlcController.stop()
       RemotePlaybackCoordinator.shared.deactivate()
@@ -787,6 +807,10 @@ struct PlayerScreen: View {
             settingsSubtitleSection(model: model)
           }
 
+          if !activeChapters.isEmpty {
+            settingsChapterSection()
+          }
+
           settingsPictureSection()
           settingsOtherSection()
         }
@@ -873,18 +897,65 @@ struct PlayerScreen: View {
   private func settingsSubtitleSection(model: PlayerModel) -> some View {
     VStack(alignment: .leading, spacing: 10) {
       settingsSectionTitle("字幕")
-      settingsRow(title: "关闭字幕", systemName: "captions.bubble", selected: model.selectedSubtitleOptionID == nil) {
+      settingsRow(
+        title: "关闭字幕",
+        systemName: "captions.bubble",
+        selected: model.selectedSubtitleOptionID == nil && selectedExternalSubtitleID == nil
+      ) {
         model.selectSubtitle(nil)
+        selectedExternalSubtitleID = nil
+        externalSubtitleCues = []
+        subtitleLoadTask?.cancel()
         keepControlsDuringInteraction()
       }
+
       ForEach(model.subtitleOptions) { option in
         settingsRow(
           title: option.title,
           systemName: "captions.bubble",
-          selected: model.selectedSubtitleOptionID == option.id
+          selected: selectedExternalSubtitleID == nil && model.selectedSubtitleOptionID == option.id
         ) {
+          selectedExternalSubtitleID = nil
+          externalSubtitleCues = []
+          subtitleLoadTask?.cancel()
           model.selectSubtitle(option.id)
           keepControlsDuringInteraction()
+        }
+      }
+
+      ForEach(externalSubtitleTracks) { track in
+        settingsRow(
+          title: track.title,
+          systemName: "captions.bubble.fill",
+          selected: selectedExternalSubtitleID == track.id
+        ) {
+          model.selectSubtitle(nil)
+          loadExternalSubtitle(track)
+          keepControlsDuringInteraction()
+        }
+      }
+
+      if model.subtitleOptions.isEmpty && externalSubtitleTracks.isEmpty {
+        settingsUnavailableRow("当前视频没有发现字幕", systemName: "captions.bubble")
+      }
+    }
+  }
+
+  private func settingsChapterSection() -> some View {
+    VStack(alignment: .leading, spacing: 10) {
+      settingsSectionTitle("章节")
+      VStack(spacing: 6) {
+        ForEach(activeChapters) { chapter in
+          let selected = activeCurrentTime >= chapter.start
+            && (chapter.end <= chapter.start || activeCurrentTime < chapter.end)
+          settingsRow(
+            title: "\(formatTime(chapter.start))  \(chapter.title)",
+            systemName: "bookmark",
+            selected: selected
+          ) {
+            seekActive(to: chapter.start)
+            keepControlsDuringInteraction()
+          }
         }
       }
     }
@@ -1227,6 +1298,16 @@ struct PlayerScreen: View {
             .fill(CinevaTheme.accent)
             .frame(width: playedX, height: 3)
 
+          if appState.showChapterMarkers, activeDuration > 0 {
+            ForEach(activeChapters) { chapter in
+              let markerX = width * CGFloat(min(max(chapter.start / duration, 0), 1))
+              Rectangle()
+                .fill(.white.opacity(0.70))
+                .frame(width: 1, height: 9)
+                .offset(x: min(max(markerX, 0), width - 1))
+            }
+          }
+
           Circle()
             .fill(.white)
             .frame(width: isScrubbing ? 10 : 8, height: isScrubbing ? 10 : 8)
@@ -1235,6 +1316,30 @@ struct PlayerScreen: View {
         }
         .frame(maxHeight: .infinity)
         .contentShape(Rectangle())
+        .overlay(alignment: .top) {
+          if isScrubbing,
+            appState.timelinePreviewEnabled,
+            !useVLC,
+            let timelinePreviewImage
+          {
+            VStack(spacing: 5) {
+              Image(uiImage: timelinePreviewImage)
+                .resizable()
+                .scaledToFill()
+                .frame(width: 168, height: 94)
+                .clipped()
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+              Text(formatTime(scrubValue))
+                .font(.caption2.monospacedDigit().weight(.semibold))
+                .foregroundStyle(.white.opacity(0.86))
+            }
+            .padding(6)
+            .background(.black.opacity(0.78), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+            .offset(y: -118)
+            .allowsHitTesting(false)
+            .transition(.opacity)
+          }
+        }
         .gesture(
           DragGesture(minimumDistance: 0)
             .onChanged { value in
@@ -1244,12 +1349,16 @@ struct PlayerScreen: View {
               }
               let x = min(max(value.location.x, 0), width)
               scrubValue = Double(x / width) * duration
+              requestTimelinePreview(at: scrubValue)
             }
             .onEnded { value in
               let x = min(max(value.location.x, 0), width)
               scrubValue = Double(x / width) * duration
               seekActive(to: scrubValue)
               isScrubbing = false
+              timelinePreviewTask?.cancel()
+              timelinePreviewImage = nil
+              timelinePreviewBucket = -1
               scheduleControlsHide()
             }
         )
@@ -1259,7 +1368,11 @@ struct PlayerScreen: View {
       HStack {
         Text(formatTime(isScrubbing ? scrubValue : activeCurrentTime))
         Spacer()
-        if !useVLC, activeBufferedUntil > activeCurrentTime + 1 {
+        if let chapter = currentChapter {
+          Text(chapter.title)
+            .lineLimit(1)
+            .foregroundStyle(.white.opacity(0.52))
+        } else if !useVLC, activeBufferedUntil > activeCurrentTime + 1 {
           Text("已缓冲 \(formatTime(activeBufferedUntil))")
             .foregroundStyle(.white.opacity(0.46))
         }
@@ -1376,6 +1489,15 @@ struct PlayerScreen: View {
   @MainActor
   private func prepareCurrentItem() async {
     controlsTask?.cancel()
+    timelinePreviewTask?.cancel()
+    subtitleLoadTask?.cancel()
+    timelinePreviewImage = nil
+    timelinePreviewBucket = -1
+    externalSubtitleTracks = []
+    selectedExternalSubtitleID = nil
+    externalSubtitleCues = []
+    sidecarChapters = []
+
     let expectedItem = currentItem
     let expectedID = expectedItem.id
 
@@ -1393,35 +1515,49 @@ struct PlayerScreen: View {
       item: expectedItem,
       api: appState.api,
       libraryStore: appState.libraryStore,
-      defaultQuality: appState.defaultQuality
+      defaultQuality: appState.defaultQuality,
+      fastStartEnabled: appState.fastStartEnabled,
+      networkAutoRecoveryEnabled: appState.networkAutoRecoveryEnabled
     )
     model = newModel
     newModel.setPlaybackRate(playbackRate)
 
+    // Metadata, sidecar subtitles and chapters are independent of decoding.
+    // Start them in parallel, but never make the first video frame wait for them.
     async let metadataTask = appState.api.localMetadata(for: expectedItem)
+    async let subtitleTracksTask: [ExternalSubtitleTrack] = (try? await appState.api.externalSubtitleTracks(for: expectedItem)) ?? []
+    async let sidecarChapterTask = appState.api.sidecarChapters(for: expectedItem)
+
     await newModel.prepareAndPlay()
     guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else {
       newModel.player.pause()
       return
     }
 
-    let metadata = await metadataTask
-    guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else {
-      newModel.player.pause()
-      return
-    }
-    localMetadata = metadata
-
+    // VLC fallback is activated immediately after source preparation. Previously
+    // local NFO/poster loading could delay VLC playback even though the URL was ready.
     activatePlaybackEngine(for: newModel)
     applyPlaybackRate(playbackRate, persist: false)
     applyAutomaticOrientation(for: newModel.videoDisplaySize)
-    await ensureCompletePlaylist(for: expectedItem)
-    guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else { return }
     configureRemotePlayback()
     updateRemotePlaybackInfo()
-
     controlsVisible = true
     scheduleControlsHide()
+
+    let metadata = await metadataTask
+    guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else { return }
+    localMetadata = metadata
+    configureRemotePlayback()
+
+    let tracks = await subtitleTracksTask
+    guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else { return }
+    externalSubtitleTracks = tracks
+    autoSelectExternalSubtitleIfNeeded()
+
+    sidecarChapters = await sidecarChapterTask
+    guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else { return }
+
+    await ensureCompletePlaylist(for: expectedItem)
   }
 
   @MainActor
@@ -1448,7 +1584,8 @@ struct PlayerScreen: View {
         source: source,
         item: currentItem,
         libraryStore: appState.libraryStore,
-        playbackRate: playbackRate
+        playbackRate: playbackRate,
+        fastStartEnabled: appState.fastStartEnabled
       )
     } else {
       if useVLC {
@@ -1485,47 +1622,38 @@ struct PlayerScreen: View {
   }
 
   @MainActor
+  private func withActiveEngine(_ action: (any CinevaPlaybackEngine) -> Void) {
+    if useVLC {
+      action(vlcController)
+    } else if let model {
+      action(model)
+    }
+  }
+
+  @MainActor
   private func applyPlaybackRate(_ rate: Float, persist: Bool = true) {
     let safe = min(max(rate, 0.5), 2.0)
     playbackRate = safe
-    if persist {
-      appState.preferredPlaybackRate = safe
-    }
-    if useVLC {
-      vlcController.setPlaybackRate(safe)
-    } else {
-      model?.setPlaybackRate(safe)
-    }
+    if persist { appState.preferredPlaybackRate = safe }
+    withActiveEngine { $0.engineSetPlaybackRate(safe) }
     updateRemotePlaybackInfo()
   }
 
   @MainActor
   private func toggleActivePlayback() {
-    if useVLC {
-      vlcController.togglePlayback()
-    } else {
-      model?.togglePlayback()
-    }
+    withActiveEngine { $0.engineTogglePlayback() }
     updateRemotePlaybackInfo()
   }
 
   @MainActor
   private func pauseActivePlayer() {
-    if useVLC {
-      vlcController.pause()
-    } else {
-      model?.pause()
-    }
+    withActiveEngine { $0.enginePause() }
     updateRemotePlaybackInfo()
   }
 
   @MainActor
   private func resumeActivePlayer() {
-    if useVLC {
-      vlcController.resume()
-    } else {
-      model?.resume()
-    }
+    withActiveEngine { $0.engineResume() }
     updateRemotePlaybackInfo()
   }
 
@@ -1542,22 +1670,14 @@ struct PlayerScreen: View {
 
   @MainActor
   private func seekActive(to seconds: Double) {
-    if useVLC {
-      vlcController.seek(to: seconds)
-    } else {
-      model?.seek(to: seconds)
-    }
+    withActiveEngine { $0.engineSeek(to: seconds) }
     updateRemotePlaybackInfo()
   }
 
   @MainActor
   private func setActiveVolume(_ volume: Float) {
     let safe = min(max(volume, 0), 1)
-    if useVLC {
-      vlcController.setVolume(safe)
-    } else {
-      model?.player.volume = safe
-    }
+    withActiveEngine { $0.engineSetVolume(safe) }
   }
 
   private var activeCurrentTime: Double {
@@ -1600,6 +1720,211 @@ struct PlayerScreen: View {
 
   private var activeVolume: Float {
     useVLC ? vlcController.volume : (model?.player.volume ?? 1)
+  }
+
+  private var activeChapters: [PlayerChapter] {
+    if let embedded = model?.chapters, !embedded.isEmpty { return embedded }
+    return sidecarChapters
+  }
+
+  private var currentChapter: PlayerChapter? {
+    let chapters = activeChapters
+    guard !chapters.isEmpty else { return nil }
+    for (index, chapter) in chapters.enumerated() {
+      let nextStart = index + 1 < chapters.count ? chapters[index + 1].start : activeDuration
+      let end = chapter.end > chapter.start ? chapter.end : nextStart
+      if activeCurrentTime >= chapter.start && (end <= chapter.start || activeCurrentTime < end) {
+        return chapter
+      }
+    }
+    return nil
+  }
+
+  private var activeExternalSubtitleText: String? {
+    guard selectedExternalSubtitleID != nil, !externalSubtitleCues.isEmpty else { return nil }
+    let time = activeCurrentTime - appState.subtitleTimeOffset
+    guard time >= 0 else { return nil }
+
+    var low = 0
+    var high = externalSubtitleCues.count - 1
+    var candidate = -1
+    while low <= high {
+      let mid = (low + high) / 2
+      if externalSubtitleCues[mid].start <= time {
+        candidate = mid
+        low = mid + 1
+      } else {
+        high = mid - 1
+      }
+    }
+    guard candidate >= 0 else { return nil }
+
+    // Overlapping subtitle events are common in ASS files. Walk backwards a few
+    // cues so a still-active event isn't missed by the binary-search candidate.
+    for index in stride(from: candidate, through: max(candidate - 4, 0), by: -1) {
+      let cue = externalSubtitleCues[index]
+      if time >= cue.start, time <= cue.end { return cue.text }
+    }
+    return nil
+  }
+
+  private func externalSubtitleOverlay(text: String, proxy: GeometryProxy) -> some View {
+    let landscape = proxy.size.width > proxy.size.height
+    let bottomPadding: CGFloat = landscape
+      ? (chromeShouldBeVisible ? 88 : 38)
+      : (chromeShouldBeVisible ? 128 : 58)
+
+    return VStack {
+      Spacer()
+      Text(text)
+        .font(.system(size: 21 * appState.subtitleFontScale, weight: .semibold))
+        .multilineTextAlignment(.center)
+        .foregroundStyle(.white)
+        .lineLimit(4)
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .frame(maxWidth: proxy.size.width * (landscape ? 0.72 : 0.88))
+        .background(.black.opacity(0.42), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .shadow(color: .black.opacity(0.75), radius: 3, y: 1)
+        .padding(.bottom, bottomPadding)
+    }
+    .frame(width: proxy.size.width, height: proxy.size.height)
+    .allowsHitTesting(false)
+  }
+
+  @ViewBuilder
+  private func skipSegmentOverlay(proxy: GeometryProxy) -> some View {
+    let landscape = proxy.size.width > proxy.size.height
+    VStack {
+      Spacer()
+      HStack {
+        Spacer()
+        if shouldShowIntroSkip {
+          skipSegmentButton("跳过片头", systemName: "forward.end.fill") {
+            seekActive(to: resolvedIntroTarget)
+          }
+        } else if shouldShowOutroSkip {
+          skipSegmentButton("跳过片尾", systemName: "forward.end.fill") {
+            if nextItem != nil {
+              playNextIfAvailable()
+            } else {
+              seekActive(to: max(activeDuration - 0.5, 0))
+            }
+          }
+        }
+      }
+      .padding(.trailing, max(proxy.safeAreaInsets.trailing, landscape ? 24 : 16))
+      .padding(.bottom, landscape ? 74 : 116)
+    }
+  }
+
+  private func skipSegmentButton(
+    _ title: String,
+    systemName: String,
+    action: @escaping () -> Void
+  ) -> some View {
+    Button(action: action) {
+      HStack(spacing: 7) {
+        Text(title)
+        Image(systemName: systemName)
+      }
+      .font(.subheadline.weight(.semibold))
+      .foregroundStyle(.white)
+      .padding(.horizontal, 15)
+      .frame(height: 40)
+      .background(.black.opacity(0.68), in: Capsule())
+      .overlay { Capsule().stroke(.white.opacity(0.18), lineWidth: 0.7) }
+    }
+    .buttonStyle(.plain)
+  }
+
+  private var resolvedIntroTarget: Double {
+    if let chapter = activeChapters.first(where: { chapterMatches($0, keywords: ["片头", "intro", "opening", " op ", "op"]) }),
+      chapter.end > chapter.start
+    {
+      return min(chapter.end, activeDuration)
+    }
+    return min(Double(appState.introSkipSeconds), activeDuration)
+  }
+
+  private var shouldShowIntroSkip: Bool {
+    guard appState.skipIntroEnabled, activeDuration > 0 else { return false }
+    let target = resolvedIntroTarget
+    return target > 5 && activeCurrentTime >= 2 && activeCurrentTime < target - 1
+  }
+
+  private var shouldShowOutroSkip: Bool {
+    guard appState.skipOutroEnabled, activeDuration > 0 else { return false }
+    if let outro = activeChapters.first(where: { chapterMatches($0, keywords: ["片尾", "outro", "ending", "credits", "credit", "ed"]) }) {
+      return activeCurrentTime >= outro.start && activeCurrentTime < activeDuration - 1
+    }
+    let remaining = activeDuration - activeCurrentTime
+    return remaining > 2 && remaining <= Double(appState.outroPromptSeconds)
+  }
+
+  private func chapterMatches(_ chapter: PlayerChapter, keywords: [String]) -> Bool {
+    let value = " \(chapter.title.lowercased()) "
+    return keywords.contains { value.contains($0) }
+  }
+
+  @MainActor
+  private func requestTimelinePreview(at seconds: Double) {
+    guard appState.timelinePreviewEnabled, !useVLC, let model else { return }
+    let bucket = max(0, Int((seconds / 5).rounded(.down)) * 5)
+    guard bucket != timelinePreviewBucket else { return }
+    timelinePreviewBucket = bucket
+    timelinePreviewImage = nil
+    timelinePreviewTask?.cancel()
+    let expectedID = currentItem.id
+
+    timelinePreviewTask = Task { @MainActor in
+      let image = await model.timelinePreview(at: seconds)
+      guard !Task.isCancelled,
+        currentItem.id == expectedID,
+        timelinePreviewBucket == bucket
+      else { return }
+      timelinePreviewImage = image
+    }
+  }
+
+  @MainActor
+  private func loadExternalSubtitle(_ track: ExternalSubtitleTrack) {
+    selectedExternalSubtitleID = track.id
+    externalSubtitleCues = []
+    subtitleLoadTask?.cancel()
+    let expectedID = currentItem.id
+
+    subtitleLoadTask = Task { @MainActor in
+      do {
+        let cues = try await appState.api.subtitleCues(for: track)
+        guard !Task.isCancelled,
+          currentItem.id == expectedID,
+          selectedExternalSubtitleID == track.id
+        else { return }
+        externalSubtitleCues = cues.sorted { $0.start < $1.start }
+        if cues.isEmpty { showGestureHUD("字幕文件没有可识别时间轴") }
+      } catch {
+        guard !Task.isCancelled, currentItem.id == expectedID else { return }
+        selectedExternalSubtitleID = nil
+        externalSubtitleCues = []
+        showGestureHUD("字幕读取失败")
+      }
+    }
+  }
+
+  @MainActor
+  private func autoSelectExternalSubtitleIfNeeded() {
+    guard appState.autoLoadExternalSubtitles, !externalSubtitleTracks.isEmpty else { return }
+    let preferredTokens = ["zh", "chs", "cht", "chi", "cn", "中文", "简体", "繁体"]
+    let preferred = externalSubtitleTracks.first { track in
+      let normalized = track.title.lowercased()
+      return preferredTokens.contains { token in normalized == token || normalized.contains(".\(token)") || normalized.contains("-\(token)") || normalized.contains("_\(token)") || normalized.contains(token) }
+    }
+    if let track = preferred ?? (externalSubtitleTracks.count == 1 ? externalSubtitleTracks.first : nil) {
+      model?.selectSubtitle(nil)
+      loadExternalSubtitle(track)
+    }
   }
 
   @MainActor
