@@ -1630,7 +1630,7 @@ struct PlayerScreen: View {
                 if useVLC {
                   scrubWasPlaying = vlcController.beginInteractiveScrub()
                 } else {
-                  scrubWasPlaying = model?.beginInteractiveScrub() ?? false
+                  scrubWasPlaying = model.beginInteractiveScrub()
                 }
               }
               let x = min(max(value.location.x, 0), width)
@@ -1642,7 +1642,7 @@ struct PlayerScreen: View {
               if useVLC {
                 vlcController.interactiveScrub(to: scrubValue)
               } else {
-                model?.interactiveScrub(to: scrubValue)
+                model.interactiveScrub(to: scrubValue)
               }
               requestTimelinePreview(at: scrubValue)
             }
@@ -1651,10 +1651,8 @@ struct PlayerScreen: View {
               scrubValue = Double(x / width) * duration
               if useVLC {
                 vlcController.endInteractiveScrub(to: scrubValue, resumeAfter: scrubWasPlaying)
-              } else if let model {
-                model.endInteractiveScrub(to: scrubValue, resumeAfter: scrubWasPlaying)
               } else {
-                seekActive(to: scrubValue)
+                model.endInteractiveScrub(to: scrubValue, resumeAfter: scrubWasPlaying)
               }
               scrubWasPlaying = false
               isScrubbing = false
