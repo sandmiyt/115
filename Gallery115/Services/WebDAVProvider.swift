@@ -429,7 +429,7 @@ actor WebDAVProvider: CloudProvider {
       logicalPath: logicalPath
     )
     return entries
-      .filter { $0.isDirectory || $0.isVideo }
+      .filter { $0.isDirectory || $0.isVideo || $0.isPhoto }
       .sorted { lhs, rhs in
         if lhs.isDirectory != rhs.isDirectory { return lhs.isDirectory }
         return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending

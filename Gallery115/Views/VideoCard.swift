@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct VideoCard: View {
   @Environment(AppState.self) private var appState
@@ -35,6 +36,9 @@ struct VideoCard: View {
     .contextMenu {
       Button {
         appState.libraryStore.toggleFavorite(item)
+        let feedback = UIImpactFeedbackGenerator(style: .medium)
+        feedback.prepare()
+        feedback.impactOccurred(intensity: 0.82)
       } label: {
         Label(
           appState.libraryStore.isFavorite(item) ? "取消收藏" : "收藏",

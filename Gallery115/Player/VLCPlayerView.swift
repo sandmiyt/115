@@ -13,6 +13,7 @@ import SwiftUI
     private(set) var duration: Double = 0
     private(set) var isPlaying = false
     private(set) var isBuffering = false
+    private(set) var isInteractiveScrubLoading = false
     private(set) var didReachEnd = false
     private(set) var networkMbps: Double = 0
     private(set) var transferredMegabytes: Double = 0
@@ -123,7 +124,7 @@ import SwiftUI
 
     @discardableResult
     func beginInteractiveScrub() -> Bool {
-      let shouldResume = isPlaying
+      let shouldResume = isPlaying || player.state == .playing || player.state == .buffering
       if shouldResume {
         player.pause()
         isPlaying = false
@@ -131,6 +132,7 @@ import SwiftUI
       }
       pendingInteractiveSeek = nil
       lastInteractiveSeekAt = 0
+      isInteractiveScrubLoading = false
       return shouldResume
     }
 
@@ -152,10 +154,18 @@ import SwiftUI
       let target = clampedSeekTarget(seconds)
       currentTime = target
       pendingInteractiveSeek = nil
+      isInteractiveScrubLoading = true
       applySeek(target)
+      // MobileVLCKit does not expose an AVPlayer-style seek completion. Resume
+      // immediately if playback was active before scrubbing, then let polling
+      // clear the loading indicator once VLC reports a stable playing/paused state.
       if resumeAfter {
         player.play()
         isPlaying = true
+      }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
+        guard let self else { return }
+        self.isInteractiveScrubLoading = false
       }
     }
 
@@ -285,6 +295,7 @@ import SwiftUI
     private(set) var duration: Double = 0
     private(set) var isPlaying = false
     private(set) var isBuffering = false
+    private(set) var isInteractiveScrubLoading = false
     private(set) var didReachEnd = false
     private(set) var networkMbps: Double = 0
     private(set) var transferredMegabytes: Double = 0

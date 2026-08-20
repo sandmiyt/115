@@ -28,6 +28,8 @@ struct PlayerScreen: View {
   @State private var isRoutePickerPresented = false
   @State private var gestureHUD: String?
   @State private var showFavoriteHeart = false
+  @State private var favoriteHUDIsRemoval = false
+  @State private var lastFavoriteToggleUptime: TimeInterval = 0
   @State private var hudTask: Task<Void, Never>?
   @State private var favoriteHUDTask: Task<Void, Never>?
   @State private var controlsTask: Task<Void, Never>?
@@ -132,12 +134,13 @@ struct PlayerScreen: View {
             .zIndex(15)
         }
 
-        if activeIsBuffering, !isDismissMotionActive {
+        if (activeIsBuffering || activeIsScrubLoading), !isDismissMotionActive {
           ProgressView()
-            .controlSize(.large)
+            .controlSize(activeIsScrubLoading ? .regular : .large)
             .tint(.white)
-            .padding(16)
-            .background(.black.opacity(0.38), in: Circle())
+            .padding(activeIsScrubLoading ? 12 : 16)
+            .background(.black.opacity(activeIsScrubLoading ? 0.30 : 0.38), in: Circle())
+            .transition(.opacity.combined(with: .scale(scale: 0.92)))
             .allowsHitTesting(false)
         }
 
@@ -153,7 +156,7 @@ struct PlayerScreen: View {
         }
 
         if showFavoriteHeart {
-          Image(systemName: "heart.fill")
+          Image(systemName: favoriteHUDIsRemoval ? "heart.slash" : "heart.fill")
             .font(.system(size: 72, weight: .bold))
             .foregroundStyle(.red)
             .shadow(color: .black.opacity(0.35), radius: 18, y: 6)
@@ -382,8 +385,12 @@ struct PlayerScreen: View {
   }
 
   private var interactiveDismissProgress: CGFloat {
-    let distance = hypot(dismissDragOffset.width, dismissDragOffset.height)
-    return min(max(distance / 260.0, 0), 1)
+    let distance = max(hypot(dismissDragOffset.width, dismissDragOffset.height), 0)
+    // Avoid a hard clamp at a fixed distance. Photos-like interactive motion
+    // keeps changing continuously as the finger approaches/leaves an edge; a
+    // saturating exponential curve has no derivative discontinuity to feel as
+    // a magnetic "snap" at the screen boundary.
+    return CGFloat(1.0 - exp(-Double(distance) / 225.0))
   }
 
   private var interactiveDismissMediaScale: CGFloat {
@@ -412,7 +419,7 @@ struct PlayerScreen: View {
       Color.clear
         .contentShape(Rectangle())
         .onTapGesture { toggleControls() }
-        .onLongPressGesture(minimumDuration: 0.55, maximumDistance: 24) {
+        .onLongPressGesture(minimumDuration: 0.48, maximumDistance: 24) {
           toggleFavoriteFromLongPress()
         }
         .frame(width: proxy.size.width * 0.34)
@@ -507,7 +514,7 @@ struct PlayerScreen: View {
         bottomOverlay(proxy: proxy)
       }
 
-      if let model, !isScrubbing {
+      if let model, !isScrubbing, !activeIsScrubLoading {
         if landscape {
           landscapeCenterTransport(model: model)
         } else {
@@ -674,8 +681,26 @@ struct PlayerScreen: View {
     let actualDistance = hypot(value.translation.width, value.translation.height)
     let projectedDistance = hypot(value.predictedEndTranslation.width, value.predictedEndTranslation.height)
     let dismissDistance = min(max(min(width, height) * 0.28, 92), 138)
-    let projectedThreshold = dismissDistance * 1.55
-    let shouldDismiss = actualDistance >= dismissDistance || projectedDistance >= projectedThreshold
+    let projectedThreshold = dismissDistance * 1.50
+
+    // If the finger physically reaches an edge while still travelling outward,
+    // finish the dismissal instead of making the page feel as if that edge is a
+    // spring-loaded wall. This is especially important when swiping upward: the
+    // finger cannot continue beyond the display, so distance alone can otherwise
+    // make a valid Photos-style escape bounce back to center.
+    let edgeMargin: CGFloat = 24
+    let nearTop = value.location.y <= edgeMargin && value.translation.height < -8
+    let nearBottom = value.location.y >= height - edgeMargin && value.translation.height > 8
+    let nearLeft = value.location.x <= edgeMargin && value.translation.width < -8
+    let nearRight = value.location.x >= width - edgeMargin && value.translation.width > 8
+    let reachedEscapeEdge = nearTop || nearBottom || nearLeft || nearRight
+
+    let releaseSpeed = hypot(value.velocity.width, value.velocity.height)
+    let fastFlick = releaseSpeed > 720 && projectedDistance > dismissDistance * 0.90
+    let shouldDismiss = reachedEscapeEdge
+      || actualDistance >= dismissDistance
+      || projectedDistance >= projectedThreshold
+      || fastFlick
 
     dismissRestoreTask?.cancel()
     isDismissDragging = false
@@ -684,43 +709,54 @@ struct PlayerScreen: View {
     if shouldDismiss {
       UIImpactFeedbackGenerator(style: .soft).impactOccurred()
 
-      // Continue in the exact two-dimensional release direction. A short
-      // interactive spring keeps the hand-off from the finger into the escape
-      // animation continuous instead of restarting the motion from zero speed.
-      let vector = projectedDistance > actualDistance
-        ? value.predictedEndTranslation
-        : value.translation
+      // Keep travelling along the true release velocity when available. This
+      // makes the finger-to-animation handoff continuous instead of aiming at a
+      // new arbitrary vector after the touch ends.
+      let velocityMagnitude = hypot(value.velocity.width, value.velocity.height)
+      let vector: CGSize
+      if velocityMagnitude > 80 {
+        vector = value.velocity
+      } else if projectedDistance > actualDistance {
+        vector = value.predictedEndTranslation
+      } else {
+        vector = value.translation
+      }
       let magnitude = max(hypot(vector.width, vector.height), 1)
-      let escapeDistance = diagonal * 0.78
+      let escapeDistance = diagonal * 0.82
       let target = CGSize(
         width: vector.width / magnitude * escapeDistance,
         height: vector.height / magnitude * escapeDistance
       )
 
-      withAnimation(.interactiveSpring(response: 0.24, dampingFraction: 0.94, blendDuration: 0.16)) {
+      withAnimation(.interpolatingSpring(duration: 0.28, bounce: 0.0, initialVelocity: min(Double(releaseSpeed / max(actualDistance, 60)), 8))) {
         dismissDragOffset = target
       }
 
       dismissRestoreTask = Task { @MainActor in
-        try? await Task.sleep(for: .milliseconds(110))
+        try? await Task.sleep(for: .milliseconds(105))
         guard !Task.isCancelled else { return }
         dismiss()
       }
       return
     }
 
-    // Cancelled dismiss: every visual property is driven only by the animated
-    // displacement. Keep a separate non-visual settling flag for hit testing
-    // so there is no second state flip at the end that can create a tiny snap.
-    // `interactiveSpring` is designed for gesture-driven motion and blends the
-    // release into the return instead of feeling like a fresh animation.
-    withAnimation(.interactiveSpring(response: 0.31, dampingFraction: 0.96, blendDuration: 0.18)) {
+    // Preserve the component of the user's real release velocity along the
+    // return-to-center path. SwiftUI's interpolating spring preserves velocity
+    // across overlapping animations, removing the tiny stop/restart sensation
+    // that is very noticeable in a Photos-style interaction.
+    let distance = max(actualDistance, 1)
+    let towardCenterX = -value.translation.width / distance
+    let towardCenterY = -value.translation.height / distance
+    let velocityTowardCenter = value.velocity.width * towardCenterX + value.velocity.height * towardCenterY
+    let normalizedInitialVelocity = min(max(Double(velocityTowardCenter / distance), -6), 6)
+
+    withAnimation(.interpolatingSpring(duration: 0.40, bounce: 0.0, initialVelocity: normalizedInitialVelocity)) {
       dismissDragOffset = .zero
     }
 
     let shouldRestoreControls = dismissControlsWereVisible
     dismissRestoreTask = Task { @MainActor in
-      try? await Task.sleep(for: .milliseconds(430))
+      try? await Task.sleep(for: .milliseconds(390))
       guard !Task.isCancelled else { return }
       isDismissSettling = false
       if shouldRestoreControls {
@@ -1473,10 +1509,12 @@ struct PlayerScreen: View {
         .shadow(color: .black.opacity(0.30), radius: 14, y: 5)
     }
     .buttonStyle(.plain)
-    .highPriorityGesture(
-      LongPressGesture(minimumDuration: 0.55, maximumDistance: 24)
-        .onEnded { _ in toggleFavoriteFromLongPress() }
-    )
+    // `onLongPressGesture` fires as soon as the minimum duration is reached;
+    // it does not wait for the finger to lift. A small toggle gate below also
+    // prevents an overlapping player surface from firing the same press twice.
+    .onLongPressGesture(minimumDuration: 0.48, maximumDistance: 24) {
+      toggleFavoriteFromLongPress()
+    }
   }
 
   private func portraitUtilityBar(model: PlayerModel) -> some View {
@@ -1510,10 +1548,12 @@ struct PlayerScreen: View {
         .shadow(color: .black.opacity(0.34), radius: 16, y: 6)
     }
     .buttonStyle(.plain)
-    .highPriorityGesture(
-      LongPressGesture(minimumDuration: 0.55, maximumDistance: 24)
-        .onEnded { _ in toggleFavoriteFromLongPress() }
-    )
+    // `onLongPressGesture` fires as soon as the minimum duration is reached;
+    // it does not wait for the finger to lift. A small toggle gate below also
+    // prevents an overlapping player surface from firing the same press twice.
+    .onLongPressGesture(minimumDuration: 0.48, maximumDistance: 24) {
+      toggleFavoriteFromLongPress()
+    }
   }
 
   private func centerTransportButton(
@@ -1758,20 +1798,29 @@ struct PlayerScreen: View {
 
   @MainActor
   private func toggleFavoriteFromLongPress() {
+    let now = ProcessInfo.processInfo.systemUptime
+    // The center control and the transparent gesture surface overlap by design.
+    // One physical long press must still toggle exactly once.
+    guard now - lastFavoriteToggleUptime > 0.36 else { return }
+    lastFavoriteToggleUptime = now
+
+    let wasFavorite = appState.libraryStore.isFavorite(currentItem)
     appState.libraryStore.toggleFavorite(currentItem)
+    favoriteHUDIsRemoval = wasFavorite
 
     let feedback = UIImpactFeedbackGenerator(style: .medium)
     feedback.prepare()
-    feedback.impactOccurred()
+    feedback.impactOccurred(intensity: 0.88)
 
     favoriteHUDTask?.cancel()
-    withAnimation(.spring(response: 0.24, dampingFraction: 0.68)) {
+    showFavoriteHeart = false
+    withAnimation(.spring(response: 0.22, dampingFraction: 0.72)) {
       showFavoriteHeart = true
     }
     favoriteHUDTask = Task { @MainActor in
       try? await Task.sleep(for: .milliseconds(620))
       guard !Task.isCancelled else { return }
-      withAnimation(.easeOut(duration: 0.20)) {
+      withAnimation(.easeOut(duration: 0.18)) {
         showFavoriteHeart = false
       }
     }
@@ -2046,6 +2095,10 @@ struct PlayerScreen: View {
 
   private var activeIsBuffering: Bool {
     useVLC ? vlcController.isBuffering : (model?.isBuffering ?? false)
+  }
+
+  private var activeIsScrubLoading: Bool {
+    useVLC ? vlcController.isInteractiveScrubLoading : (model?.isInteractiveScrubLoading ?? false)
   }
 
   private var activeDidReachEnd: Bool {

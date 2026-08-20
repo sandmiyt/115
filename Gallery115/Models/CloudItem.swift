@@ -36,6 +36,10 @@ struct CloudItem: Codable, Hashable, Identifiable {
     return String(format: "%02d:%02d", minutes, seconds)
   }
 
+  var isPhoto: Bool {
+    Self.photoExtensions.contains(fileExtension.lowercased())
+  }
+
   var isDiscImage: Bool {
     ["iso", "img"].contains(fileExtension.lowercased())
   }
@@ -44,4 +48,8 @@ struct CloudItem: Codable, Hashable, Identifiable {
     let ext = fileExtension.lowercased()
     return ["mkv", "avi", "flv", "rmvb", "wmv", "m2ts", "mts", "ts", "webm", "iso", "img"].contains(ext)
   }
+
+  private static let photoExtensions: Set<String> = [
+    "jpg", "jpeg", "png", "heic", "heif", "webp", "gif", "tif", "tiff", "bmp", "avif",
+  ]
 }

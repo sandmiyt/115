@@ -152,6 +152,7 @@ final class PlayerModel: PlaybackEngineControlling {
   private(set) var isPlaying = false
   private(set) var didReachEnd = false
   private(set) var isBuffering = false
+  private(set) var isInteractiveScrubLoading = false
   private(set) var videoDisplaySize: CGSize?
   private(set) var audioOptions: [PlayerMediaOption] = []
   private(set) var subtitleOptions: [PlayerMediaOption] = []
@@ -334,10 +335,14 @@ final class PlayerModel: PlaybackEngineControlling {
   func beginInteractiveScrub() -> Bool {
     interactiveScrubActive = true
     stallProbeTask?.cancel()
-    let shouldResume = player.timeControlStatus == .playing || player.rate > 0
+    // Preserve the user's playback intent, not just AVPlayer's instantaneous
+    // timeControlStatus. A normally-playing network item can briefly report
+    // `.waitingToPlayAtSpecifiedRate` exactly when the finger lands.
+    let shouldResume = isPlaying || player.timeControlStatus != .paused || player.rate > 0
     if shouldResume { player.pause() }
     isPlaying = false
     isBuffering = false
+    isInteractiveScrubLoading = false
     scrubFinalTarget = nil
     scrubResumeAfterFinish = false
     scrubLiveToleranceSeconds = 0.08
@@ -397,10 +402,17 @@ final class PlayerModel: PlaybackEngineControlling {
   private func performInteractiveScrubSeek() {
     guard scrubChaseTime.isValid, let item = player.currentItem, item.status == .readyToPlay else {
       scrubSeekInProgress = false
-      if scrubResumeAfterFinish {
-        scrubResumeAfterFinish = false
+      isInteractiveScrubLoading = false
+      interactiveScrubActive = false
+      scrubFinalTarget = nil
+      let shouldResume = scrubResumeAfterFinish
+      scrubResumeAfterFinish = false
+      if shouldResume {
+        // AVPlayer may still be preparing; playImmediately records the intent
+        // and playback begins as soon as the item can render again.
         player.playImmediately(atRate: player.defaultRate)
         isPlaying = true
+        isBuffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
       }
       return
     }
@@ -411,6 +423,7 @@ final class PlayerModel: PlaybackEngineControlling {
     let toleranceSeconds = isFinalPass ? (1.0 / 120.0) : scrubLiveToleranceSeconds
     let tolerance = CMTime(seconds: toleranceSeconds, preferredTimescale: 600)
     scrubSeekInProgress = true
+    isInteractiveScrubLoading = true
 
     player.seek(
       to: target,
@@ -438,6 +451,7 @@ final class PlayerModel: PlaybackEngineControlling {
         }
 
         self.scrubSeekInProgress = false
+        self.isInteractiveScrubLoading = false
         if let final = self.scrubFinalTarget, CMTimeCompare(final, target) == 0 {
           self.scrubFinalTarget = nil
           self.interactiveScrubActive = false

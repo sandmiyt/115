@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct FolderView: View {
   enum SortMode: String, CaseIterable, Identifiable {
@@ -12,6 +13,32 @@ struct FolderView: View {
       case .updated: return "最近更新"
       case .name: return "名称"
       case .size: return "大小"
+      }
+    }
+  }
+
+  enum MediaFilter: String, CaseIterable, Identifiable {
+    case all
+    case photos
+    case videos
+    case favorites
+
+    var id: String { rawValue }
+    var title: String {
+      switch self {
+      case .all: return "全部"
+      case .photos: return "照片"
+      case .videos: return "视频"
+      case .favorites: return "已收藏"
+      }
+    }
+
+    var systemImage: String {
+      switch self {
+      case .all: return "square.grid.2x2"
+      case .photos: return "photo"
+      case .videos: return "video"
+      case .favorites: return "heart.fill"
       }
     }
   }
@@ -33,6 +60,7 @@ struct FolderView: View {
   @State private var playlistItems: [CloudItem] = []
   @State private var didScheduleBackgroundRefresh = false
   @State private var sortMode: SortMode = .updated
+  @State private var mediaFilter: MediaFilter = .all
   @State private var selectedVideo: CloudItem?
   @State private var nextOffset = 0
   @State private var hasMore = true
@@ -55,9 +83,9 @@ struct FolderView: View {
         }
       } else if displayItems.isEmpty {
         ContentUnavailableView(
-          query.isEmpty ? "这里没有视频" : "没有搜索结果",
-          systemImage: query.isEmpty ? "video.slash" : "magnifyingglass",
-          description: Text(query.isEmpty ? "当前目录中没有文件夹或视频。" : "换一个关键词试试。")
+          query.isEmpty ? emptyFilterTitle : "没有搜索结果",
+          systemImage: query.isEmpty ? emptyFilterSystemImage : "magnifyingglass",
+          description: Text(query.isEmpty ? emptyFilterDescription : "换一个关键词试试。")
         )
       } else {
         content
@@ -71,12 +99,26 @@ struct FolderView: View {
     .searchable(text: $query, prompt: "搜索当前目录")
     .onChange(of: query) { _, _ in rebuildDisplayItems() }
     .onChange(of: sortMode) { _, _ in rebuildDisplayItems() }
+    .onChange(of: mediaFilter) { _, _ in rebuildDisplayItems() }
+    .onChange(of: appState.libraryStore.favorites.map(\.id)) { _, _ in rebuildDisplayItems() }
     .task(id: query) { await updateSearchResults() }
     .toolbar {
-      ToolbarItem(placement: .topBarTrailing) {
-        // The visible control is now the refresh button the user asked for.
-        // A long press still exposes the existing view/sort options, so this
-        // change does not remove stable browsing features or add toolbar clutter.
+      ToolbarItemGroup(placement: .topBarTrailing) {
+        Menu {
+          Picker("筛选", selection: $mediaFilter) {
+            ForEach(MediaFilter.allCases) { filter in
+              Label(filter.title, systemImage: filter.systemImage)
+                .tag(filter)
+            }
+          }
+        } label: {
+          Image(systemName: mediaFilter == .all ? "line.3.horizontal.decrease.circle" : "line.3.horizontal.decrease.circle.fill")
+        }
+        .accessibilityLabel("筛选资料库")
+        .accessibilityValue(mediaFilter.title)
+
+        // Refresh keeps its established position and behavior. The menu behind
+        // a long press still contains the existing view/sort controls.
         Menu {
           Section("视图") {
             Button {
@@ -207,6 +249,8 @@ struct FolderView: View {
                 FolderCard(item: item)
               }
               .buttonStyle(.plain)
+            } else if item.isPhoto {
+              PhotoFileCard(item: item)
             } else {
               VideoCard(item: item) {
                 selectedVideo = item
@@ -243,6 +287,8 @@ struct FolderView: View {
             NavigationLink(value: item) {
               FolderListRow(item: item)
             }
+          } else if item.isPhoto {
+            PhotoListRow(item: item)
           } else {
             Button {
               selectedVideo = item
@@ -250,6 +296,9 @@ struct FolderView: View {
               VideoListRow(item: item)
             }
             .buttonStyle(.plain)
+            .contextMenu {
+              favoriteMenuButton(for: item)
+            }
           }
         }
 
@@ -272,6 +321,52 @@ struct FolderView: View {
       .listStyle(.plain)
       .refreshable { await refreshCurrentFolder() }
     }
+  }
+
+  private var emptyFilterTitle: String {
+    switch mediaFilter {
+    case .all: return "这里没有媒体"
+    case .photos: return "这里没有照片"
+    case .videos: return "这里没有视频"
+    case .favorites: return "这里没有已收藏内容"
+    }
+  }
+
+  private var emptyFilterSystemImage: String {
+    switch mediaFilter {
+    case .all: return "rectangle.stack"
+    case .photos: return "photo.on.rectangle.angled"
+    case .videos: return "video.slash"
+    case .favorites: return "heart.slash"
+    }
+  }
+
+  private var emptyFilterDescription: String {
+    switch mediaFilter {
+    case .all: return "当前目录中没有文件夹或视频。"
+    case .photos: return "当前目录中没有可显示的照片。"
+    case .videos: return "当前目录中没有视频。"
+    case .favorites: return "当前目录中没有已收藏的媒体。"
+    }
+  }
+
+  @ViewBuilder
+  private func favoriteMenuButton(for item: CloudItem) -> some View {
+    let isFavorite = appState.libraryStore.isFavorite(item)
+    Button {
+      toggleFavoriteWithFeedback(item)
+    } label: {
+      Label(isFavorite ? "取消收藏" : "收藏", systemImage: isFavorite ? "heart.slash" : "heart")
+    }
+  }
+
+  @MainActor
+  private func toggleFavoriteWithFeedback(_ item: CloudItem) {
+    appState.libraryStore.toggleFavorite(item)
+    let feedback = UIImpactFeedbackGenerator(style: .medium)
+    feedback.prepare()
+    feedback.impactOccurred(intensity: 0.82)
+    rebuildDisplayItems()
   }
 
   private var loadingState: some View {
@@ -319,6 +414,19 @@ struct FolderView: View {
     var output = trimmed.isEmpty
       ? source
       : source.filter { $0.name.localizedCaseInsensitiveContains(trimmed) }
+
+    switch mediaFilter {
+    case .all:
+      // Preserve Cineva's existing default library exactly: folders + videos.
+      // Photos are surfaced only when the user explicitly asks for them.
+      output = output.filter { $0.isDirectory || $0.isVideo }
+    case .photos:
+      output = output.filter { $0.isDirectory || $0.isPhoto }
+    case .videos:
+      output = output.filter { $0.isDirectory || $0.isVideo }
+    case .favorites:
+      output = output.filter { !$0.isDirectory && appState.libraryStore.isFavorite($0) }
+    }
 
     output.sort { lhs, rhs in
       if lhs.isDirectory != rhs.isDirectory { return lhs.isDirectory }
@@ -581,6 +689,108 @@ private struct FolderListRow: View {
       Spacer(minLength: 4)
     }
     .padding(.vertical, 4)
+  }
+}
+
+private struct PhotoFileCard: View {
+  @Environment(AppState.self) private var appState
+  let item: CloudItem
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 5) {
+      ZStack {
+        LinearGradient(
+          colors: [Color.secondary.opacity(0.13), Color.secondary.opacity(0.05)],
+          startPoint: .topLeading,
+          endPoint: .bottomTrailing
+        )
+        Image(systemName: "photo.fill")
+          .font(.system(size: 32, weight: .medium))
+          .foregroundStyle(.secondary.opacity(0.72))
+      }
+      .aspectRatio(16 / 9, contentMode: .fit)
+      .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+      Text(item.name)
+        .font(.caption.weight(.semibold))
+        .foregroundStyle(.primary)
+        .lineLimit(2)
+
+      HStack(spacing: 5) {
+        Text(item.formattedSize)
+          .font(.caption2)
+          .foregroundStyle(.secondary)
+        Spacer(minLength: 2)
+        if appState.libraryStore.isFavorite(item) {
+          Image(systemName: "heart.fill")
+            .font(.caption2)
+            .foregroundStyle(CinevaTheme.accent)
+        }
+      }
+    }
+    .contentShape(Rectangle())
+    .contextMenu {
+      let isFavorite = appState.libraryStore.isFavorite(item)
+      Button {
+        appState.libraryStore.toggleFavorite(item)
+        let feedback = UIImpactFeedbackGenerator(style: .medium)
+        feedback.prepare()
+        feedback.impactOccurred(intensity: 0.82)
+      } label: {
+        Label(isFavorite ? "取消收藏" : "收藏", systemImage: isFavorite ? "heart.slash" : "heart")
+      }
+    }
+  }
+}
+
+private struct PhotoListRow: View {
+  @Environment(AppState.self) private var appState
+  let item: CloudItem
+
+  var body: some View {
+    HStack(spacing: 13) {
+      ZStack {
+        RoundedRectangle(cornerRadius: 12, style: .continuous)
+          .fill(Color.secondary.opacity(0.10))
+        Image(systemName: "photo.fill")
+          .font(.title3)
+          .foregroundStyle(.secondary)
+      }
+      .frame(width: 82, height: 48)
+
+      VStack(alignment: .leading, spacing: 5) {
+        Text(item.name)
+          .font(.subheadline.weight(.semibold))
+          .foregroundStyle(.primary)
+          .lineLimit(2)
+        HStack(spacing: 6) {
+          if !item.fileExtension.isEmpty { Text(item.fileExtension.uppercased()) }
+          Text(item.formattedSize)
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+      }
+      Spacer(minLength: 4)
+      if appState.libraryStore.isFavorite(item) {
+        Image(systemName: "heart.fill")
+          .foregroundStyle(CinevaTheme.accent)
+      } else {
+        Image(systemName: "photo")
+          .foregroundStyle(.secondary)
+      }
+    }
+    .padding(.vertical, 4)
+    .contextMenu {
+      let isFavorite = appState.libraryStore.isFavorite(item)
+      Button {
+        appState.libraryStore.toggleFavorite(item)
+        let feedback = UIImpactFeedbackGenerator(style: .medium)
+        feedback.prepare()
+        feedback.impactOccurred(intensity: 0.82)
+      } label: {
+        Label(isFavorite ? "取消收藏" : "收藏", systemImage: isFavorite ? "heart.slash" : "heart")
+      }
+    }
   }
 }
 
