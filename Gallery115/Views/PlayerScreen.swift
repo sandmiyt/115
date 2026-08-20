@@ -539,24 +539,55 @@ struct PlayerScreen: View {
 
   private func timeline(model: PlayerModel) -> some View {
     VStack(spacing: 5) {
-      Slider(
-        value: Binding(
-          get: { isScrubbing ? scrubValue : model.currentTime },
-          set: { scrubValue = $0 }
-        ),
-        in: 0...max(model.duration, 1),
-        onEditingChanged: { editing in
-          isScrubbing = editing
-          if editing {
-            scrubValue = model.currentTime
-            controlsTask?.cancel()
-          } else {
-            model.seek(to: scrubValue)
-            scheduleControlsHide()
-          }
+      GeometryReader { proxy in
+        let width = max(proxy.size.width, 1)
+        let duration = max(model.duration, 1)
+        let current = min(max(isScrubbing ? scrubValue : model.currentTime, 0), duration)
+        let buffered = min(max(model.bufferedUntil, 0), duration)
+        let playedX = width * current / duration
+        let bufferedX = width * buffered / duration
+
+        ZStack(alignment: .leading) {
+          Capsule()
+            .fill(.white.opacity(0.20))
+            .frame(height: 3)
+
+          Capsule()
+            .fill(.white.opacity(0.32))
+            .frame(width: bufferedX, height: 3)
+
+          Capsule()
+            .fill(CinevaTheme.accent)
+            .frame(width: playedX, height: 3)
+
+          Circle()
+            .fill(.white)
+            .frame(width: isScrubbing ? 10 : 8, height: isScrubbing ? 10 : 8)
+            .shadow(color: .black.opacity(0.22), radius: 2, y: 1)
+            .offset(x: min(max(playedX - (isScrubbing ? 5 : 4), 0), max(width - (isScrubbing ? 10 : 8), 0)))
         }
-      )
-      .tint(CinevaTheme.accent)
+        .frame(maxHeight: .infinity)
+        .contentShape(Rectangle())
+        .gesture(
+          DragGesture(minimumDistance: 0)
+            .onChanged { value in
+              if !isScrubbing {
+                isScrubbing = true
+                controlsTask?.cancel()
+              }
+              let x = min(max(value.location.x, 0), width)
+              scrubValue = x / width * duration
+            }
+            .onEnded { value in
+              let x = min(max(value.location.x, 0), width)
+              scrubValue = x / width * duration
+              model.seek(to: scrubValue)
+              isScrubbing = false
+              scheduleControlsHide()
+            }
+        )
+      }
+      .frame(height: 28)
 
       HStack {
         Text(formatTime(isScrubbing ? scrubValue : model.currentTime))

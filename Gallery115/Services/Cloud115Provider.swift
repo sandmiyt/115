@@ -2,7 +2,7 @@ import Foundation
 
 actor Cloud115Provider: CloudProvider {
   static let shared = Cloud115Provider()
-  static let userAgent = "Cineva-iOS/1.7"
+  static let userAgent = "Cineva-iOS/1.8"
 
   private let baseURL = URL(string: "https://proapi.115.com")!
   private let auth = Cloud115AuthManager.shared
@@ -22,7 +22,32 @@ actor Cloud115Provider: CloudProvider {
   }
 
   func validateCredentials() async throws {
-    _ = try await authorizedRequest(path: "/open/user/info", method: "GET")
+    do {
+      _ = try await authorizedRequest(path: "/open/user/info", method: "GET")
+      return
+    } catch let error as CloudProviderError {
+      // Some 115 edge gateways intermittently return 405/HTML for the user-info probe.
+      // Only a confirmed authentication failure should stop here; otherwise validate
+      // the same OAuth session with a tiny root-folder request instead.
+      if case .authenticationRequired = error { throw error }
+    }
+
+    _ = try await authorizedRequest(
+      path: "/open/ufile/files",
+      method: "GET",
+      query: [
+        "cid": "0",
+        "limit": "1",
+        "offset": "0",
+        "asc": "0",
+        "o": "user_utime",
+        "custom_order": "0",
+        "stdir": "1",
+        "star": "0",
+        "cur": "0",
+        "show_dir": "1",
+      ]
+    )
   }
 
   func listFolder(id: String) async throws -> [CloudItem] {

@@ -127,10 +127,24 @@ struct SetupView: View {
             appState.finishConfiguration(rootFolderID: "0")
             isConnecting = false
           }
+        } catch let error as CloudProviderError {
+          if case .authenticationRequired = error {
+            CredentialStore.shared.clear()
+            await MainActor.run {
+              errorMessage = error.localizedDescription
+              isConnecting = false
+            }
+          } else {
+            // OAuth already returned a valid token pair. A temporary probe failure
+            // must not erase the newly-issued session or force another login.
+            await MainActor.run {
+              appState.finishConfiguration(rootFolderID: "0")
+              isConnecting = false
+            }
+          }
         } catch {
-          CredentialStore.shared.clear()
           await MainActor.run {
-            errorMessage = error.localizedDescription
+            appState.finishConfiguration(rootFolderID: "0")
             isConnecting = false
           }
         }
@@ -193,7 +207,7 @@ enum Cloud115AuthorizationClient {
 
         var request = URLRequest(url: url)
         request.timeoutInterval = 20
-        request.setValue("Cineva-iOS/1.7", forHTTPHeaderField: "User-Agent")
+        request.setValue("Cineva-iOS/1.8", forHTTPHeaderField: "User-Agent")
 
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {

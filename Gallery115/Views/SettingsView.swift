@@ -167,7 +167,7 @@ struct SettingsView: View {
             Text("115 云端影音播放器").font(.caption).foregroundStyle(.secondary)
           }
         }
-        LabeledContent("版本", value: "1.7")
+        LabeledContent("版本", value: "1.8")
       }
     }
     .navigationTitle("设置")
@@ -196,8 +196,22 @@ struct SettingsView: View {
             isConnecting = false
           }
           return
+        } catch let error as CloudProviderError {
+          if case .authenticationRequired = error {
+            // Confirmed invalid session: continue into interactive authorization below.
+          } else {
+            await MainActor.run {
+              statusMessage = error.localizedDescription
+              isConnecting = false
+            }
+            return
+          }
         } catch {
-          // Existing refresh token can no longer recover the session; fall through to login.
+          await MainActor.run {
+            statusMessage = error.localizedDescription
+            isConnecting = false
+          }
+          return
         }
       }
 
