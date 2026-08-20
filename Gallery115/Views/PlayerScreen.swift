@@ -17,6 +17,7 @@ struct PlayerScreen: View {
   @State private var isLocked = false
   @State private var controlsVisible = true
   @State private var showSettingsPanel = false
+  @State private var showSpeedPanel = false
   @State private var gestureHUD: String?
   @State private var hudTask: Task<Void, Never>?
   @State private var controlsTask: Task<Void, Never>?
@@ -67,6 +68,13 @@ struct PlayerScreen: View {
             .simultaneousGesture(controlsInteractionGesture)
             .transition(.opacity.combined(with: .scale(scale: 0.985)))
             .zIndex(20)
+        }
+
+        if showSpeedPanel, !isLocked {
+          speedOverlay(proxy: proxy)
+            .simultaneousGesture(controlsInteractionGesture)
+            .transition(.opacity.combined(with: .scale(scale: 0.97, anchor: .bottomLeading)))
+            .zIndex(21)
         }
 
         if model?.isBuffering == true {
@@ -141,6 +149,7 @@ struct PlayerScreen: View {
     }
     .onDisappear {
       showSettingsPanel = false
+      showSpeedPanel = false
       isControlsInteractionActive = false
       hudTask?.cancel()
       controlsTask?.cancel()
@@ -265,7 +274,7 @@ struct PlayerScreen: View {
   }
 
   private func lockShield(proxy: GeometryProxy) -> some View {
-    ZStack(alignment: .leading) {
+    ZStack(alignment: .trailing) {
       Color.clear
         .contentShape(Rectangle())
         .ignoresSafeArea()
@@ -284,7 +293,7 @@ struct PlayerScreen: View {
           .background(.black.opacity(0.62), in: Circle())
       }
       .buttonStyle(.plain)
-      .padding(.leading, 16)
+      .padding(.trailing, max(proxy.safeAreaInsets.trailing, 16))
     }
   }
 
@@ -337,8 +346,11 @@ struct PlayerScreen: View {
 
       if landscape {
         playerIconButton("lock.fill") {
+          showSettingsPanel = false
+          showSpeedPanel = false
           isLocked = true
           controlsVisible = false
+          controlsTask?.cancel()
           showGestureHUD("控制已锁定")
         }
       }
@@ -382,6 +394,55 @@ struct PlayerScreen: View {
     .onTapGesture {
       controlsTask?.cancel()
       controlsVisible = true
+    }
+  }
+
+  private func speedOverlay(proxy: GeometryProxy) -> some View {
+    let landscape = proxy.size.width > proxy.size.height
+    let panelWidth = landscape ? 286.0 : min(max(proxy.size.width * 0.62, 230), 290)
+
+    return ZStack(alignment: .bottomLeading) {
+      Color.black.opacity(0.001)
+        .ignoresSafeArea()
+        .contentShape(Rectangle())
+        .onTapGesture { closeSpeedPanel() }
+
+      VStack(alignment: .leading, spacing: 12) {
+        HStack {
+          Text("播放速度")
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(.white)
+          Spacer()
+          Text(formatRate(Double(playbackRate)))
+            .font(.caption.monospacedDigit().weight(.semibold))
+            .foregroundStyle(.white.opacity(0.58))
+        }
+
+        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 3), spacing: 8) {
+          ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { rate in
+            settingsChip(
+              formatRate(rate),
+              selected: abs(Double(playbackRate) - rate) < 0.001
+            ) {
+              playbackRate = Float(rate)
+              model?.setPlaybackRate(Float(rate))
+              closeSpeedPanel()
+            }
+          }
+        }
+      }
+      .padding(14)
+      .frame(width: panelWidth)
+      .background(.black.opacity(0.88))
+      .background(.ultraThinMaterial)
+      .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+      .overlay {
+        RoundedRectangle(cornerRadius: 18, style: .continuous)
+          .stroke(.white.opacity(0.10), lineWidth: 0.8)
+      }
+      .shadow(color: .black.opacity(0.34), radius: 20, y: 8)
+      .padding(.leading, max(proxy.safeAreaInsets.leading, landscape ? 24 : 16))
+      .padding(.bottom, max(proxy.safeAreaInsets.bottom, landscape ? 10 : 14) + 74)
     }
   }
 
@@ -583,13 +644,6 @@ struct PlayerScreen: View {
         }
       }
 
-      settingsActionButton("锁定控制", systemName: "lock.fill") {
-        showSettingsPanel = false
-        isLocked = true
-        controlsVisible = false
-        controlsTask?.cancel()
-        showGestureHUD("控制已锁定")
-      }
     }
   }
 
@@ -743,7 +797,7 @@ struct PlayerScreen: View {
   private func portraitUtilityBar(model: PlayerModel) -> some View {
     HStack(spacing: 8) {
       utilityButton(title: formatRate(Double(playbackRate)), systemName: "speedometer") {
-        openSettingsPanel()
+        openSpeedPanel()
       }
 
       utilityIconButton("backward.end.fill", enabled: previousItem != nil) {
@@ -756,19 +810,9 @@ struct PlayerScreen: View {
 
       Spacer(minLength: 8)
 
-      utilityIconButton(videoLayout == .fit ? "rectangle.inset.filled" : "arrow.up.left.and.arrow.down.right") {
-        videoLayout = videoLayout == .fit ? .fill : .fit
-        showGestureHUD(videoLayout.title)
-        scheduleControlsHide()
-      }
-
       utilityIconButton(appState.libraryStore.isFavorite(currentItem) ? "heart.fill" : "heart") {
         appState.libraryStore.toggleFavorite(currentItem)
         scheduleControlsHide()
-      }
-
-      utilityIconButton("ellipsis") {
-        openSettingsPanel()
       }
     }
   }
@@ -831,29 +875,17 @@ struct PlayerScreen: View {
   private func landscapeUtilityBar(model: PlayerModel) -> some View {
     HStack(spacing: 8) {
       utilityButton(title: formatRate(Double(playbackRate)), systemName: "speedometer") {
-        openSettingsPanel()
+        openSpeedPanel()
       }
 
       utilityButton(title: "音轨", systemName: "waveform") { openSettingsPanel() }
       utilityButton(title: "字幕", systemName: "captions.bubble") { openSettingsPanel() }
-
-      utilityIconButton(videoLayout == .fit ? "rectangle.inset.filled" : "arrow.up.left.and.arrow.down.right") {
-        videoLayout = videoLayout == .fit ? .fill : .fit
-        showGestureHUD(videoLayout.title)
-        scheduleControlsHide()
-      }
 
       Spacer(minLength: 12)
 
       utilityIconButton(appState.libraryStore.isFavorite(currentItem) ? "heart.fill" : "heart") {
         appState.libraryStore.toggleFavorite(currentItem)
         scheduleControlsHide()
-      }
-
-      utilityIconButton("info.circle") {
-        controlsTask?.cancel()
-        controlsVisible = true
-        showInfo = true
       }
     }
   }
@@ -1088,6 +1120,7 @@ struct PlayerScreen: View {
 
   private func switchTo(_ item: CloudItem) {
     showSettingsPanel = false
+    showSpeedPanel = false
     model?.pause()
     model = nil
     useVLC = false
@@ -1119,9 +1152,30 @@ struct PlayerScreen: View {
   }
 
   @MainActor
+  private func openSpeedPanel() {
+    controlsTask?.cancel()
+    controlsVisible = true
+    showSettingsPanel = false
+    withAnimation(.easeOut(duration: 0.16)) {
+      showSpeedPanel = true
+    }
+  }
+
+  @MainActor
+  private func closeSpeedPanel(scheduleHide: Bool = true) {
+    withAnimation(.easeIn(duration: 0.14)) {
+      showSpeedPanel = false
+    }
+    if scheduleHide {
+      scheduleControlsHide()
+    }
+  }
+
+  @MainActor
   private func openSettingsPanel() {
     controlsTask?.cancel()
     controlsVisible = true
+    showSpeedPanel = false
     withAnimation(.easeOut(duration: 0.18)) {
       showSettingsPanel = true
     }
@@ -1146,10 +1200,10 @@ struct PlayerScreen: View {
   @MainActor
   private func scheduleControlsHide() {
     controlsTask?.cancel()
-    guard model?.isPlaying == true, !isLocked, !isScrubbing, !isGestureInteracting, !isControlsInteractionActive, !showSettingsPanel, !showInfo else { return }
+    guard model?.isPlaying == true, !isLocked, !isScrubbing, !isGestureInteracting, !isControlsInteractionActive, !showSettingsPanel, !showSpeedPanel, !showInfo else { return }
     controlsTask = Task { @MainActor in
       try? await Task.sleep(for: .seconds(2.0))
-      guard !Task.isCancelled, !showSettingsPanel, !showInfo, !isScrubbing, !isGestureInteracting, !isControlsInteractionActive else { return }
+      guard !Task.isCancelled, !showSettingsPanel, !showSpeedPanel, !showInfo, !isScrubbing, !isGestureInteracting, !isControlsInteractionActive else { return }
       withAnimation(.easeIn(duration: 0.22)) {
         controlsVisible = false
       }
