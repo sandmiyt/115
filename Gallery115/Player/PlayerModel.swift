@@ -42,6 +42,7 @@ final class PlayerModel {
   nonisolated(unsafe) private var failureObserver: NSObjectProtocol?
   nonisolated(unsafe) private var endObserver: NSObjectProtocol?
   private var lastSavedSecond = -1
+  private var lastRemoteHistorySecond = -60
   private var isFallingBack = false
 
   init(
@@ -76,7 +77,7 @@ final class PlayerModel {
     do {
       sources = try await api.videoSources(for: item)
       guard !sources.isEmpty else {
-        errorMessage = "115 没有返回可播放清晰度。"
+        errorMessage = "媒体源没有返回可播放地址。"
         return
       }
 
@@ -381,11 +382,14 @@ final class PlayerModel {
     let seconds = player.currentTime().seconds
     guard seconds.isFinite, seconds >= 0 else { return }
     libraryStore.recordPlayback(item, position: seconds)
-    if force || Int(seconds) % 15 == 0 {
+    let second = Int(seconds)
+    let shouldSyncRemote = force || second - lastRemoteHistorySecond >= 60
+    if shouldSyncRemote {
+      lastRemoteHistorySecond = second
       Task {
         await api.updateVideoHistory(
           pickCode: item.pickCode,
-          seconds: Int(seconds),
+          seconds: second,
           watchEnd: duration > 0 && seconds >= duration - 10
         )
       }

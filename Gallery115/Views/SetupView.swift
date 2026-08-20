@@ -1,77 +1,98 @@
 import SwiftUI
-import WebKit
 
 struct SetupView: View {
   @Environment(AppState.self) private var appState
-  @State private var authorizationSession: Cloud115AuthorizationSession?
+
+  @State private var serverURL = ""
+  @State private var username = ""
+  @State private var password = ""
+  @State private var rootPath = "/115"
   @State private var isConnecting = false
   @State private var errorMessage: String?
 
   var body: some View {
     NavigationStack {
-      VStack(spacing: 0) {
-        Spacer(minLength: 34)
+      ScrollView {
+        VStack(spacing: 26) {
+          Spacer(minLength: 20)
 
-        VStack(spacing: 17) {
-          CinevaLogoMark(size: 104)
+          VStack(spacing: 14) {
+            CinevaLogoMark(size: 94)
+            VStack(spacing: 6) {
+              Text("Cineva")
+                .font(.system(size: 38, weight: .bold, design: .rounded))
+              Text("连接一次，长期稳定挂载")
+                .font(.headline)
+                .foregroundStyle(.secondary)
+            }
 
-          VStack(spacing: 7) {
-            Text("Cineva")
-              .font(.system(size: 40, weight: .bold, design: .rounded))
-            Text("连接 115，开始你的私人影院")
-              .font(.headline)
+            Text("Cineva 通过 OpenList / AList WebDAV 读取媒体。115 登录、Token 刷新、限流和接口变化都由服务器处理，iPhone 不再直接请求 115。")
+              .font(.subheadline)
+              .multilineTextAlignment(.center)
               .foregroundStyle(.secondary)
+              .padding(.horizontal, 8)
           }
 
-          Text("无需手动复制 Token。授权成功后，Cineva 会自动取得访问凭据并安全保存到本机 Keychain。")
-            .font(.subheadline)
-            .multilineTextAlignment(.center)
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, 14)
-        }
+          VStack(spacing: 12) {
+            setupField(title: "OpenList / AList 地址", icon: "server.rack") {
+              TextField("https://pan.example.com", text: $serverURL)
+                .textInputAutocapitalization(.never)
+                .keyboardType(.URL)
+                .autocorrectionDisabled()
+            }
 
-        Spacer(minLength: 30)
+            setupField(title: "WebDAV 用户名", icon: "person.fill") {
+              TextField("可留空", text: $username)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            }
 
-        Button(action: beginAuthorization) {
-          HStack(spacing: 10) {
-            if isConnecting {
-              ProgressView().tint(.white)
-            } else {
-              Image(systemName: "externaldrive.badge.icloud")
-              Text("连接 115 网盘")
-                .fontWeight(.semibold)
+            setupField(title: "WebDAV 密码", icon: "key.fill") {
+              SecureField("可留空", text: $password)
+            }
+
+            setupField(title: "媒体库路径", icon: "folder.fill") {
+              TextField("/115", text: $rootPath)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
             }
           }
-          .frame(maxWidth: .infinity)
-          .frame(height: 56)
-          .foregroundStyle(.white)
-          .background(
-            CinevaTheme.brandGradient,
-            in: RoundedRectangle(cornerRadius: 18, style: .continuous)
-          )
-        }
-        .buttonStyle(.plain)
-        .disabled(isConnecting)
 
-        HStack(spacing: 7) {
-          Image(systemName: "lock.shield.fill")
-          Text("仅在需要时打开 115 授权页 · Token 不会显示在界面中")
-        }
-        .font(.footnote)
-        .foregroundStyle(.secondary)
-        .padding(.top, 13)
+          Button(action: connect) {
+            HStack(spacing: 9) {
+              if isConnecting {
+                ProgressView().tint(.white)
+              } else {
+                Image(systemName: "externaldrive.connected.to.line.below.fill")
+                Text("连接媒体库").fontWeight(.semibold)
+              }
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 56)
+            .foregroundStyle(.white)
+            .background(
+              CinevaTheme.brandGradient,
+              in: RoundedRectangle(cornerRadius: 18, style: .continuous)
+            )
+          }
+          .buttonStyle(.plain)
+          .disabled(isConnecting || serverURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
-        Spacer(minLength: 30)
+          VStack(spacing: 6) {
+            Label("服务器地址会自动补齐 /dav/", systemImage: "checkmark.shield.fill")
+            Text("建议在 OpenList 中创建只读用户，仅开启 WebDAV Read 权限。")
+          }
+          .font(.footnote)
+          .foregroundStyle(.secondary)
+          .multilineTextAlignment(.center)
+
+          Spacer(minLength: 24)
+        }
+        .padding(.horizontal, 22)
       }
-      .padding(.horizontal, 24)
       .background(Color(uiColor: .systemBackground).ignoresSafeArea())
       .navigationBarHidden(true)
-      .sheet(item: $authorizationSession) { session in
-        Cloud115AuthorizationSheet(session: session) { result in
-          authorizationSession = nil
-          handleAuthorizationResult(result)
-        }
-      }
+      .onAppear { loadStoredConfiguration() }
       .alert(
         "连接失败",
         isPresented: Binding(
@@ -86,16 +107,66 @@ struct SetupView: View {
     }
   }
 
-  private func beginAuthorization() {
+  @ViewBuilder
+  private func setupField<Content: View>(
+    title: String,
+    icon: String,
+    @ViewBuilder content: () -> Content
+  ) -> some View {
+    HStack(spacing: 12) {
+      Image(systemName: icon)
+        .font(.system(size: 16, weight: .semibold))
+        .foregroundStyle(CinevaTheme.accent)
+        .frame(width: 32, height: 32)
+        .background(CinevaTheme.accent.opacity(0.10), in: RoundedRectangle(cornerRadius: 9))
+
+      VStack(alignment: .leading, spacing: 4) {
+        Text(title)
+          .font(.caption)
+          .foregroundStyle(.secondary)
+        content()
+          .font(.body)
+      }
+      Spacer(minLength: 0)
+    }
+    .padding(.horizontal, 14)
+    .frame(minHeight: 64)
+    .background(
+      Color(uiColor: .secondarySystemBackground),
+      in: RoundedRectangle(cornerRadius: 16, style: .continuous)
+    )
+  }
+
+  private func loadStoredConfiguration() {
+    guard let configuration = WebDAVCredentialStore.shared.configuration else { return }
+    serverURL = configuration.serverURL
+    username = configuration.username
+    password = configuration.password
+    rootPath = configuration.normalizedRootPath
+  }
+
+  private func connect() {
     guard !isConnecting else { return }
+    let configuration = WebDAVMountConfiguration(
+      serverURL: serverURL,
+      username: username,
+      password: password,
+      rootPath: rootPath
+    )
+    guard configuration.normalizedWebDAVURL != nil else {
+      errorMessage = "请输入正确的 OpenList / AList 地址。"
+      return
+    }
+
     isConnecting = true
     errorMessage = nil
-
     Task {
       do {
-        let session = try await Cloud115AuthorizationClient.makeSession()
+        try await appState.api.validate(configuration: configuration)
+        WebDAVCredentialStore.shared.save(configuration)
+        await appState.api.clearMountCache()
         await MainActor.run {
-          authorizationSession = session
+          appState.finishConfiguration(rootFolderID: configuration.normalizedRootPath)
           isConnecting = false
         }
       } catch {
@@ -104,292 +175,6 @@ struct SetupView: View {
           isConnecting = false
         }
       }
-    }
-  }
-
-  private func handleAuthorizationResult(_ result: Result<Cloud115Credentials, Error>) {
-    switch result {
-    case .failure(let error):
-      if !(error is CancellationError) {
-        errorMessage = error.localizedDescription
-      }
-    case .success(let credentials):
-      isConnecting = true
-      CredentialStore.shared.save(
-        accessToken: credentials.accessToken,
-        refreshToken: credentials.refreshToken
-      )
-
-      Task {
-        do {
-          try await appState.api.validateCredentials()
-          await MainActor.run {
-            appState.finishConfiguration(rootFolderID: "0")
-            isConnecting = false
-          }
-        } catch let error as CloudProviderError {
-          if case .authenticationRequired = error {
-            CredentialStore.shared.clear()
-            await MainActor.run {
-              errorMessage = error.localizedDescription
-              isConnecting = false
-            }
-          } else {
-            // OAuth already returned a valid token pair. A temporary probe failure
-            // must not erase the newly-issued session or force another login.
-            await MainActor.run {
-              appState.finishConfiguration(rootFolderID: "0")
-              isConnecting = false
-            }
-          }
-        } catch {
-          await MainActor.run {
-            appState.finishConfiguration(rootFolderID: "0")
-            isConnecting = false
-          }
-        }
-      }
-    }
-  }
-}
-
-struct Cloud115Credentials: Sendable {
-  let accessToken: String
-  let refreshToken: String
-}
-
-struct Cloud115AuthorizationSession: Identifiable, @unchecked Sendable {
-  let id = UUID()
-  let loginURL: URL
-  let cookies: [HTTPCookie]
-}
-
-enum Cloud115AuthorizationError: LocalizedError {
-  case invalidResponse
-  case authorizationURLMissing
-  case callbackMalformed
-  case remote(String)
-
-  var errorDescription: String? {
-    switch self {
-    case .invalidResponse:
-      return "115 授权服务返回了无法识别的响应。"
-    case .authorizationURLMissing:
-      return "没有取得 115 登录地址，请稍后重试。"
-    case .callbackMalformed:
-      return "115 授权完成，但返回的登录信息无法读取。"
-    case .remote(let message):
-      return message.isEmpty ? "115 授权失败。" : message
-    }
-  }
-}
-
-enum Cloud115AuthorizationClient {
-  static func makeSession() async throws -> Cloud115AuthorizationSession {
-    let endpoints = [
-      "https://api.oplist.org/115cloud/requests",
-      "https://api-cn.oplist.org/115cloud/requests",
-    ]
-
-    var lastError: Error?
-    for endpoint in endpoints {
-      do {
-        guard var components = URLComponents(string: endpoint) else {
-          throw Cloud115AuthorizationError.invalidResponse
-        }
-        components.queryItems = [
-          URLQueryItem(name: "driver_txt", value: "115cloud_go"),
-          URLQueryItem(name: "server_use", value: "true"),
-        ]
-        guard let url = components.url else {
-          throw Cloud115AuthorizationError.invalidResponse
-        }
-
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 20
-        request.setValue("Cineva-iOS/1.8", forHTTPHeaderField: "User-Agent")
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-          throw Cloud115AuthorizationError.invalidResponse
-        }
-
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-          throw Cloud115AuthorizationError.invalidResponse
-        }
-        let loginURLText = cloud115String(object["text"])
-        guard let loginURL = URL(string: loginURLText), loginURL.scheme == "https" else {
-          let message = [
-            cloud115String(object["message"]),
-            cloud115String(object["error"]),
-          ].first(where: { !$0.isEmpty })
-          if let message {
-            throw Cloud115AuthorizationError.remote(message)
-          }
-          throw Cloud115AuthorizationError.authorizationURLMissing
-        }
-
-        let headerFields = http.allHeaderFields.reduce(into: [String: String]()) { result, pair in
-          if let key = pair.key as? String {
-            result[key] = String(describing: pair.value)
-          }
-        }
-        var cookies = HTTPCookie.cookies(withResponseHeaderFields: headerFields, for: url)
-        if let storedCookies = HTTPCookieStorage.shared.cookies(for: url) {
-          for cookie in storedCookies where !cookies.contains(where: { $0.name == cookie.name }) {
-            cookies.append(cookie)
-          }
-        }
-        return Cloud115AuthorizationSession(loginURL: loginURL, cookies: cookies)
-      } catch {
-        lastError = error
-      }
-    }
-
-    throw lastError ?? Cloud115AuthorizationError.invalidResponse
-  }
-}
-
-struct Cloud115AuthorizationSheet: View {
-  @Environment(\.dismiss) private var dismiss
-  let session: Cloud115AuthorizationSession
-  let completion: (Result<Cloud115Credentials, Error>) -> Void
-
-  var body: some View {
-    NavigationStack {
-      Cloud115AuthorizationWebView(session: session) { result in
-        completion(result)
-        dismiss()
-      }
-      .ignoresSafeArea(edges: .bottom)
-      .navigationTitle("登录 115")
-      .navigationBarTitleDisplayMode(.inline)
-      .toolbar {
-        ToolbarItem(placement: .topBarLeading) {
-          Button("取消") {
-            completion(.failure(CancellationError()))
-            dismiss()
-          }
-        }
-      }
-    }
-  }
-}
-
-private struct Cloud115AuthorizationWebView: UIViewRepresentable {
-  let session: Cloud115AuthorizationSession
-  let completion: (Result<Cloud115Credentials, Error>) -> Void
-
-  func makeCoordinator() -> Coordinator {
-    Coordinator(completion: completion)
-  }
-
-  func makeUIView(context: Context) -> WKWebView {
-    let configuration = WKWebViewConfiguration()
-    configuration.websiteDataStore = .default()
-    let webView = WKWebView(frame: .zero, configuration: configuration)
-    webView.navigationDelegate = context.coordinator
-    webView.uiDelegate = context.coordinator
-    webView.allowsBackForwardNavigationGestures = true
-
-    let cookieStore = configuration.websiteDataStore.httpCookieStore
-    let group = DispatchGroup()
-    for cookie in session.cookies {
-      group.enter()
-      cookieStore.setCookie(cookie) {
-        group.leave()
-      }
-    }
-    group.notify(queue: .main) {
-      webView.load(URLRequest(url: session.loginURL))
-    }
-    return webView
-  }
-
-  func updateUIView(_ webView: WKWebView, context: Context) {}
-
-  final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
-    private let completion: (Result<Cloud115Credentials, Error>) -> Void
-    private var didFinish = false
-
-    init(completion: @escaping (Result<Cloud115Credentials, Error>) -> Void) {
-      self.completion = completion
-    }
-
-    func webView(
-      _ webView: WKWebView,
-      decidePolicyFor navigationAction: WKNavigationAction,
-      decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
-    ) {
-      if let url = navigationAction.request.url, consumeCallbackIfPresent(url) {
-        decisionHandler(.cancel)
-      } else {
-        decisionHandler(.allow)
-      }
-    }
-
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-      if let url = webView.url {
-        _ = consumeCallbackIfPresent(url)
-      }
-    }
-
-    func webView(
-      _ webView: WKWebView,
-      createWebViewWith configuration: WKWebViewConfiguration,
-      for navigationAction: WKNavigationAction,
-      windowFeatures: WKWindowFeatures
-    ) -> WKWebView? {
-      if navigationAction.targetFrame == nil, let url = navigationAction.request.url {
-        webView.load(URLRequest(url: url))
-      }
-      return nil
-    }
-
-    private func consumeCallbackIfPresent(_ url: URL) -> Bool {
-      guard !didFinish,
-        let host = url.host?.lowercased(),
-        host == "api.oplist.org" || host == "api-cn.oplist.org",
-        let fragment = url.fragment,
-        !fragment.isEmpty
-      else {
-        return false
-      }
-
-      didFinish = true
-      do {
-        let credentials = try Self.decodeCredentials(fragment)
-        completion(.success(credentials))
-      } catch {
-        completion(.failure(error))
-      }
-      return true
-    }
-
-    private static func decodeCredentials(_ fragment: String) throws -> Cloud115Credentials {
-      var encoded = fragment.removingPercentEncoding ?? fragment
-      encoded = encoded.replacingOccurrences(of: "-", with: "+")
-        .replacingOccurrences(of: "_", with: "/")
-      let remainder = encoded.count % 4
-      if remainder != 0 {
-        encoded += String(repeating: "=", count: 4 - remainder)
-      }
-
-      guard let data = Data(base64Encoded: encoded),
-        let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-      else {
-        throw Cloud115AuthorizationError.callbackMalformed
-      }
-
-      if let message = object["message_err"] as? String, !message.isEmpty {
-        throw Cloud115AuthorizationError.remote(message)
-      }
-      guard let accessToken = object["access_token"] as? String, !accessToken.isEmpty,
-        let refreshToken = object["refresh_token"] as? String, !refreshToken.isEmpty
-      else {
-        throw Cloud115AuthorizationError.callbackMalformed
-      }
-      return Cloud115Credentials(accessToken: accessToken, refreshToken: refreshToken)
     }
   }
 }

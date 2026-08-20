@@ -148,14 +148,14 @@ private struct HomeView: View {
       VStack(alignment: .leading, spacing: 2) {
         Text("Cineva")
           .font(.system(size: 29, weight: .bold, design: .rounded))
-        Text("你的私人云端影院")
+        Text("稳定挂载的私人影音库")
           .font(.caption)
           .foregroundStyle(.secondary)
       }
       Spacer()
       HStack(spacing: 6) {
         Circle().fill(.green).frame(width: 7, height: 7)
-        Text("115 已连接")
+        Text("OpenList · WebDAV")
       }
       .font(.caption.weight(.medium))
       .foregroundStyle(.secondary)
@@ -333,59 +333,8 @@ private struct HomeLandscapeArtwork: View {
   let progress: Double?
 
   var body: some View {
-    ZStack(alignment: .bottom) {
-      VideoArtwork(item: item)
-
-      LinearGradient(
-        colors: [.clear, .black.opacity(0.34)],
-        startPoint: .center,
-        endPoint: .bottom
-      )
-      .allowsHitTesting(false)
-
-      HStack {
-        if !item.fileExtension.isEmpty {
-          Text(item.fileExtension.uppercased())
-            .font(.system(size: 9, weight: .bold, design: .rounded))
-            .foregroundStyle(.white.opacity(0.92))
-            .padding(.horizontal, 6)
-            .padding(.vertical, 3)
-            .background(.black.opacity(0.58), in: Capsule())
-        }
-        Spacer(minLength: 5)
-        if !item.formattedDuration.isEmpty {
-          Text(item.formattedDuration)
-            .font(.caption2.monospacedDigit().weight(.semibold))
-            .foregroundStyle(.white)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 3)
-            .background(.black.opacity(0.72), in: Capsule())
-        }
-      }
-      .padding(6)
-
-      if let progress, progress > 0.002 {
-        GeometryReader { proxy in
-          VStack(spacing: 0) {
-            Spacer()
-            ZStack(alignment: .leading) {
-              Rectangle().fill(.white.opacity(0.24))
-              Rectangle()
-                .fill(CinevaTheme.accent)
-                .frame(width: max(2, proxy.size.width * progress))
-            }
-            .frame(height: 3)
-          }
-        }
-      }
-    }
-    .frame(width: width)
-    .aspectRatio(16 / 9, contentMode: .fit)
-    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-    .overlay {
-      RoundedRectangle(cornerRadius: 12, style: .continuous)
-        .stroke(.primary.opacity(0.08), lineWidth: 0.6)
-    }
+    MediaArtworkCard(item: item, progress: progress)
+      .frame(width: width)
   }
 }
 

@@ -85,7 +85,7 @@ final class AppState {
   let thumbnailService = ThumbnailService()
   let libraryStore = LibraryStore()
 
-  var isConfigured = CredentialStore.shared.hasRefreshToken
+  var isConfigured = WebDAVCredentialStore.shared.isConfigured
   var biometricErrorMessage: String?
   private(set) var isAppUnlocked: Bool
   private var biometricAuthenticationInProgress = false
@@ -154,7 +154,9 @@ final class AppState {
       ?? .highestTranscode
     colorSchemePreference =
       ColorSchemePreference(rawValue: defaults.string(forKey: Keys.colorScheme) ?? "") ?? .system
-    rootFolderID = defaults.string(forKey: Keys.rootFolderID) ?? "0"
+    rootFolderID = WebDAVCredentialStore.shared.configuration?.normalizedRootPath
+      ?? defaults.string(forKey: Keys.rootFolderID)
+      ?? "/115"
     faceIDEnabled = defaults.bool(forKey: Keys.faceIDEnabled)
     playerGesturesEnabled = defaults.object(forKey: Keys.playerGesturesEnabled) as? Bool ?? true
     autoPlayNextEpisode = defaults.object(forKey: Keys.autoPlayNextEpisode) as? Bool ?? true
@@ -164,14 +166,17 @@ final class AppState {
   }
 
   func finishConfiguration(rootFolderID: String) {
-    self.rootFolderID = rootFolderID.isEmpty ? "0" : rootFolderID
-    isConfigured = true
+    let trimmed = rootFolderID.trimmingCharacters(in: .whitespacesAndNewlines)
+    self.rootFolderID = trimmed.isEmpty ? "/115" : (trimmed.hasPrefix("/") ? trimmed : "/" + trimmed)
+    isConfigured = WebDAVCredentialStore.shared.isConfigured
     isAppUnlocked = true
   }
 
   func signOut() {
+    WebDAVCredentialStore.shared.clear()
     CredentialStore.shared.clear()
     libraryStore.clearSensitiveSessionData()
+    Task { await api.clearMountCache() }
     isConfigured = false
     isAppUnlocked = true
   }

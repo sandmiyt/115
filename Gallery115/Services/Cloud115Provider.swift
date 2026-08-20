@@ -2,11 +2,14 @@ import Foundation
 
 actor Cloud115Provider: CloudProvider {
   static let shared = Cloud115Provider()
-  static let userAgent = "Cineva-iOS/1.8"
+  static let userAgent = "Cineva-iOS/2.0"
 
   private let baseURL = URL(string: "https://proapi.115.com")!
   private let auth = Cloud115AuthManager.shared
   private let session: URLSession
+  private let mountCache = Cloud115MountCache()
+  private var nextRequestSlot: TimeInterval = 0
+  private let requestInterval: TimeInterval = 0.55
 
   init() {
     let config = URLSessionConfiguration.default
@@ -50,20 +53,30 @@ actor Cloud115Provider: CloudProvider {
     )
   }
 
-  func listFolder(id: String) async throws -> [CloudItem] {
-    var offset = 0
-    let pageSize = 200
-    var all: [CloudItem] = []
-    var expectedTotal: Int?
+  func listFolderPage(
+    id: String,
+    offset: Int,
+    limit: Int,
+    forceRefresh: Bool
+  ) async throws -> CloudFolderPage {
+    let safeOffset = max(offset, 0)
+    let safeLimit = min(max(limit, 1), 56)
 
-    repeat {
+    if !forceRefresh,
+      let cached = mountCache.page(folderID: id, offset: safeOffset, limit: safeLimit),
+      Date().timeIntervalSince(cached.savedAt) < 300
+    {
+      return cached.folderPage(servedFromCache: true)
+    }
+
+    do {
       let data = try await authorizedRequest(
         path: "/open/ufile/files",
         method: "GET",
         query: [
           "cid": id,
-          "limit": String(pageSize),
-          "offset": String(offset),
+          "limit": String(safeLimit),
+          "offset": String(safeOffset),
           "asc": "0",
           "o": "user_utime",
           "custom_order": "0",
@@ -74,20 +87,38 @@ actor Cloud115Provider: CloudProvider {
         ]
       )
 
-      let page = try parseFileList(data, endpoint: "资料库")
-      if expectedTotal == nil { expectedTotal = page.total }
-      all.append(contentsOf: page.items)
+      let parsed = try parseFileList(data, endpoint: "资料库")
+      let total = parsed.total
+      let hasMore: Bool
+      if let total, total > 0 {
+        hasMore = safeOffset + parsed.rawRecordCount < total && parsed.rawRecordCount > 0
+      } else {
+        hasMore = parsed.rawRecordCount >= safeLimit
+      }
 
-      // Stop on a physically short page. This is safer than relying only on a count
-      // field whose type/meaning has changed in several 115 response variants.
-      if page.rawRecordCount < pageSize { break }
-      offset += pageSize
-      if let expectedTotal, offset >= expectedTotal { break }
+      let cached = CachedCloud115Page(
+        folderID: id,
+        offset: safeOffset,
+        limit: safeLimit,
+        items: parsed.items.filter { $0.isDirectory || $0.isVideo },
+        total: total,
+        hasMore: hasMore,
+        savedAt: Date()
+      )
+      mountCache.save(cached)
+      return cached.folderPage(servedFromCache: false)
+    } catch {
+      // A mounted source should remain browsable during temporary 115/WAF failures.
+      // Prefer stale data over replacing a working library with an error screen.
+      if let cached = mountCache.page(folderID: id, offset: safeOffset, limit: safeLimit) {
+        return cached.folderPage(servedFromCache: true)
+      }
+      throw error
+    }
+  }
 
-      try? await Task.sleep(for: .milliseconds(220))
-    } while true
-
-    return all.filter { $0.isDirectory || $0.isVideo }
+  func clearMountCache() async {
+    mountCache.clear()
   }
 
   func videoSources(for item: CloudItem) async throws -> [VideoSource] {
@@ -273,10 +304,24 @@ actor Cloud115Provider: CloudProvider {
         )
       }
 
+      if http.statusCode == 405 {
+        // 115 edge/WAF occasionally responds with HTML 405 when access protection is
+        // triggered. All Cineva methods are verified against the Open API, so treat
+        // this as temporary overload rather than an instruction to log the user out.
+        if transientAttempt < 2 {
+          transientAttempt += 1
+          try? await Task.sleep(for: .milliseconds(1100 * transientAttempt))
+          continue
+        }
+        throw CloudProviderError.rateLimited(
+          "115 当前访问保护已触发，Cineva 将继续使用本地资料库缓存。"
+        )
+      }
+
       if http.statusCode == 429 {
         if transientAttempt < 2 {
           transientAttempt += 1
-          try? await Task.sleep(for: .milliseconds(650 * transientAttempt))
+          try? await Task.sleep(for: .milliseconds(1200 * transientAttempt))
           continue
         }
         throw CloudProviderError.rateLimited("115 请求过于频繁，请稍后再试。")
@@ -311,7 +356,7 @@ actor Cloud115Provider: CloudProvider {
         if isRateLimitCode(status.code, message: status.message) {
           if transientAttempt < 2 {
             transientAttempt += 1
-            try? await Task.sleep(for: .milliseconds(650 * transientAttempt))
+            try? await Task.sleep(for: .milliseconds(1200 * transientAttempt))
             continue
           }
           throw CloudProviderError.rateLimited(status.message)
@@ -353,11 +398,22 @@ actor Cloud115Provider: CloudProvider {
       request.httpBody = form.cloud115FormEncoded.data(using: .utf8)
     }
 
+    await waitForRequestSlot()
     let (data, response) = try await session.data(for: request)
     guard let http = response as? HTTPURLResponse else {
       throw CloudProviderError.invalidResponse(path)
     }
     return (data, http)
+  }
+
+  private func waitForRequestSlot() async {
+    let now = Date().timeIntervalSinceReferenceDate
+    let scheduled = max(now, nextRequestSlot)
+    nextRequestSlot = scheduled + requestInterval
+    let delay = scheduled - now
+    if delay > 0 {
+      try? await Task.sleep(for: .milliseconds(Int((delay * 1000).rounded(.up))))
+    }
   }
 
   private func parseStatus(from data: Data, httpStatus: Int) -> Cloud115Status {
@@ -420,7 +476,7 @@ actor Cloud115Provider: CloudProvider {
     let count = Int(cloud115Int64(countValue))
     return Cloud115FilePage(
       items: items,
-      total: count > 0 ? count : rawRecords.count,
+      total: count > 0 ? count : nil,
       rawRecordCount: rawRecords.count
     )
   }
@@ -503,8 +559,73 @@ private struct Cloud115Status {
 
 private struct Cloud115FilePage {
   let items: [CloudItem]
-  let total: Int
+  let total: Int?
   let rawRecordCount: Int
+}
+
+private struct CachedCloud115Page: Codable {
+  let folderID: String
+  let offset: Int
+  let limit: Int
+  let items: [CloudItem]
+  let total: Int?
+  let hasMore: Bool
+  let savedAt: Date
+
+  func folderPage(servedFromCache: Bool) -> CloudFolderPage {
+    CloudFolderPage(
+      items: items,
+      offset: offset,
+      limit: limit,
+      total: total,
+      hasMore: hasMore,
+      servedFromCache: servedFromCache
+    )
+  }
+}
+
+private final class Cloud115MountCache: @unchecked Sendable {
+  private let fileManager = FileManager.default
+  private let directory: URL
+  private let lock = NSLock()
+
+  init() {
+    let base = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first!
+    directory = base.appending(path: "CinevaMountCache/115", directoryHint: .isDirectory)
+    try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+  }
+
+  func page(folderID: String, offset: Int, limit: Int) -> CachedCloud115Page? {
+    lock.lock()
+    defer { lock.unlock() }
+    let url = fileURL(folderID: folderID, offset: offset, limit: limit)
+    guard let data = try? Data(contentsOf: url) else { return nil }
+    return try? JSONDecoder().decode(CachedCloud115Page.self, from: data)
+  }
+
+  func save(_ page: CachedCloud115Page) {
+    lock.lock()
+    defer { lock.unlock() }
+    guard let data = try? JSONEncoder().encode(page) else { return }
+    try? data.write(
+      to: fileURL(folderID: page.folderID, offset: page.offset, limit: page.limit),
+      options: .atomic
+    )
+  }
+
+  func clear() {
+    lock.lock()
+    defer { lock.unlock() }
+    try? fileManager.removeItem(at: directory)
+    try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+  }
+
+  private func fileURL(folderID: String, offset: Int, limit: Int) -> URL {
+    let safeID = folderID.unicodeScalars.map { scalar in
+      CharacterSet.alphanumerics.contains(scalar) ? String(scalar) : "_"
+    }.joined()
+    return directory.appending(path: "page-\(safeID)-\(offset)-\(limit).json")
+  }
 }
 
 private func cloud115Bool(_ value: Any?) -> Bool {

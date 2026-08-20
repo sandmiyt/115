@@ -172,3 +172,139 @@ final class CredentialStore: @unchecked Sendable {
     store.clear()
   }
 }
+
+struct WebDAVMountConfiguration: Codable, Equatable, Sendable {
+  let serverURL: String
+  let username: String
+  let password: String
+  let rootPath: String
+
+  init(serverURL: String, username: String, password: String, rootPath: String) {
+    self.serverURL = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
+    self.username = username.trimmingCharacters(in: .whitespacesAndNewlines)
+    self.password = password
+    self.rootPath = rootPath.trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  var normalizedRootPath: String {
+    var value = rootPath.trimmingCharacters(in: .whitespacesAndNewlines)
+    if value.isEmpty { value = "/115" }
+    if !value.hasPrefix("/") { value = "/" + value }
+    while value.count > 1, value.hasSuffix("/") { value.removeLast() }
+    return value
+  }
+
+  var normalizedWebDAVURL: URL? {
+    var input = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !input.isEmpty else { return nil }
+    if !input.contains("://") { input = "https://" + input }
+    guard var components = URLComponents(string: input),
+      let scheme = components.scheme?.lowercased(),
+      scheme == "https" || scheme == "http",
+      components.host != nil
+    else {
+      return nil
+    }
+
+    var path = components.path
+    while path.count > 1, path.hasSuffix("/") { path.removeLast() }
+    if path.isEmpty || path == "/" {
+      path = "/dav"
+    } else if !path.lowercased().hasSuffix("/dav") {
+      path += "/dav"
+    }
+    components.path = path + "/"
+    components.query = nil
+    components.fragment = nil
+    return components.url
+  }
+
+  var webDAVBasePath: String {
+    guard let url = normalizedWebDAVURL else { return "/dav" }
+    var path = url.path
+    while path.count > 1, path.hasSuffix("/") { path.removeLast() }
+    return path.isEmpty ? "/dav" : path
+  }
+
+  var authorizationHeader: String? {
+    guard !username.isEmpty || !password.isEmpty else { return nil }
+    let raw = "\(username):\(password)"
+    return "Basic \(Data(raw.utf8).base64EncodedString())"
+  }
+
+  var cacheNamespace: String {
+    let host = normalizedWebDAVURL?.host ?? serverURL
+    return "\(host)|\(username)|\(normalizedRootPath)"
+  }
+}
+
+final class WebDAVCredentialStore: @unchecked Sendable {
+  static let shared = WebDAVCredentialStore()
+
+  private let service = "com.xiaocai.gallery115.webdav"
+  private let account = "openlist-webdav-v1"
+  private let lock = NSLock()
+
+  private init() {}
+
+  var configuration: WebDAVMountConfiguration? {
+    lock.lock()
+    defer { lock.unlock() }
+    guard let data = readData() else { return nil }
+    return try? JSONDecoder().decode(WebDAVMountConfiguration.self, from: data)
+  }
+
+  var isConfigured: Bool {
+    guard let configuration else { return false }
+    return configuration.normalizedWebDAVURL != nil
+  }
+
+  func save(_ configuration: WebDAVMountConfiguration) {
+    guard configuration.normalizedWebDAVURL != nil else { return }
+    guard let data = try? JSONEncoder().encode(configuration) else { return }
+    lock.lock()
+    defer { lock.unlock() }
+    writeData(data)
+  }
+
+  func clear() {
+    lock.lock()
+    defer { lock.unlock() }
+    let query: [String: Any] = [
+      kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: service,
+      kSecAttrAccount as String: account,
+    ]
+    SecItemDelete(query as CFDictionary)
+  }
+
+  private func readData() -> Data? {
+    let query: [String: Any] = [
+      kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: service,
+      kSecAttrAccount as String: account,
+      kSecReturnData as String: true,
+      kSecMatchLimit as String: kSecMatchLimitOne,
+    ]
+    var result: CFTypeRef?
+    let status = SecItemCopyMatching(query as CFDictionary, &result)
+    guard status == errSecSuccess else { return nil }
+    return result as? Data
+  }
+
+  private func writeData(_ data: Data) {
+    let baseQuery: [String: Any] = [
+      kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: service,
+      kSecAttrAccount as String: account,
+    ]
+    let update: [String: Any] = [kSecValueData as String: data]
+    let status = SecItemUpdate(baseQuery as CFDictionary, update as CFDictionary)
+    if status == errSecItemNotFound {
+      var add = baseQuery
+      add[kSecValueData as String] = data
+      add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+      SecItemAdd(add as CFDictionary, nil)
+    }
+  }
+}

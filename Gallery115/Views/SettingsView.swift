@@ -2,17 +2,39 @@ import SwiftUI
 
 struct SettingsView: View {
   @Environment(AppState.self) private var appState
-  @State private var authorizationSession: Cloud115AuthorizationSession?
   @State private var statusMessage: String?
-  @State private var isConnecting = false
+  @State private var isCheckingConnection = false
   @State private var isChangingFaceID = false
-  @State private var showAdvanced = false
-  @State private var rootFolderID = "0"
 
   var body: some View {
     @Bindable var appState = appState
 
     Form {
+      Section("媒体源") {
+        connectionSummary
+
+        Button(action: checkConnection) {
+          HStack {
+            Label("检查连接", systemImage: "wave.3.right.circle")
+            Spacer()
+            if isCheckingConnection {
+              ProgressView()
+            }
+          }
+        }
+        .disabled(isCheckingConnection)
+
+        if let statusMessage {
+          Text(statusMessage)
+            .font(.footnote)
+            .foregroundStyle(statusMessage.contains("正常") ? .green : .secondary)
+        }
+
+        Button("更换或断开媒体源", role: .destructive) {
+          appState.signOut()
+        }
+      }
+
       Section("外观") {
         Picker("界面", selection: $appState.colorSchemePreference) {
           ForEach(AppState.ColorSchemePreference.allCases) { scheme in
@@ -43,12 +65,6 @@ struct SettingsView: View {
       }
 
       Section("播放") {
-        Picker("默认清晰度", selection: $appState.defaultQuality) {
-          ForEach(AppState.DefaultQuality.allCases) { quality in
-            Text(quality.title).tag(quality)
-          }
-        }
-
         Toggle("播放器手势", isOn: $appState.playerGesturesEnabled)
 
         if appState.playerGesturesEnabled {
@@ -62,8 +78,8 @@ struct SettingsView: View {
         Toggle("自动播放下一集", isOn: $appState.autoPlayNextEpisode)
         Text(
           appState.autoPlayNextEpisode
-            ? "开启：优先播放下一集；已经是最后一个视频时自动重播。"
-            : "关闭：当前视频播放结束后自动从头重播。"
+            ? "有下一集时自动播放下一集；最后一个视频自动重播。"
+            : "关闭后，当前视频播放结束会自动从头重播。"
         )
         .font(.caption)
         .foregroundStyle(.secondary)
@@ -93,67 +109,23 @@ struct SettingsView: View {
         }
       }
 
-      Section("115 网盘") {
-        HStack(spacing: 10) {
-          Image(systemName: CredentialStore.shared.hasRefreshToken ? "checkmark.circle.fill" : "externaldrive.badge.icloud")
-            .foregroundStyle(CredentialStore.shared.hasRefreshToken ? .green : CinevaTheme.accent)
-          VStack(alignment: .leading, spacing: 2) {
-            Text(CredentialStore.shared.hasRefreshToken ? "115 已连接" : "未连接 115")
-              .font(.subheadline.weight(.semibold))
-            Text("登录状态由 Cineva 自动维护并安全保存在本机 Keychain")
-              .font(.caption)
-              .foregroundStyle(.secondary)
-          }
-        }
-
-        Button(action: connect115) {
-          HStack {
-            Text(CredentialStore.shared.hasRefreshToken ? "检查连接" : "连接 115 网盘")
-            Spacer()
-            if isConnecting {
-              ProgressView()
-            } else {
-              Image(systemName: "chevron.right")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
+      Section("缓存") {
+        Button("清除资料库缓存") {
+          Task {
+            await appState.api.clearMountCache()
+            await MainActor.run {
+              statusMessage = "资料库缓存已清除，下次进入目录会重新读取服务器。"
             }
           }
         }
-        .disabled(isConnecting)
 
-        DisclosureGroup("高级", isExpanded: $showAdvanced) {
-          TextField("根目录 ID", text: $rootFolderID)
-            .textInputAutocapitalization(.never)
-            .autocorrectionDisabled()
-            .onSubmit {
-              appState.rootFolderID = rootFolderID.isEmpty ? "0" : rootFolderID
-            }
-
-          Text("默认 0 表示整个 115 网盘。通常无需修改。")
-            .font(.caption)
-            .foregroundStyle(.secondary)
-        }
-
-        if let statusMessage {
-          Text(statusMessage)
-            .font(.footnote)
-            .foregroundStyle(statusMessage.contains("成功") || statusMessage.contains("正常") ? .green : .red)
-        }
-
-        if CredentialStore.shared.hasRefreshToken {
-          Button("断开 115", role: .destructive) {
-            appState.signOut()
-          }
-        }
-      }
-
-      Section("数据") {
         Button("清除封面缓存") {
           Task {
             await appState.thumbnailService.clearCache()
-            statusMessage = "封面缓存已清除。"
+            await MainActor.run { statusMessage = "封面缓存已清除。" }
           }
         }
+
         Button("清除最近播放") {
           appState.libraryStore.clearRecents()
         }
@@ -164,96 +136,64 @@ struct SettingsView: View {
           CinevaLogoMark(size: 42)
           VStack(alignment: .leading, spacing: 2) {
             Text("Cineva").font(.headline)
-            Text("115 云端影音播放器").font(.caption).foregroundStyle(.secondary)
+            Text("OpenList / AList 私人影音播放器")
+              .font(.caption)
+              .foregroundStyle(.secondary)
           }
         }
-        LabeledContent("版本", value: "1.8")
+        LabeledContent("版本", value: "2.0")
+        LabeledContent("挂载协议", value: "WebDAV")
       }
     }
     .navigationTitle("设置")
-    .onAppear {
-      rootFolderID = appState.rootFolderID
-    }
-    .sheet(item: $authorizationSession) { session in
-      Cloud115AuthorizationSheet(session: session) { result in
-        authorizationSession = nil
-        handleAuthorizationResult(result)
-      }
-    }
   }
 
-  private func connect115() {
-    guard !isConnecting else { return }
-    isConnecting = true
-    statusMessage = nil
+  @ViewBuilder
+  private var connectionSummary: some View {
+    if let configuration = WebDAVCredentialStore.shared.configuration {
+      HStack(spacing: 11) {
+        Image(systemName: "checkmark.circle.fill")
+          .font(.title3)
+          .foregroundStyle(.green)
 
-    Task {
-      if CredentialStore.shared.hasRefreshToken {
-        do {
-          try await appState.api.validateCredentials()
-          await MainActor.run {
-            statusMessage = "115 连接正常。"
-            isConnecting = false
-          }
-          return
-        } catch let error as CloudProviderError {
-          if case .authenticationRequired = error {
-            // Confirmed invalid session: continue into interactive authorization below.
-          } else {
-            await MainActor.run {
-              statusMessage = error.localizedDescription
-              isConnecting = false
-            }
-            return
-          }
-        } catch {
-          await MainActor.run {
-            statusMessage = error.localizedDescription
-            isConnecting = false
-          }
-          return
+        VStack(alignment: .leading, spacing: 3) {
+          Text("OpenList / AList 已连接")
+            .font(.subheadline.weight(.semibold))
+          Text(configuration.normalizedWebDAVURL?.host ?? configuration.serverURL)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+          Text("媒体库：\(configuration.normalizedRootPath)")
+            .font(.caption2)
+            .foregroundStyle(.secondary)
         }
       }
 
+      LabeledContent("读取方式", value: "WebDAV 只读")
+      Text("115 Token、刷新、限流与 405 均由 OpenList / AList 服务器端处理；Cineva 不直接访问 115 Open API。")
+        .font(.caption)
+        .foregroundStyle(.secondary)
+    } else {
+      Label("未连接媒体源", systemImage: "externaldrive.badge.xmark")
+        .foregroundStyle(.secondary)
+    }
+  }
+
+  private func checkConnection() {
+    guard !isCheckingConnection else { return }
+    isCheckingConnection = true
+    statusMessage = nil
+    Task {
       do {
-        let session = try await Cloud115AuthorizationClient.makeSession()
+        try await appState.api.validateCredentials()
         await MainActor.run {
-          authorizationSession = session
-          isConnecting = false
+          statusMessage = "OpenList / AList 连接正常。"
+          isCheckingConnection = false
         }
       } catch {
         await MainActor.run {
           statusMessage = error.localizedDescription
-          isConnecting = false
-        }
-      }
-    }
-  }
-
-  private func handleAuthorizationResult(_ result: Result<Cloud115Credentials, Error>) {
-    switch result {
-    case .failure(let error):
-      if !(error is CancellationError) {
-        statusMessage = error.localizedDescription
-      }
-    case .success(let credentials):
-      isConnecting = true
-      CredentialStore.shared.save(
-        accessToken: credentials.accessToken,
-        refreshToken: credentials.refreshToken
-      )
-      Task {
-        do {
-          try await appState.api.validateCredentials()
-          await MainActor.run {
-            statusMessage = "115 连接成功。"
-            isConnecting = false
-          }
-        } catch {
-          await MainActor.run {
-            statusMessage = error.localizedDescription
-            isConnecting = false
-          }
+          isCheckingConnection = false
         }
       }
     }

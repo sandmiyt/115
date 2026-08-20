@@ -25,8 +25,19 @@ struct PlayerScreen: View {
   @State private var gestureStartBrightness: CGFloat?
   @State private var gestureStartVolume: Float?
 
-  init(item: CloudItem) {
+  init(item: CloudItem, playlist: [CloudItem] = []) {
     _currentItem = State(initialValue: item)
+    let videos = playlist.filter { !$0.isDirectory && $0.isVideo }
+    let normalized: [CloudItem]
+    if videos.isEmpty {
+      normalized = [item]
+    } else if videos.contains(where: { $0.id == item.id }) {
+      normalized = videos
+    } else {
+      normalized = videos + [item]
+    }
+    _playlist = State(initialValue: normalized)
+    _loadedPlaylistParentID = State(initialValue: playlist.isEmpty ? nil : item.parentID)
   }
 
   var body: some View {
@@ -101,7 +112,6 @@ struct PlayerScreen: View {
     }
     .task(id: currentItem.id) {
       await prepareCurrentItem()
-      await loadPlaylistIfNeeded()
     }
     .onChange(of: model?.didReachEnd ?? false) { _, ended in
       guard ended else { return }
@@ -264,7 +274,7 @@ struct PlayerScreen: View {
 
       Spacer(minLength: 4)
 
-      if let model {
+      if let model, model.sources.count > 1 {
         qualityMenu(model: model, compact: !landscape)
       }
 
@@ -750,24 +760,6 @@ struct PlayerScreen: View {
     }
     let ratio = size.width / max(size.height, 1)
     PlayerOrientation.request(ratio > 1.12 ? .landscape : .portrait)
-  }
-
-  @MainActor
-  private func loadPlaylistIfNeeded() async {
-    guard !currentItem.parentID.isEmpty else {
-      playlist = [currentItem]
-      return
-    }
-    guard loadedPlaylistParentID != currentItem.parentID else { return }
-    do {
-      let siblings = try await appState.api.listFolder(id: currentItem.parentID)
-        .filter { !$0.isDirectory && $0.isVideo }
-        .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-      playlist = siblings.isEmpty ? [currentItem] : siblings
-      loadedPlaylistParentID = currentItem.parentID
-    } catch {
-      playlist = [currentItem]
-    }
   }
 
   private var currentIndex: Int {

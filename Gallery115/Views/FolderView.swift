@@ -20,16 +20,22 @@ struct FolderView: View {
   let folderID: String
   let title: String
 
+  private let pageSize = 56
+
   @State private var items: [CloudItem] = []
-  @State private var isLoading = true
+  @State private var isInitialLoading = true
+  @State private var isLoadingMore = false
   @State private var errorMessage: String?
+  @State private var transientMessage: String?
   @State private var query = ""
   @State private var sortMode: SortMode = .updated
   @State private var selectedVideo: CloudItem?
+  @State private var nextOffset = 0
+  @State private var hasMore = true
 
   var body: some View {
     Group {
-      if isLoading && items.isEmpty {
+      if isInitialLoading && items.isEmpty {
         loadingState
       } else if let errorMessage, items.isEmpty {
         ContentUnavailableView {
@@ -37,7 +43,7 @@ struct FolderView: View {
         } description: {
           Text(errorMessage)
         } actions: {
-          Button("重试") { Task { await load() } }
+          Button("重试") { Task { await loadFirstPage(forceRefresh: true) } }
         }
       } else if filteredItems.isEmpty {
         ContentUnavailableView(
@@ -54,7 +60,7 @@ struct FolderView: View {
     .navigationDestination(for: CloudItem.self) { item in
       FolderView(folderID: item.id, title: item.name)
     }
-    .searchable(text: $query, prompt: "搜索当前目录")
+    .searchable(text: $query, prompt: "搜索当前已加载内容")
     .toolbar {
       ToolbarItemGroup(placement: .topBarTrailing) {
         Button {
@@ -87,10 +93,26 @@ struct FolderView: View {
         }
       }
     }
-    .fullScreenCover(item: $selectedVideo) { item in
-      PlayerScreen(item: item)
+    .safeAreaInset(edge: .bottom, spacing: 0) {
+      if let transientMessage {
+        HStack(spacing: 8) {
+          Image(systemName: "externaldrive.connected.to.line.below.fill")
+          Text(transientMessage).lineLimit(2)
+          Spacer(minLength: 4)
+          Button("关闭") { self.transientMessage = nil }
+            .font(.caption.weight(.semibold))
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 12)
+        .frame(minHeight: 40)
+        .background(.ultraThinMaterial)
+      }
     }
-    .task(id: folderID) { await load() }
+    .fullScreenCover(item: $selectedVideo) { item in
+      PlayerScreen(item: item, playlist: loadedVideoPlaylist)
+    }
+    .task(id: folderID) { await loadFirstPage(forceRefresh: false) }
   }
 
   @ViewBuilder
@@ -105,18 +127,26 @@ struct FolderView: View {
                 FolderCard(item: item)
               }
               .buttonStyle(.plain)
+              .onAppear { loadMoreIfNeeded(around: item) }
             } else {
               VideoCard(item: item) {
                 selectedVideo = item
               }
+              .onAppear { loadMoreIfNeeded(around: item) }
             }
+          }
+
+          if isLoadingMore {
+            ProgressView()
+              .frame(maxWidth: .infinity)
+              .padding(.vertical, 18)
           }
         }
         .padding(.horizontal, 10)
         .padding(.top, 10)
         .padding(.bottom, 30)
       }
-      .refreshable { await load() }
+      .refreshable { await loadFirstPage(forceRefresh: true) }
 
     case .list:
       List {
@@ -125,6 +155,7 @@ struct FolderView: View {
             NavigationLink(value: item) {
               FolderListRow(item: item)
             }
+            .onAppear { loadMoreIfNeeded(around: item) }
           } else {
             Button {
               selectedVideo = item
@@ -132,11 +163,21 @@ struct FolderView: View {
               VideoListRow(item: item)
             }
             .buttonStyle(.plain)
+            .onAppear { loadMoreIfNeeded(around: item) }
           }
+        }
+
+        if isLoadingMore {
+          HStack {
+            Spacer()
+            ProgressView()
+            Spacer()
+          }
+          .listRowSeparator(.hidden)
         }
       }
       .listStyle(.plain)
-      .refreshable { await load() }
+      .refreshable { await loadFirstPage(forceRefresh: true) }
     }
   }
 
@@ -144,7 +185,7 @@ struct FolderView: View {
     VStack(spacing: 14) {
       ProgressView()
         .controlSize(.large)
-      Text("正在读取 115…")
+      Text("正在读取媒体库…")
         .font(.subheadline)
         .foregroundStyle(.secondary)
     }
@@ -183,15 +224,72 @@ struct FolderView: View {
     }
   }
 
+  private var loadedVideoPlaylist: [CloudItem] {
+    items.filter { !$0.isDirectory && $0.isVideo }
+      .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+  }
+
+  private func loadMoreIfNeeded(around item: CloudItem) {
+    guard query.isEmpty, hasMore, !isLoadingMore else { return }
+    let triggerIDs = Set(items.suffix(8).map(\.id))
+    guard triggerIDs.contains(item.id) else { return }
+    Task { await loadNextPage() }
+  }
+
   @MainActor
-  private func load() async {
-    isLoading = true
-    defer { isLoading = false }
+  private func loadFirstPage(forceRefresh: Bool) async {
+    isInitialLoading = items.isEmpty
+    isLoadingMore = false
+    defer { isInitialLoading = false }
+
     do {
-      items = try await appState.api.listFolder(id: folderID)
+      let page = try await appState.api.listFolderPage(
+        id: folderID,
+        offset: 0,
+        limit: pageSize,
+        forceRefresh: forceRefresh
+      )
+      items = page.items
+      nextOffset = page.limit
+      hasMore = page.hasMore
       errorMessage = nil
+      if forceRefresh, page.servedFromCache {
+        transientMessage = "媒体服务器暂时不可用，已继续使用本地资料库缓存。"
+      } else {
+        transientMessage = nil
+      }
     } catch {
       errorMessage = error.localizedDescription
+    }
+  }
+
+  @MainActor
+  private func loadNextPage() async {
+    guard hasMore, !isLoadingMore else { return }
+    isLoadingMore = true
+    defer { isLoadingMore = false }
+
+    do {
+      let page = try await appState.api.listFolderPage(
+        id: folderID,
+        offset: nextOffset,
+        limit: pageSize,
+        forceRefresh: false
+      )
+      var known = Set(items.map(\.id))
+      let additions = page.items.filter { known.insert($0.id).inserted }
+      items.append(contentsOf: additions)
+      nextOffset += page.limit
+      hasMore = page.hasMore
+      if page.servedFromCache {
+        transientMessage = "已从本地资料库缓存继续加载。"
+      }
+    } catch let error as CloudProviderError {
+      // Keep the mounted directory visible. The user can continue browsing what has
+      // already been indexed instead of losing the whole screen to a temporary 405.
+      transientMessage = error.localizedDescription
+    } catch {
+      transientMessage = "网络暂时不可用，已保留当前资料库。"
     }
   }
 }

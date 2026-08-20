@@ -17,7 +17,21 @@ import SwiftUI
       let mediaPlayer = VLCMediaPlayer()
       mediaPlayer.drawable = view
       let media = VLCMedia(url: source.url)
-      media.addOptions(["http-user-agent": APIClient.userAgent, "network-caching": 1500])
+
+      var options: [String: Any] = [
+        "http-user-agent": APIClient.userAgent,
+        "network-caching": 1800,
+      ]
+      if let authorization = source.headers["Authorization"],
+        authorization.hasPrefix("Basic "),
+        let data = Data(base64Encoded: String(authorization.dropFirst(6))),
+        let pair = String(data: data, encoding: .utf8),
+        let separator = pair.firstIndex(of: ":")
+      {
+        options["http-user"] = String(pair[..<separator])
+        options["http-pwd"] = String(pair[pair.index(after: separator)...])
+      }
+      media.addOptions(options)
       mediaPlayer.media = media
       context.coordinator.player = mediaPlayer
       mediaPlayer.play()

@@ -8,60 +8,7 @@ struct VideoCard: View {
   var body: some View {
     Button(action: onOpen) {
       VStack(alignment: .leading, spacing: 5) {
-        ZStack(alignment: .bottom) {
-          VideoArtwork(item: item)
-
-          LinearGradient(
-            colors: [.clear, .black.opacity(0.34)],
-            startPoint: .center,
-            endPoint: .bottom
-          )
-          .allowsHitTesting(false)
-
-          HStack(alignment: .bottom) {
-            if !item.fileExtension.isEmpty {
-              Text(item.fileExtension.uppercased())
-                .font(.system(size: 9, weight: .bold, design: .rounded))
-                .foregroundStyle(.white.opacity(0.92))
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
-                .background(.black.opacity(0.58), in: Capsule())
-            }
-
-            Spacer(minLength: 6)
-
-            if !item.formattedDuration.isEmpty {
-              Text(item.formattedDuration)
-                .font(.caption2.monospacedDigit().weight(.semibold))
-                .foregroundStyle(.white)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
-                .background(.black.opacity(0.72), in: Capsule())
-            }
-          }
-          .padding(6)
-
-          if resumeProgress > 0.002 {
-            GeometryReader { proxy in
-              VStack(spacing: 0) {
-                Spacer()
-                ZStack(alignment: .leading) {
-                  Rectangle().fill(.white.opacity(0.24))
-                  Rectangle()
-                    .fill(CinevaTheme.accent)
-                    .frame(width: max(2, proxy.size.width * resumeProgress))
-                }
-                .frame(height: 3)
-              }
-            }
-            .allowsHitTesting(false)
-          }
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay {
-          RoundedRectangle(cornerRadius: 12, style: .continuous)
-            .stroke(.primary.opacity(0.08), lineWidth: 0.6)
-        }
+        MediaArtworkCard(item: item, progress: resumeProgress)
 
         Text(item.name)
           .font(.caption.weight(.semibold))
@@ -102,6 +49,69 @@ struct VideoCard: View {
     let position = appState.libraryStore.resumePosition(for: item)
     guard position > 2, position < item.duration - 8 else { return 0 }
     return min(max(position / item.duration, 0), 1)
+  }
+}
+
+struct MediaArtworkCard: View {
+  let item: CloudItem
+  let progress: Double?
+
+  var body: some View {
+    ZStack(alignment: .bottom) {
+      VideoArtwork(item: item)
+
+      LinearGradient(
+        colors: [.clear, .black.opacity(0.34)],
+        startPoint: .center,
+        endPoint: .bottom
+      )
+      .allowsHitTesting(false)
+
+      HStack(alignment: .bottom) {
+        if !item.fileExtension.isEmpty {
+          Text(item.fileExtension.uppercased())
+            .font(.system(size: 9, weight: .bold, design: .rounded))
+            .foregroundStyle(.white.opacity(0.92))
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(.black.opacity(0.58), in: Capsule())
+        }
+
+        Spacer(minLength: 6)
+
+        if !item.formattedDuration.isEmpty {
+          Text(item.formattedDuration)
+            .font(.caption2.monospacedDigit().weight(.semibold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(.black.opacity(0.72), in: Capsule())
+        }
+      }
+      .padding(6)
+
+      if let progress, progress > 0.002 {
+        GeometryReader { proxy in
+          VStack(spacing: 0) {
+            Spacer()
+            ZStack(alignment: .leading) {
+              Rectangle().fill(.white.opacity(0.24))
+              Rectangle()
+                .fill(CinevaTheme.accent)
+                .frame(width: max(2, proxy.size.width * min(max(progress, 0), 1)))
+            }
+            .frame(height: 3)
+          }
+        }
+        .allowsHitTesting(false)
+      }
+    }
+    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    .overlay {
+      RoundedRectangle(cornerRadius: 12, style: .continuous)
+        .stroke(.primary.opacity(0.08), lineWidth: 0.6)
+    }
+    .shadow(color: .black.opacity(0.08), radius: 8, y: 3)
   }
 }
 

@@ -1,18 +1,36 @@
 import Foundation
 
-/// Compatibility facade retained so stable views/player code do not need a risky all-at-once rewrite.
-/// All 115 networking/authentication now lives in Cloud115Provider + Cloud115AuthManager.
+/// Stable compatibility facade. Cineva 2.0 treats OpenList/AList WebDAV as the
+/// mounted media source; iPhone no longer calls 115 Open API while browsing or playing.
 actor APIClient {
-  static let userAgent = Cloud115Provider.userAgent
+  static let userAgent = WebDAVProvider.userAgent
 
-  private let provider = Cloud115Provider.shared
+  private let provider = WebDAVProvider.shared
 
   func validateCredentials() async throws {
     try await provider.validateCredentials()
   }
 
+  func validate(configuration: WebDAVMountConfiguration) async throws {
+    try await provider.validate(configuration: configuration)
+  }
+
   func listFolder(id: String) async throws -> [CloudItem] {
     try await provider.listFolder(id: id)
+  }
+
+  func listFolderPage(
+    id: String,
+    offset: Int,
+    limit: Int = 56,
+    forceRefresh: Bool = false
+  ) async throws -> CloudFolderPage {
+    try await provider.listFolderPage(
+      id: id,
+      offset: offset,
+      limit: limit,
+      forceRefresh: forceRefresh
+    )
   }
 
   func videoSources(for item: CloudItem) async throws -> [VideoSource] {
@@ -25,5 +43,9 @@ actor APIClient {
       seconds: seconds,
       watchEnd: watchEnd
     )
+  }
+
+  func clearMountCache() async {
+    await provider.clearMountCache()
   }
 }
