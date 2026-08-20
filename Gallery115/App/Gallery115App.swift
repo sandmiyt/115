@@ -1,4 +1,6 @@
 import SwiftUI
+import Combine
+import UIKit
 
 @main
 struct Gallery115App: App {
@@ -11,19 +13,94 @@ struct Gallery115App: App {
         .environment(appState)
         .preferredColorScheme(appState.colorSchemePreference.colorScheme)
         .tint(CinevaTheme.accent)
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
+          // Install the window-level blur before iOS captures the app-switcher snapshot.
+          // This is visual privacy only; Face ID remains untouched until .background.
+          AppPrivacyShield.shared.show()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+          AppPrivacyShield.shared.hide()
+        }
         .onChange(of: scenePhase) { _, phase in
           switch phase {
           case .active:
+            AppPrivacyShield.shared.hide()
             Task { await appState.authenticateIfNeeded() }
+          case .inactive:
+            // Only protect the system app-switcher snapshot here. Do not change
+            // Face ID state for Control Center, Notification Center, permission
+            // prompts, or other temporary inactive transitions.
+            AppPrivacyShield.shared.show()
           case .background:
+            AppPrivacyShield.shared.show()
             appState.lockForBackground()
-          default:
+          @unknown default:
             break
           }
         }
     }
   }
 }
+
+@MainActor
+private final class AppPrivacyShield {
+  static let shared = AppPrivacyShield()
+
+  private var shields: [ObjectIdentifier: UIView] = [:]
+
+  private init() {}
+
+  func show() {
+    for case let scene as UIWindowScene in UIApplication.shared.connectedScenes {
+      for window in scene.windows where !window.isHidden && window.alpha > 0 {
+        let key = ObjectIdentifier(window)
+        guard shields[key] == nil else { continue }
+
+        let container = UIView(frame: window.bounds)
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.isUserInteractionEnabled = true
+        container.accessibilityViewIsModal = true
+
+        let blur = UIVisualEffectView(effect: UIBlurEffect(style: .systemChromeMaterial))
+        blur.translatesAutoresizingMaskIntoConstraints = false
+        blur.isUserInteractionEnabled = false
+        container.addSubview(blur)
+
+        let veil = UIView()
+        veil.translatesAutoresizingMaskIntoConstraints = false
+        veil.backgroundColor = UIColor.black.withAlphaComponent(0.10)
+        veil.isUserInteractionEnabled = false
+        container.addSubview(veil)
+
+        window.addSubview(container)
+        NSLayoutConstraint.activate([
+          container.leadingAnchor.constraint(equalTo: window.leadingAnchor),
+          container.trailingAnchor.constraint(equalTo: window.trailingAnchor),
+          container.topAnchor.constraint(equalTo: window.topAnchor),
+          container.bottomAnchor.constraint(equalTo: window.bottomAnchor),
+          blur.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+          blur.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+          blur.topAnchor.constraint(equalTo: container.topAnchor),
+          blur.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+          veil.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+          veil.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+          veil.topAnchor.constraint(equalTo: container.topAnchor),
+          veil.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+        ])
+
+        shields[key] = container
+      }
+    }
+  }
+
+  func hide() {
+    for shield in shields.values {
+      shield.removeFromSuperview()
+    }
+    shields.removeAll()
+  }
+}
+
 
 enum CinevaTheme {
   static let accent = Color(red: 1.00, green: 0.40, blue: 0.08)
