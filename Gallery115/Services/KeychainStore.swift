@@ -232,19 +232,11 @@ final class MediaSourceSelectionStore: @unchecked Sendable {
   private init() {}
 
   var activeSource: MediaSourceKind {
-    get {
-      if let raw = UserDefaults.standard.string(forKey: key),
-        let stored = MediaSourceKind(rawValue: raw)
-      {
-        return stored
-      }
-      if CredentialStore.shared.hasRefreshToken { return .cloud115 }
-      // New Cineva installs use 115 Open API as the only user-facing media source.
-      // WebDAV remains readable only as a legacy compatibility path.
-      return .cloud115
-    }
+    get { .webDAV }
     set {
-      UserDefaults.standard.set(newValue.rawValue, forKey: key)
+      // Keep the persisted key for downgrade compatibility, but Cineva now
+      // deliberately uses OpenList/AList WebDAV as the active media source.
+      UserDefaults.standard.set(MediaSourceKind.webDAV.rawValue, forKey: key)
     }
   }
 
@@ -255,13 +247,7 @@ final class MediaSourceSelectionStore: @unchecked Sendable {
     }
   }
 
-  var resolvedSource: MediaSourceKind {
-    let stored = activeSource
-    if isConfigured(stored) { return stored }
-    if CredentialStore.shared.hasRefreshToken { return .cloud115 }
-    if WebDAVCredentialStore.shared.isConfigured { return .webDAV }
-    return stored
-  }
+  var resolvedSource: MediaSourceKind { .webDAV }
 }
 
 struct WebDAVMountConfiguration: Codable, Equatable, Sendable {

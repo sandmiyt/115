@@ -157,7 +157,7 @@ private struct MediaSourceSettingsView: View {
       }
       Button("取消", role: .cancel) {}
     } message: {
-      Text("只会移除 Cineva 保存的 WebDAV 登录信息，不会删除 OpenList 或 115 中的文件。")
+      Text("只会移除 Cineva 保存的 WebDAV 登录信息，不会删除 OpenList 中挂载的任何文件。")
     }
   }
 
