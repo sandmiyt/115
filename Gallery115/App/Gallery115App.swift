@@ -18,14 +18,21 @@ struct Gallery115App: App {
           // This is visual privacy only; Face ID remains untouched until .background.
           AppPrivacyShield.shared.show()
         }
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
-          AppPrivacyShield.shared.hide()
-        }
         .onChange(of: scenePhase) { _, phase in
           switch phase {
           case .active:
-            AppPrivacyShield.shared.hide()
-            Task { await appState.authenticateIfNeeded() }
+            // If we really entered the background, convert the deferred lock
+            // now—not while Picture in Picture is running on the Home Screen.
+            // This keeps PiP uninterrupted but still guarantees Face ID when
+            // the user returns to Cineva from PiP or from the Home Screen.
+            appState.prepareForForegroundAuthentication()
+            Task { @MainActor in
+              // Give SwiftUI one turn to mount its locked/blurred presentation
+              // before removing the window-level privacy glass.
+              await Task.yield()
+              AppPrivacyShield.shared.hide()
+              await appState.authenticateIfNeeded()
+            }
           case .inactive:
             // Only protect the system app-switcher snapshot here. Do not change
             // Face ID state for Control Center, Notification Center, permission
@@ -61,14 +68,16 @@ private final class AppPrivacyShield {
         container.isUserInteractionEnabled = true
         container.accessibilityViewIsModal = true
 
-        let blur = UIVisualEffectView(effect: UIBlurEffect(style: .systemChromeMaterial))
+        let blur = UIVisualEffectView(effect: UIBlurEffect(style: .systemThickMaterial))
         blur.translatesAutoresizingMaskIntoConstraints = false
         blur.isUserInteractionEnabled = false
         container.addSubview(blur)
 
         let veil = UIView()
         veil.translatesAutoresizingMaskIntoConstraints = false
-        veil.backgroundColor = UIColor.black.withAlphaComponent(0.10)
+        // A stronger frosted-glass veil keeps titles, thumbnails and video
+        // frames unreadable in the app switcher without changing Cineva's UI.
+        veil.backgroundColor = UIColor.systemBackground.withAlphaComponent(0.32)
         veil.isUserInteractionEnabled = false
         container.addSubview(veil)
 

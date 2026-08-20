@@ -115,6 +115,10 @@ final class AppState {
   var biometricErrorMessage: String?
   private(set) var isAppUnlocked: Bool
   private var biometricAuthenticationInProgress = false
+  // Entering the background should not launch Face ID while the user is
+  // watching Picture in Picture. Instead, remember that the next foreground
+  // activation must lock and authenticate before content is revealed.
+  private var requiresAuthenticationAfterBackground = false
 
   private var storedGridColumns: Int
   var gridColumns: Int {
@@ -324,11 +328,38 @@ final class AppState {
     Task { await api.clearMountCache() }
     isConfigured = false
     isAppUnlocked = true
+    requiresAuthenticationAfterBackground = false
     mediaConnectionState = .unknown
   }
 
   func lockForBackground() {
-    guard isConfigured, faceIDEnabled else { return }
+    guard isConfigured, faceIDEnabled else {
+      requiresAuthenticationAfterBackground = false
+      return
+    }
+
+    // Do not flip isAppUnlocked here. A full-screen player may be entering
+    // Picture in Picture at the same moment, and changing the lock state while
+    // the app is backgrounding can cause biometric authentication to appear on
+    // top of the Home Screen. The window privacy shield already protects the
+    // app-switcher snapshot while we are away.
+    requiresAuthenticationAfterBackground = true
+    biometricErrorMessage = nil
+  }
+
+  /// Moves a deferred background lock into the visible locked state. Call this
+  /// only after the scene becomes active again. This guarantees that returning
+  /// from the Home Screen or Picture in Picture still requires Face ID, without
+  /// presenting Face ID while the user remains outside Cineva.
+  func prepareForForegroundAuthentication() {
+    guard requiresAuthenticationAfterBackground else { return }
+    requiresAuthenticationAfterBackground = false
+
+    guard isConfigured, faceIDEnabled else {
+      isAppUnlocked = true
+      return
+    }
+
     isAppUnlocked = false
     biometricErrorMessage = nil
   }
@@ -350,6 +381,7 @@ final class AppState {
     if !enabled {
       faceIDEnabled = false
       isAppUnlocked = true
+      requiresAuthenticationAfterBackground = false
       return true
     }
 
