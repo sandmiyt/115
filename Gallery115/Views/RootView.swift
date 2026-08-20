@@ -12,12 +12,22 @@ struct RootView: View {
   @Environment(AppState.self) private var appState
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @State private var homeLogoFrame: CGRect = .zero
-  @State private var launchHeroProgress: CGFloat = 0
+  @State private var launchHeroTravel: CGFloat = 0
+  @State private var launchHeroScaleProgress: CGFloat = 0
+  @State private var launchHeroBackdropProgress: CGFloat = 0
+  @State private var launchHeroLift: CGFloat = 0
   @State private var launchHeroVisible = true
   @State private var launchHeroStarted = false
 
   private var isPrivacyLocked: Bool {
     appState.faceIDEnabled && !appState.isAppUnlocked
+  }
+
+  private var homeLogoReveal: CGFloat {
+    guard launchHeroVisible else { return 1 }
+    let arrival = (launchHeroTravel - 0.80) / 0.20
+    let clamped = min(max(arrival, 0), 1)
+    return clamped * clamped * (3 - 2 * clamped)
   }
 
   var body: some View {
@@ -26,7 +36,7 @@ struct RootView: View {
       // background does not reset the selected tab, navigation stack, or an
       // active full-screen player. Sensitive content is heavily blurred and
       // cannot receive touches until biometric authentication succeeds.
-      MainTabView()
+      MainTabView(homeLogoReveal: homeLogoReveal)
         .blur(radius: isPrivacyLocked ? 28 : 0)
         .scaleEffect(isPrivacyLocked ? 1.015 : 1)
         .allowsHitTesting(!isPrivacyLocked)
@@ -54,8 +64,14 @@ struct RootView: View {
     }
     .overlay {
       if launchHeroVisible, appState.isAppUnlocked, homeLogoFrame.width > 1 {
-        LaunchHeroOverlay(destination: homeLogoFrame, progress: launchHeroProgress)
-          .allowsHitTesting(true)
+        LaunchHeroOverlay(
+          destination: homeLogoFrame,
+          travel: launchHeroTravel,
+          scaleProgress: launchHeroScaleProgress,
+          backdropProgress: launchHeroBackdropProgress,
+          lift: launchHeroLift
+        )
+          .allowsHitTesting(false)
           .zIndex(20_000)
       }
     }
@@ -71,13 +87,36 @@ struct RootView: View {
       try? await Task.sleep(for: .milliseconds(90))
 
       if reduceMotion {
-        withAnimation(.easeOut(duration: 0.22)) { launchHeroProgress = 1 }
-        try? await Task.sleep(for: .milliseconds(240))
-      } else {
-        withAnimation(.spring(response: 0.72, dampingFraction: 0.88, blendDuration: 0.16)) {
-          launchHeroProgress = 1
+        withAnimation(.easeOut(duration: 0.20)) {
+          launchHeroTravel = 1
+          launchHeroScaleProgress = 1
+          launchHeroBackdropProgress = 1
+          launchHeroLift = 1
         }
-        try? await Task.sleep(for: .milliseconds(780))
+        try? await Task.sleep(for: .milliseconds(220))
+      } else {
+        // A tiny lift gives the mark visual "mass" before it starts moving.
+        // It is deliberately subtle: the launch should feel tactile, not showy.
+        withAnimation(.smooth(duration: 0.16, extraBounce: 0.0)) {
+          launchHeroLift = 1
+        }
+
+        try? await Task.sleep(for: .milliseconds(72))
+
+        // Separate tracks create a more system-like shared-element transition:
+        // position stays calm and continuous, while size uses a small snappy
+        // overshoot so the mark appears to magnetically settle into Home.
+        withAnimation(.smooth(duration: 0.56, extraBounce: 0.0)) {
+          launchHeroTravel = 1
+        }
+        withAnimation(.snappy(duration: 0.48, extraBounce: 0.055)) {
+          launchHeroScaleProgress = 1
+        }
+        withAnimation(.easeOut(duration: 0.46)) {
+          launchHeroBackdropProgress = 1
+        }
+
+        try? await Task.sleep(for: .milliseconds(650))
       }
 
       launchHeroVisible = false
@@ -100,30 +139,61 @@ private struct HomeLogoFramePreferenceKey: PreferenceKey {
 
 private struct LaunchHeroOverlay: View {
   let destination: CGRect
-  let progress: CGFloat
+  let travel: CGFloat
+  let scaleProgress: CGFloat
+  let backdropProgress: CGFloat
+  let lift: CGFloat
 
   var body: some View {
     GeometryReader { proxy in
       let startCenter = CGPoint(x: proxy.size.width * 0.5, y: proxy.size.height * 0.5)
       let endCenter = CGPoint(x: destination.midX, y: destination.midY)
-      let p = min(max(progress, 0), 1)
-      let center = CGPoint(
-        x: startCenter.x + (endCenter.x - startCenter.x) * p,
-        y: startCenter.y + (endCenter.y - startCenter.y) * p
+      let t = min(max(travel, 0), 1)
+      let backdrop = min(max(backdropProgress, 0), 1)
+      let liftAmount = min(max(lift, 0), 1) * (1 - t)
+
+      // A shallow bezier arc makes the icon feel like it is being attracted to
+      // the Home mark instead of sliding along a ruler-straight diagonal.
+      let distanceX = endCenter.x - startCenter.x
+      let distanceY = endCenter.y - startCenter.y
+      let control1 = CGPoint(
+        x: startCenter.x + distanceX * 0.18,
+        y: startCenter.y + distanceY * 0.10 - 10
       )
+      let control2 = CGPoint(
+        x: endCenter.x - distanceX * 0.10 + 6,
+        y: endCenter.y - distanceY * 0.16 + 12
+      )
+      var center = cubicPoint(
+        from: startCenter,
+        control1: control1,
+        control2: control2,
+        to: endCenter,
+        progress: systemEase(t)
+      )
+      center.y -= 3.5 * liftAmount
+
       let destinationSize = max(destination.width, 48)
-      let logoSize = 120 + (destinationSize - 120) * p
-      let backgroundOpacity = max(0, 1 - p * 1.18)
-      let logoOpacity = p < 0.84 ? 1 : max(0, 1 - (p - 0.84) / 0.16)
+      // Keep scaleProgress unclamped on purpose. A snappy spring can briefly
+      // travel a few percent beyond 1, producing a tiny magnetic settle at the
+      // destination without making the position itself bounce.
+      let sizeP = max(0, scaleProgress)
+      var logoSize = 120 + (destinationSize - 120) * sizeP
+      logoSize *= 1 + 0.022 * liftAmount
+
+      // Preserve the launch screen for the first beat, then reveal Home a touch
+      // faster near the end so the destination is visually ready before the
+      // moving mark crossfades into it.
+      let backgroundOpacity = 1 - smoothstep(backdrop)
+      let arrival = min(max((t - 0.78) / 0.22, 0), 1)
+      let logoOpacity = 1 - smoothstep(arrival)
+      let shadowEnergy = (1 - t) * 0.65 + liftAmount * 0.35
 
       ZStack {
         Color(uiColor: .systemBackground)
           .opacity(backgroundOpacity)
           .ignoresSafeArea()
 
-        // The runtime overlay uses the exact same asset as UILaunchScreen. At
-        // the final few frames it crossfades into the existing Home logo, so
-        // the Home UI itself does not need to change.
         Image("LaunchLogo")
           .resizable()
           .interpolation(.high)
@@ -131,11 +201,45 @@ private struct LaunchHeroOverlay: View {
           .frame(width: logoSize, height: logoSize)
           .position(center)
           .opacity(logoOpacity)
-          .shadow(color: .black.opacity(0.10 * (1 - p)), radius: 14 * (1 - p), y: 6 * (1 - p))
+          .shadow(
+            color: .black.opacity(0.105 * shadowEnergy),
+            radius: 15 * shadowEnergy,
+            y: 6 * shadowEnergy
+          )
       }
       .frame(width: proxy.size.width, height: proxy.size.height)
     }
     .ignoresSafeArea()
+  }
+
+  private func cubicPoint(
+    from p0: CGPoint,
+    control1 p1: CGPoint,
+    control2 p2: CGPoint,
+    to p3: CGPoint,
+    progress t: CGFloat
+  ) -> CGPoint {
+    let u = 1 - t
+    let tt = t * t
+    let uu = u * u
+    let uuu = uu * u
+    let ttt = tt * t
+    return CGPoint(
+      x: uuu * p0.x + 3 * uu * t * p1.x + 3 * u * tt * p2.x + ttt * p3.x,
+      y: uuu * p0.y + 3 * uu * t * p1.y + 3 * u * tt * p2.y + ttt * p3.y
+    )
+  }
+
+  private func systemEase(_ value: CGFloat) -> CGFloat {
+    let x = min(max(value, 0), 1)
+    // Quintic smoothstep has zero velocity and acceleration at both ends. It
+    // reads closer to UIKit/SwiftUI system motion than a plain linear lerp.
+    return x * x * x * (x * (x * 6 - 15) + 10)
+  }
+
+  private func smoothstep(_ value: CGFloat) -> CGFloat {
+    let x = min(max(value, 0), 1)
+    return x * x * (3 - 2 * x)
   }
 }
 
@@ -167,10 +271,11 @@ private struct MainTabView: View {
   @Environment(\.colorScheme) private var colorScheme
   @Environment(AppState.self) private var appState
   @State private var selectedTab: AppTab = .home
+  let homeLogoReveal: CGFloat
 
   var body: some View {
     TabView(selection: $selectedTab) {
-      NavigationStack { HomeView() }
+      NavigationStack { HomeView(logoReveal: homeLogoReveal) }
         .tag(AppTab.home)
         .tabItem { Label("首页", systemImage: "house.fill") }
 
@@ -203,6 +308,7 @@ private struct HomeView: View {
   @Environment(AppState.self) private var appState
   @State private var selectedVideo: CloudItem?
   @State private var didCheckConnection = false
+  let logoReveal: CGFloat
 
   var body: some View {
     ScrollView {
@@ -251,6 +357,8 @@ private struct HomeView: View {
   private var header: some View {
     HStack(spacing: 12) {
       CinevaLogoMark(size: 48)
+        .opacity(logoReveal)
+        .scaleEffect(0.97 + 0.03 * logoReveal)
         .background {
           GeometryReader { logoProxy in
             Color.clear
