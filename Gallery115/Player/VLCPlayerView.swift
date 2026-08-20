@@ -28,6 +28,8 @@ import SwiftUI
     private var lastState: VLCMediaPlayerState = .stopped
     private var maxObservedTime: Double = 0
     private var playbackGeneration = UUID()
+    private var lastInteractiveSeekAt: TimeInterval = 0
+    private var pendingInteractiveSeek: Double?
 
     func configure(
       source: VideoSource,
@@ -114,9 +116,55 @@ import SwiftUI
     }
 
     func seek(to seconds: Double) {
-      let upper = duration > 0 ? duration : max(seconds, currentTime + 60)
-      let target = min(max(seconds, 0), upper)
+      let target = clampedSeekTarget(seconds)
       currentTime = target
+      applySeek(target)
+    }
+
+    @discardableResult
+    func beginInteractiveScrub() -> Bool {
+      let shouldResume = isPlaying
+      if shouldResume {
+        player.pause()
+        isPlaying = false
+        isBuffering = false
+      }
+      pendingInteractiveSeek = nil
+      lastInteractiveSeekAt = 0
+      return shouldResume
+    }
+
+    /// MobileVLCKit has no seek-completion callback equivalent to AVPlayer's,
+    /// so cap decoder jumps to ~20 fps while still updating the timeline value
+    /// every finger event. This avoids queueing dozens of expensive VLC seeks.
+    func interactiveScrub(to seconds: Double) {
+      let target = clampedSeekTarget(seconds)
+      currentTime = target
+      pendingInteractiveSeek = target
+      let now = ProcessInfo.processInfo.systemUptime
+      guard now - lastInteractiveSeekAt >= 0.05 else { return }
+      lastInteractiveSeekAt = now
+      pendingInteractiveSeek = nil
+      applySeek(target)
+    }
+
+    func endInteractiveScrub(to seconds: Double, resumeAfter: Bool) {
+      let target = clampedSeekTarget(seconds)
+      currentTime = target
+      pendingInteractiveSeek = nil
+      applySeek(target)
+      if resumeAfter {
+        player.play()
+        isPlaying = true
+      }
+    }
+
+    private func clampedSeekTarget(_ seconds: Double) -> Double {
+      let upper = duration > 0 ? duration : max(seconds, currentTime + 60)
+      return min(max(seconds, 0), upper)
+    }
+
+    private func applySeek(_ target: Double) {
       player.time = VLCTime(int: Int32(min(target * 1000, Double(Int32.max))))
     }
 

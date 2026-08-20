@@ -33,6 +33,7 @@ struct PlayerScreen: View {
   @State private var controlsTask: Task<Void, Never>?
   @State private var scrubValue: Double = 0
   @State private var isScrubbing = false
+  @State private var scrubWasPlaying = false
   @State private var isGestureInteracting = false
   @State private var isControlsInteractionActive = false
   @State private var gestureStartBrightness: CGFloat?
@@ -42,6 +43,10 @@ struct PlayerScreen: View {
   @State private var videoOffset: CGSize = .zero
   @State private var panStartOffset: CGSize = .zero
   @State private var isPinchInteracting = false
+  @State private var dismissDragOffset: CGSize = .zero
+  @State private var isDismissDragging = false
+  @State private var dismissControlsWereVisible = false
+  @State private var dismissRestoreTask: Task<Void, Never>?
   @State private var singleFingerGestureSuppressedUntil: TimeInterval = 0
   @State private var externalSubtitleTracks: [ExternalSubtitleTrack] = []
   @State private var selectedExternalSubtitleID: String?
@@ -70,30 +75,24 @@ struct PlayerScreen: View {
 
   var body: some View {
     playbackObservedView
+      // The player is presented with fullScreenCover. Keeping the presentation
+      // background transparent lets the existing library remain alive and
+      // visible underneath during the Photos-style interactive dismiss.
+      .presentationBackground(.clear)
   }
 
   private var playerBaseView: some View {
     GeometryReader { proxy in
       ZStack {
-        Color.black.ignoresSafeArea()
-
-        playerLayer
-          .frame(width: proxy.size.width, height: proxy.size.height)
-          .scaleEffect(videoScale, anchor: .center)
-          .offset(videoOffset)
-          .frame(width: proxy.size.width, height: proxy.size.height)
-          .background(Color.black)
-          .clipped()
+        Color.black
+          .opacity(interactiveDismissBackdropOpacity)
           .ignoresSafeArea()
+
+        mediaPresentation(proxy: proxy)
 
         interactionLayer(proxy: proxy)
 
-        if let subtitleText = activeExternalSubtitleText {
-          externalSubtitleOverlay(text: subtitleText, proxy: proxy)
-            .zIndex(8)
-        }
-
-        if !isLocked, appState.isAppUnlocked {
+        if !isLocked, appState.isAppUnlocked, !isDismissDragging {
           skipSegmentOverlay(proxy: proxy)
             .zIndex(9)
         }
@@ -103,9 +102,9 @@ struct PlayerScreen: View {
         } else {
           playerChrome(proxy: proxy)
             .simultaneousGesture(controlsInteractionGesture)
-            .opacity(chromeShouldBeVisible ? 1 : 0)
-            .allowsHitTesting(chromeShouldBeVisible && !showSettingsPanel && !showSpeedPanel && !showQueuePanel)
-            .accessibilityHidden(!chromeShouldBeVisible)
+            .opacity(chromeShouldBeVisible && !isDismissDragging ? 1 : 0)
+            .allowsHitTesting(chromeShouldBeVisible && !isDismissDragging && !showSettingsPanel && !showSpeedPanel && !showQueuePanel)
+            .accessibilityHidden(!chromeShouldBeVisible || isDismissDragging)
         }
 
         if showSettingsPanel, !isLocked {
@@ -135,7 +134,7 @@ struct PlayerScreen: View {
             .zIndex(15)
         }
 
-        if activeIsBuffering {
+        if activeIsBuffering, !isDismissDragging {
           ProgressView()
             .controlSize(.large)
             .tint(.white)
@@ -193,7 +192,7 @@ struct PlayerScreen: View {
       .animation(.easeInOut(duration: chromeShouldBeVisible ? 0.18 : 0.26), value: chromeShouldBeVisible)
       .animation(.easeInOut(duration: 0.18), value: showPlaybackHUD)
     }
-    .background(Color.black)
+    .background(Color.clear)
     .ignoresSafeArea()
     .statusBarHidden(true)
   }
@@ -319,6 +318,7 @@ struct PlayerScreen: View {
     timelinePreviewTask?.cancel()
     subtitleLoadTask?.cancel()
     auxiliaryLoadTask?.cancel()
+    dismissRestoreTask?.cancel()
     pauseActivePlayer()
     vlcController.stop()
     RemotePlaybackCoordinator.shared.deactivate()
@@ -345,6 +345,57 @@ struct PlayerScreen: View {
           .foregroundStyle(.white.opacity(0.8))
       }
     }
+  }
+
+  private func mediaPresentation(proxy: GeometryProxy) -> some View {
+    ZStack {
+      playerLayer
+        .frame(width: proxy.size.width, height: proxy.size.height)
+        .scaleEffect(videoScale, anchor: .center)
+        .offset(videoOffset)
+        .frame(width: proxy.size.width, height: proxy.size.height)
+        .background(Color.black)
+        .clipped()
+        .ignoresSafeArea()
+
+      if let subtitleText = activeExternalSubtitleText {
+        externalSubtitleOverlay(text: subtitleText, proxy: proxy)
+          .zIndex(8)
+      }
+    }
+    .frame(width: proxy.size.width, height: proxy.size.height)
+    .scaleEffect(interactiveDismissMediaScale, anchor: .center)
+    .offset(dismissDragOffset)
+    .clipShape(
+      RoundedRectangle(
+        cornerRadius: interactiveDismissCornerRadius,
+        style: .continuous
+      )
+    )
+    .shadow(
+      color: .black.opacity(isDismissDragging ? 0.28 : 0),
+      radius: isDismissDragging ? 28 : 0,
+      y: isDismissDragging ? 12 : 0
+    )
+    .allowsHitTesting(false)
+  }
+
+  private var interactiveDismissProgress: CGFloat {
+    let distance = hypot(dismissDragOffset.width, dismissDragOffset.height)
+    return min(max(distance / 240.0, 0), 1)
+  }
+
+  private var interactiveDismissMediaScale: CGFloat {
+    1.0 - interactiveDismissProgress * 0.18
+  }
+
+  private var interactiveDismissCornerRadius: CGFloat {
+    interactiveDismissProgress * 24.0
+  }
+
+  private var interactiveDismissBackdropOpacity: Double {
+    guard isDismissDragging else { return 1 }
+    return max(0.06, 1.0 - Double(interactiveDismissProgress) * 0.94)
   }
 
   private func interactionLayer(proxy: GeometryProxy) -> some View {
@@ -475,14 +526,14 @@ struct PlayerScreen: View {
     let availableWidth = max(proxy.size.width, 1)
     let isLandscape = availableWidth > availableHeight
 
-    return DragGesture(minimumDistance: 16)
+    return DragGesture(minimumDistance: 12)
       .onChanged { value in
         guard appState.playerGesturesEnabled, !isPinchInteracting else { return }
         guard ProcessInfo.processInfo.systemUptime >= singleFingerGestureSuppressedUntil else { return }
 
-        // Once zoomed, the entire screen becomes a free pan surface. This is
-        // deliberately global instead of being attached to the left/right
-        // brightness zones so the user can grab the picture from anywhere.
+        // A zoomed video always owns one-finger movement. Interactive dismiss
+        // is intentionally disabled above 1x so panning a magnified frame can
+        // never accidentally leave the player.
         if videoScale > 1.001 {
           if !isGestureInteracting {
             isGestureInteracting = true
@@ -499,15 +550,20 @@ struct PlayerScreen: View {
           return
         }
 
+        // Portrait gets an iOS Photos-style free drag. The media follows the
+        // finger in two dimensions while the library underneath is revealed.
+        // Timeline scrubbing still wins inside the visible progress bar.
+        if !isLandscape {
+          updatePortraitDismissDrag(value)
+          return
+        }
+
         let dx = value.translation.width
         let dy = value.translation.height
         guard abs(dy) >= abs(dx) else { return }
 
-        // Portrait intentionally has no vertical brightness/volume gesture.
         // In landscape the starting finger position decides the channel once:
         // left half = brightness, right half = volume.
-        guard isLandscape else { return }
-
         if !isGestureInteracting {
           isGestureInteracting = true
           controlsTask?.cancel()
@@ -549,11 +605,17 @@ struct PlayerScreen: View {
           return
         }
 
+        if !isLandscape {
+          finishPortraitDismissDrag(value, viewport: proxy.size)
+          return
+        }
+
         let dx = value.translation.width
         let dy = value.translation.height
 
-        // Horizontal seek remains available in both orientations. Vertical
-        // gestures in portrait deliberately do nothing.
+        // Landscape retains the quick horizontal seek gesture. Portrait uses
+        // the Photos-style drag-to-dismiss instead; precision seeking lives on
+        // the timeline there, avoiding a gesture conflict.
         if abs(dx) > abs(dy) {
           let delta = Double(dx / availableWidth) * 180
           if abs(delta) > 2 { seekBy(delta) }
@@ -565,6 +627,76 @@ struct PlayerScreen: View {
         isGestureInteracting = false
         scheduleControlsHide()
       }
+  }
+
+  @MainActor
+  private func updatePortraitDismissDrag(_ value: DragGesture.Value) {
+    guard !isScrubbing,
+      !isControlsInteractionActive,
+      !showSettingsPanel,
+      !showSpeedPanel,
+      !showQueuePanel,
+      !showPlaybackHUD,
+      !showInfo
+    else { return }
+
+    if !isDismissDragging {
+      isDismissDragging = true
+      dismissControlsWereVisible = controlsVisible
+      dismissRestoreTask?.cancel()
+      controlsTask?.cancel()
+      hudTask?.cancel()
+      gestureHUD = nil
+      withAnimation(.easeOut(duration: 0.10)) {
+        controlsVisible = false
+      }
+    }
+
+    // Keep downward/sideways movement exactly under the finger. Upward travel
+    // has a light rubber-band resistance because upward motion is not a dismiss
+    // direction, but it still feels free rather than being hard-clamped.
+    let y = value.translation.height >= 0
+      ? value.translation.height
+      : value.translation.height * 0.32
+    dismissDragOffset = CGSize(width: value.translation.width, height: y)
+  }
+
+  @MainActor
+  private func finishPortraitDismissDrag(_ value: DragGesture.Value, viewport: CGSize) {
+    guard isDismissDragging else { return }
+
+    let height = max(viewport.height, 1)
+    let dismissDistance = min(max(height * 0.18, 120), 170)
+    let movedDown = value.translation.height > dismissDistance
+    let flickedDown = value.translation.height > 36
+      && value.predictedEndTranslation.height > dismissDistance * 1.35
+
+    if movedDown || flickedDown {
+      dismissRestoreTask?.cancel()
+      UIImpactFeedbackGenerator(style: .soft).impactOccurred()
+      // Keep the interactive transform intact until the presentation controller
+      // takes over. The underlying FolderView was never rebuilt, so dismissal
+      // returns to exactly the library position the user came from.
+      dismiss()
+      return
+    }
+
+    isDismissDragging = false
+    withAnimation(.spring(response: 0.38, dampingFraction: 0.84, blendDuration: 0.10)) {
+      dismissDragOffset = .zero
+    }
+
+    let shouldRestoreControls = dismissControlsWereVisible
+    dismissRestoreTask?.cancel()
+    dismissRestoreTask = Task { @MainActor in
+      try? await Task.sleep(for: .milliseconds(120))
+      guard !Task.isCancelled, !isDismissDragging else { return }
+      if shouldRestoreControls {
+        showControls(animated: true)
+      } else {
+        scheduleControlsHide()
+      }
+    }
   }
 
   private func lockShield(proxy: GeometryProxy) -> some View {
@@ -1495,19 +1627,41 @@ struct PlayerScreen: View {
               if !isScrubbing {
                 isScrubbing = true
                 controlsTask?.cancel()
+                if useVLC {
+                  scrubWasPlaying = vlcController.beginInteractiveScrub()
+                } else {
+                  scrubWasPlaying = model?.beginInteractiveScrub() ?? false
+                }
               }
               let x = min(max(value.location.x, 0), width)
               scrubValue = Double(x / width) * duration
+
+              // The timeline value follows the finger immediately, while the
+              // decoder uses a coalesced chase seek so stale intermediate
+              // positions never build up behind the user's gesture.
+              if useVLC {
+                vlcController.interactiveScrub(to: scrubValue)
+              } else {
+                model?.interactiveScrub(to: scrubValue)
+              }
               requestTimelinePreview(at: scrubValue)
             }
             .onEnded { value in
               let x = min(max(value.location.x, 0), width)
               scrubValue = Double(x / width) * duration
-              seekActive(to: scrubValue)
+              if useVLC {
+                vlcController.endInteractiveScrub(to: scrubValue, resumeAfter: scrubWasPlaying)
+              } else if let model {
+                model.endInteractiveScrub(to: scrubValue, resumeAfter: scrubWasPlaying)
+              } else {
+                seekActive(to: scrubValue)
+              }
+              scrubWasPlaying = false
               isScrubbing = false
               timelinePreviewTask?.cancel()
               timelinePreviewImage = nil
               timelinePreviewBucket = -1
+              updateRemotePlaybackInfo()
               scheduleControlsHide()
             }
         )
@@ -2043,6 +2197,11 @@ struct PlayerScreen: View {
     let expectedID = currentItem.id
 
     timelinePreviewTask = Task { @MainActor in
+      // Don't let AVAssetImageGenerator compete with rapid live seek traffic.
+      // A short settle delay means quick swipes prioritize the real video frame;
+      // the floating thumbnail appears only when the finger lingers briefly.
+      try? await Task.sleep(for: .milliseconds(120))
+      guard !Task.isCancelled else { return }
       let image = await model.timelinePreview(at: seconds)
       guard !Task.isCancelled,
         currentItem.id == expectedID,
@@ -2198,6 +2357,9 @@ struct PlayerScreen: View {
     pinchStartScale = 1.0
     videoOffset = .zero
     panStartOffset = .zero
+    dismissDragOffset = .zero
+    isDismissDragging = false
+    dismissRestoreTask?.cancel()
     isPinchInteracting = false
     singleFingerGestureSuppressedUntil = 0
     if item.parentID != loadedPlaylistParentID {
