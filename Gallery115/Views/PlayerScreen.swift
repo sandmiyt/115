@@ -27,7 +27,9 @@ struct PlayerScreen: View {
   @State private var showPlaybackHUD = false
   @State private var isRoutePickerPresented = false
   @State private var gestureHUD: String?
+  @State private var showFavoriteHeart = false
   @State private var hudTask: Task<Void, Never>?
+  @State private var favoriteHUDTask: Task<Void, Never>?
   @State private var controlsTask: Task<Void, Never>?
   @State private var scrubValue: Double = 0
   @State private var isScrubbing = false
@@ -118,6 +120,16 @@ struct PlayerScreen: View {
             .background(.black.opacity(0.76), in: Capsule())
             .transition(.scale.combined(with: .opacity))
             .allowsHitTesting(false)
+        }
+
+        if showFavoriteHeart {
+          Image(systemName: "heart.fill")
+            .font(.system(size: 72, weight: .bold))
+            .foregroundStyle(.red)
+            .shadow(color: .black.opacity(0.35), radius: 18, y: 6)
+            .transition(.scale(scale: 0.55).combined(with: .opacity))
+            .allowsHitTesting(false)
+            .zIndex(40)
         }
       }
       .frame(width: proxy.size.width, height: proxy.size.height)
@@ -216,6 +228,7 @@ struct PlayerScreen: View {
       showQueuePanel = false
       isControlsInteractionActive = false
       hudTask?.cancel()
+      favoriteHUDTask?.cancel()
       controlsTask?.cancel()
       pauseActivePlayer()
       vlcController.stop()
@@ -252,6 +265,9 @@ struct PlayerScreen: View {
       Color.clear
         .contentShape(Rectangle())
         .onTapGesture { toggleControls() }
+        .onLongPressGesture(minimumDuration: 0.55, maximumDistance: 24) {
+          toggleFavoriteFromLongPress()
+        }
         .frame(width: proxy.size.width * 0.34)
       gestureSurface(isLeft: false, proxy: proxy)
     }
@@ -415,11 +431,12 @@ struct PlayerScreen: View {
         }
       }
 
-      if playlist.count > 1 {
-        playerIconButton("rectangle.stack.badge.play") {
-          openQueuePanel()
-        }
+      playerIconButton("rectangle.landscape.rotate") {
+        PlayerOrientation.toggle()
+        keepControlsDuringInteraction()
+        scheduleControlsHide()
       }
+      .accessibilityLabel("切换横屏或竖屏")
 
       if landscape {
         playerIconButton("lock.fill") {
@@ -442,8 +459,8 @@ struct PlayerScreen: View {
     .padding(
       .top,
       landscape
-        ? max(proxy.safeAreaInsets.top + 10, 18)
-        : max(proxy.safeAreaInsets.top + 12, 54)
+        ? max(proxy.safeAreaInsets.top + 20, 30)
+        : max(proxy.safeAreaInsets.top + 22, 66)
     )
     .padding(.bottom, landscape ? 20 : 12)
     .background(
@@ -868,18 +885,9 @@ struct PlayerScreen: View {
         }
       }
 
-      HStack(spacing: 8) {
-        settingsActionButton(
-          appState.libraryStore.isFavorite(currentItem) ? "已收藏" : "收藏",
-          systemName: appState.libraryStore.isFavorite(currentItem) ? "heart.fill" : "heart"
-        ) {
-          appState.libraryStore.toggleFavorite(currentItem)
-          keepControlsDuringInteraction()
-        }
-        settingsActionButton(showPlaybackHUD ? "关闭 HUD" : "播放 HUD", systemName: "waveform.path.ecg") {
-          showPlaybackHUD.toggle()
-          keepControlsDuringInteraction()
-        }
+      settingsActionButton(showPlaybackHUD ? "关闭 HUD" : "播放 HUD", systemName: "waveform.path.ecg") {
+        showPlaybackHUD.toggle()
+        keepControlsDuringInteraction()
       }
 
       HStack(spacing: 8) {
@@ -1022,37 +1030,23 @@ struct PlayerScreen: View {
   }
 
   private func portraitCenterTransport(model: PlayerModel) -> some View {
-    HStack(spacing: 14) {
-      centerTransportButton("backward.end.fill", enabled: previousItem != nil, size: 15) {
-        playPreviousIfAvailable()
-      }
-
-      centerTransportButton("gobackward.\(appState.doubleTapSeekSeconds)", size: 18) {
-        seekBy(-Double(appState.doubleTapSeekSeconds))
-      }
-
-      Button {
-        toggleActivePlayback()
-        controlsVisible = true
-        scheduleControlsHide()
-      } label: {
-        Image(systemName: activeIsPlaying ? "pause.fill" : "play.fill")
-          .font(.system(size: 24, weight: .bold))
-          .foregroundStyle(.black)
-          .frame(width: 62, height: 62)
-          .background(.white, in: Circle())
-          .shadow(color: .black.opacity(0.30), radius: 14, y: 5)
-      }
-      .buttonStyle(.plain)
-
-      centerTransportButton("goforward.\(appState.doubleTapSeekSeconds)", size: 18) {
-        seekBy(Double(appState.doubleTapSeekSeconds))
-      }
-
-      centerTransportButton("forward.end.fill", enabled: nextItem != nil, size: 15) {
-        playNextIfAvailable()
-      }
+    Button {
+      toggleActivePlayback()
+      controlsVisible = true
+      scheduleControlsHide()
+    } label: {
+      Image(systemName: activeIsPlaying ? "pause.fill" : "play.fill")
+        .font(.system(size: 24, weight: .bold))
+        .foregroundStyle(.black)
+        .frame(width: 62, height: 62)
+        .background(.white, in: Circle())
+        .shadow(color: .black.opacity(0.30), radius: 14, y: 5)
     }
+    .buttonStyle(.plain)
+    .highPriorityGesture(
+      LongPressGesture(minimumDuration: 0.55, maximumDistance: 24)
+        .onEnded { _ in toggleFavoriteFromLongPress() }
+    )
   }
 
   private func portraitUtilityBar(model: PlayerModel) -> some View {
@@ -1063,45 +1057,33 @@ struct PlayerScreen: View {
 
       Spacer(minLength: 12)
 
-      utilityIconButton(appState.libraryStore.isFavorite(currentItem) ? "heart.fill" : "heart") {
-        appState.libraryStore.toggleFavorite(currentItem)
-        scheduleControlsHide()
+      if playlist.count > 1 {
+        utilityIconButton("rectangle.stack.badge.play") {
+          openQueuePanel()
+        }
+        .accessibilityLabel("播放队列")
       }
     }
   }
 
   private func landscapeCenterTransport(model: PlayerModel) -> some View {
-    HStack(spacing: 24) {
-      centerTransportButton("backward.end.fill", enabled: previousItem != nil, size: 18) {
-        playPreviousIfAvailable()
-      }
-
-      centerTransportButton("gobackward.\(appState.doubleTapSeekSeconds)", size: 20) {
-        seekBy(-Double(appState.doubleTapSeekSeconds))
-      }
-
-      Button {
-        toggleActivePlayback()
-        controlsVisible = true
-        scheduleControlsHide()
-      } label: {
-        Image(systemName: activeIsPlaying ? "pause.fill" : "play.fill")
-          .font(.system(size: 27, weight: .bold))
-          .foregroundStyle(.black)
-          .frame(width: 68, height: 68)
-          .background(.white, in: Circle())
-          .shadow(color: .black.opacity(0.34), radius: 16, y: 6)
-      }
-      .buttonStyle(.plain)
-
-      centerTransportButton("goforward.\(appState.doubleTapSeekSeconds)", size: 20) {
-        seekBy(Double(appState.doubleTapSeekSeconds))
-      }
-
-      centerTransportButton("forward.end.fill", enabled: nextItem != nil, size: 18) {
-        playNextIfAvailable()
-      }
+    Button {
+      toggleActivePlayback()
+      controlsVisible = true
+      scheduleControlsHide()
+    } label: {
+      Image(systemName: activeIsPlaying ? "pause.fill" : "play.fill")
+        .font(.system(size: 27, weight: .bold))
+        .foregroundStyle(.black)
+        .frame(width: 68, height: 68)
+        .background(.white, in: Circle())
+        .shadow(color: .black.opacity(0.34), radius: 16, y: 6)
     }
+    .buttonStyle(.plain)
+    .highPriorityGesture(
+      LongPressGesture(minimumDuration: 0.55, maximumDistance: 24)
+        .onEnded { _ in toggleFavoriteFromLongPress() }
+    )
   }
 
   private func centerTransportButton(
@@ -1133,9 +1115,11 @@ struct PlayerScreen: View {
 
       Spacer(minLength: 12)
 
-      utilityIconButton(appState.libraryStore.isFavorite(currentItem) ? "heart.fill" : "heart") {
-        appState.libraryStore.toggleFavorite(currentItem)
-        scheduleControlsHide()
+      if playlist.count > 1 {
+        utilityIconButton("rectangle.stack.badge.play") {
+          openQueuePanel()
+        }
+        .accessibilityLabel("播放队列")
       }
     }
   }
@@ -1282,6 +1266,27 @@ struct PlayerScreen: View {
     .padding(.horizontal, 10)
     .frame(height: 36)
     .background(.white.opacity(0.10), in: Capsule())
+  }
+
+  @MainActor
+  private func toggleFavoriteFromLongPress() {
+    appState.libraryStore.toggleFavorite(currentItem)
+
+    let feedback = UIImpactFeedbackGenerator(style: .medium)
+    feedback.prepare()
+    feedback.impactOccurred()
+
+    favoriteHUDTask?.cancel()
+    withAnimation(.spring(response: 0.24, dampingFraction: 0.68)) {
+      showFavoriteHeart = true
+    }
+    favoriteHUDTask = Task { @MainActor in
+      try? await Task.sleep(for: .milliseconds(620))
+      guard !Task.isCancelled else { return }
+      withAnimation(.easeOut(duration: 0.20)) {
+        showFavoriteHeart = false
+      }
+    }
   }
 
   private var autoHideSuspended: Bool {
@@ -1861,19 +1866,9 @@ private struct PlayerInfoSheet: View {
         Section("手势") {
           LabeledContent("双击快进/快退", value: "\(appState.doubleTapSeekSeconds) 秒")
           LabeledContent("左右滑动", value: "快进 / 快退")
+          LabeledContent("画面中间长按", value: "收藏 / 取消收藏")
           LabeledContent("左侧上下滑", value: "亮度")
           LabeledContent("右侧上下滑", value: "播放音量")
-        }
-
-        Section {
-          Button {
-            appState.libraryStore.toggleFavorite(item)
-          } label: {
-            Label(
-              appState.libraryStore.isFavorite(item) ? "取消收藏" : "收藏这个视频",
-              systemImage: appState.libraryStore.isFavorite(item) ? "heart.slash" : "heart"
-            )
-          }
         }
       }
       .navigationTitle("播放详情")

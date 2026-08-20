@@ -7,6 +7,7 @@ struct SettingsView: View {
   @State private var isChangingFaceID = false
   @State private var showDisconnectConfirmation = false
   @State private var showClearRecentsConfirmation = false
+  @State private var showMediaSetup = false
 
   var body: some View {
     @Bindable var appState = appState
@@ -15,25 +16,39 @@ struct SettingsView: View {
       Section("媒体源") {
         connectionSummary
 
-        Button(action: checkConnection) {
-          HStack {
-            Label("检查连接", systemImage: "wave.3.right.circle")
-            Spacer()
-            if isCheckingConnection {
-              ProgressView()
+        if appState.isConfigured {
+          Button(action: checkConnection) {
+            HStack {
+              Label("检查连接", systemImage: "wave.3.right.circle")
+              Spacer()
+              if isCheckingConnection {
+                ProgressView()
+              }
             }
           }
+          .disabled(isCheckingConnection)
+
+          Button {
+            showMediaSetup = true
+          } label: {
+            Label("更换媒体源", systemImage: "externaldrive.badge.plus")
+          }
+
+          Button("断开媒体源", role: .destructive) {
+            showDisconnectConfirmation = true
+          }
+        } else {
+          Button {
+            showMediaSetup = true
+          } label: {
+            Label("连接 OpenList / AList", systemImage: "externaldrive.badge.plus")
+          }
         }
-        .disabled(isCheckingConnection)
 
         if let statusMessage {
           Text(statusMessage)
             .font(.footnote)
             .foregroundStyle(statusMessage.contains("正常") ? .green : .secondary)
-        }
-
-        Button("更换或断开媒体源", role: .destructive) {
-          showDisconnectConfirmation = true
         }
       }
 
@@ -159,6 +174,9 @@ struct SettingsView: View {
         LabeledContent("挂载协议", value: "WebDAV")
       }
     }
+    .sheet(isPresented: $showMediaSetup) {
+      SetupView()
+    }
     .confirmationDialog("断开当前媒体源？", isPresented: $showDisconnectConfirmation, titleVisibility: .visible) {
       Button("断开媒体源", role: .destructive) {
         appState.signOut()
@@ -203,27 +221,23 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 3) {
           Text("OpenList / AList 已连接")
             .font(.subheadline.weight(.semibold))
-          Text(configuration.normalizedWebDAVURL?.host ?? configuration.serverURL)
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .lineLimit(1)
           Text("媒体库：\(configuration.normalizedRootPath)")
-            .font(.caption2)
+            .font(.caption)
             .foregroundStyle(.secondary)
         }
       }
 
       LabeledContent("读取方式", value: "WebDAV 只读")
       if configuration.normalizedWebDAVURL?.scheme?.lowercased() == "http" {
-        Label("当前使用 HTTP，账号密码和媒体流未经过 TLS 加密。建议稳定后切换 HTTPS。", systemImage: "exclamationmark.triangle.fill")
+        Label("当前连接使用 HTTP。若要使用 HTTPS，必须先在 OpenList 所在服务器或反向代理真正配置 TLS 和有效证书；仅把 http 改成 https 会直接导致 TLS 连接失败。使用 IP+端口时，证书还必须与该访问地址匹配。", systemImage: "exclamationmark.triangle.fill")
           .font(.caption)
           .foregroundStyle(.orange)
       }
-      Text("115 Token、刷新、限流与 405 均由 OpenList / AList 服务器端处理；Cineva 不直接访问 115 Open API。")
+      Text("服务器地址与账号信息不会在设置页展示。115 Token、刷新与限流继续由 OpenList / AList 服务器端处理。")
         .font(.caption)
         .foregroundStyle(.secondary)
     } else {
-      Label("未连接媒体源", systemImage: "externaldrive.badge.xmark")
+      Label("未连接媒体源，可在进入软件后自行挂载。", systemImage: "externaldrive.badge.xmark")
         .foregroundStyle(.secondary)
     }
   }

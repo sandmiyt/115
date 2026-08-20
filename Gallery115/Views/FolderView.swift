@@ -34,10 +34,13 @@ struct FolderView: View {
   @State private var selectedVideo: CloudItem?
   @State private var nextOffset = 0
   @State private var hasMore = true
+  @State private var showMediaSetup = false
 
   var body: some View {
     Group {
-      if isInitialLoading && items.isEmpty {
+      if !appState.isConfigured {
+        unconfiguredState
+      } else if isInitialLoading && items.isEmpty {
         loadingState
       } else if let errorMessage, items.isEmpty {
         ContentUnavailableView {
@@ -121,7 +124,34 @@ struct FolderView: View {
     .fullScreenCover(item: $selectedVideo) { item in
       PlayerScreen(item: item, playlist: loadedVideoPlaylist)
     }
-    .task(id: folderID) { await loadFirstPage(forceRefresh: false) }
+    .sheet(isPresented: $showMediaSetup) {
+      SetupView()
+    }
+    .task(id: "\(folderID)|\(appState.isConfigured)") {
+      if appState.isConfigured {
+        await loadFirstPage(forceRefresh: false)
+      } else {
+        isInitialLoading = false
+        isLoadingMore = false
+        items = []
+        searchItems = nil
+        errorMessage = nil
+      }
+    }
+  }
+
+
+  private var unconfiguredState: some View {
+    ContentUnavailableView {
+      Label("尚未连接媒体源", systemImage: "externaldrive.badge.plus")
+    } description: {
+      Text("先进入 Cineva，再连接你自己的 OpenList / AList。连接成功后，这里会显示你的 115 媒体库。")
+    } actions: {
+      Button("连接媒体源") {
+        showMediaSetup = true
+      }
+      .buttonStyle(.borderedProminent)
+    }
   }
 
   @ViewBuilder

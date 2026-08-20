@@ -244,6 +244,20 @@ final class PlayerModel {
     lastTransferredBytes = 0
     lastBandwidthSampleAt = Date()
 
+    // Containers that AVPlayer commonly rejects should go straight to VLC when
+    // the VLC runtime is actually bundled. MP4/MOV and other Apple-friendly
+    // originals still stay on AVPlayer so HDR, Dolby Vision, AirPlay and PiP
+    // keep using the system playback pipeline.
+    if source.isOriginal, item.prefersVLCForOriginal, VLCAvailability.isAvailable {
+      player.replaceCurrentItem(with: nil)
+      requiresVLC = true
+      isPlaying = false
+      isBuffering = false
+      videoCodec = item.fileExtension.uppercased()
+      hdrFormat = "由 VLC 解码"
+      return
+    }
+
     let asset: AVURLAsset
     if source.headers.isEmpty {
       asset = AVURLAsset(url: source.url)

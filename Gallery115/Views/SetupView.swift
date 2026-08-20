@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct SetupView: View {
+  @Environment(\.dismiss) private var dismiss
   @Environment(AppState.self) private var appState
 
   @State private var serverURL = ""
@@ -80,7 +81,8 @@ struct SetupView: View {
 
           VStack(spacing: 6) {
             Label("服务器地址会自动补齐 /dav/", systemImage: "checkmark.shield.fill")
-            Text("建议在 OpenList 中创建只读用户，仅开启 WebDAV Read 权限。")
+            Text("每台设备可在进入 Cineva 后自行连接自己的 OpenList / AList；建议创建只读 WebDAV 用户。")
+            Text("如果当前服务实际只开放 HTTP，请不要只把地址文字改成 HTTPS。HTTPS 需要服务器或反向代理先配置 TLS 证书。")
           }
           .font(.footnote)
           .foregroundStyle(.secondary)
@@ -167,7 +169,9 @@ struct SetupView: View {
         await appState.api.clearMountCache()
         await MainActor.run {
           appState.finishConfiguration(rootFolderID: configuration.normalizedRootPath)
+          appState.markMediaConnected()
           isConnecting = false
+          dismiss()
         }
       } catch {
         await MainActor.run {

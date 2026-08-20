@@ -12,17 +12,11 @@ struct RootView: View {
   @Environment(AppState.self) private var appState
 
   var body: some View {
-    Group {
-      if !appState.isConfigured {
-        SetupView()
-      } else {
-        ZStack {
-          MainTabView()
-          if appState.faceIDEnabled && !appState.isAppUnlocked {
-            AppLockView()
-              .zIndex(10_000)
-          }
-        }
+    ZStack {
+      MainTabView()
+      if appState.faceIDEnabled && !appState.isAppUnlocked {
+        AppLockView()
+          .zIndex(10_000)
       }
     }
   }
@@ -61,7 +55,7 @@ private struct MainTabView: View {
 
   var body: some View {
     TabView(selection: $selectedTab) {
-      NavigationStack { HomeView(selectedTab: $selectedTab) }
+      NavigationStack { HomeView() }
         .tag(AppTab.home)
         .tabItem { Label("首页", systemImage: "house.fill") }
 
@@ -92,7 +86,6 @@ private struct MainTabView: View {
 private struct HomeView: View {
   @Environment(\.colorScheme) private var colorScheme
   @Environment(AppState.self) private var appState
-  @Binding var selectedTab: AppTab
   @State private var selectedVideo: CloudItem?
   @State private var didCheckConnection = false
 
@@ -117,23 +110,6 @@ private struct HomeView: View {
           }
         }
 
-        libraryActions
-
-        if !appState.libraryStore.favorites.isEmpty {
-          mediaSection(title: "我的收藏", subtitle: "随时回到喜欢的内容") {
-            ScrollView(.horizontal) {
-              LazyHStack(spacing: 11) {
-                ForEach(appState.libraryStore.favorites.prefix(12)) { item in
-                  CompactPosterCard(item: item) {
-                    selectedVideo = item
-                  }
-                }
-              }
-              .padding(.horizontal, 1)
-            }
-            .scrollIndicators(.hidden)
-          }
-        }
 
       }
       .padding(.horizontal, 16)
@@ -146,7 +122,7 @@ private struct HomeView: View {
       PlayerScreen(item: item)
     }
     .task {
-      guard !didCheckConnection else { return }
+      guard !didCheckConnection, appState.isConfigured else { return }
       didCheckConnection = true
       do {
         try await appState.api.validateCredentials()
@@ -170,7 +146,7 @@ private struct HomeView: View {
       Spacer()
       HStack(spacing: 6) {
         Circle().fill(connectionColor).frame(width: 7, height: 7)
-        Text(appState.mediaConnectionState.title)
+        Text(appState.isConfigured ? appState.mediaConnectionState.title : "未连接媒体源")
       }
       .font(.caption.weight(.medium))
       .foregroundStyle(.secondary)
@@ -181,34 +157,9 @@ private struct HomeView: View {
     .padding(.top, 6)
   }
 
-  private var libraryActions: some View {
-    VStack(alignment: .leading, spacing: 12) {
-      Text("媒体库")
-        .font(.title3.bold())
-
-      HStack(spacing: 12) {
-        LibraryActionCard(
-          icon: "rectangle.stack.fill",
-          title: "浏览资料库",
-          subtitle: appState.browserLayout.title,
-          accent: CinevaTheme.accent
-        ) {
-          selectedTab = .library
-        }
-
-        LibraryActionCard(
-          icon: "clock.arrow.circlepath",
-          title: "播放记录",
-          subtitle: "\(appState.libraryStore.recents.count) 个项目",
-          accent: CinevaTheme.accentWarm
-        ) {
-          selectedTab = .recent
-        }
-      }
-    }
-  }
 
   private var connectionColor: Color {
+    guard appState.isConfigured else { return .secondary }
     switch appState.mediaConnectionState {
     case .unknown: return .secondary
     case .connected: return .green
@@ -238,43 +189,6 @@ private struct HomeView: View {
       }
       content()
     }
-  }
-}
-
-private struct LibraryActionCard: View {
-  @Environment(\.colorScheme) private var colorScheme
-  let icon: String
-  let title: String
-  let subtitle: String
-  let accent: Color
-  let action: () -> Void
-
-  var body: some View {
-    Button(action: action) {
-      VStack(alignment: .leading, spacing: 13) {
-        Image(systemName: icon)
-          .font(.title3.weight(.semibold))
-          .foregroundStyle(accent)
-          .frame(width: 38, height: 38)
-          .background(accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-
-        VStack(alignment: .leading, spacing: 3) {
-          Text(title)
-            .font(.subheadline.weight(.semibold))
-            .foregroundStyle(.primary)
-          Text(subtitle)
-            .font(.caption)
-            .foregroundStyle(.secondary)
-        }
-      }
-      .frame(maxWidth: .infinity, alignment: .leading)
-      .padding(14)
-      .background(
-        colorScheme == .dark ? CinevaTheme.darkPanel : Color(uiColor: .secondarySystemGroupedBackground),
-        in: RoundedRectangle(cornerRadius: 18, style: .continuous)
-      )
-    }
-    .buttonStyle(.plain)
   }
 }
 
@@ -314,40 +228,6 @@ private struct ContinueWatchingCard: View {
     let m = (value % 3600) / 60
     let s = value % 60
     return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%02d:%02d", m, s)
-  }
-}
-
-private struct CompactPosterCard: View {
-  let item: CloudItem
-  let action: () -> Void
-
-  private let cardWidth: CGFloat = 150
-
-  var body: some View {
-    Button(action: action) {
-      VStack(alignment: .leading, spacing: 7) {
-        HomeLandscapeArtwork(item: item, width: cardWidth, progress: nil)
-
-        Text(item.name)
-          .font(.subheadline.weight(.semibold))
-          .foregroundStyle(.primary)
-          .lineLimit(1)
-          .frame(width: cardWidth, alignment: .leading)
-
-        HStack(spacing: 5) {
-          if !item.fileExtension.isEmpty {
-            Text(item.fileExtension.uppercased())
-          }
-          if !item.formattedDuration.isEmpty {
-            Text(item.formattedDuration)
-          }
-        }
-        .font(.caption2.weight(.medium))
-        .foregroundStyle(.secondary)
-        .frame(width: cardWidth, alignment: .leading)
-      }
-    }
-    .buttonStyle(.plain)
   }
 }
 

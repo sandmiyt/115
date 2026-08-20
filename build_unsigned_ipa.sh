@@ -1,8 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
+if ! command -v pod >/dev/null 2>&1; then
+  echo "CocoaPods is required because Cineva bundles MobileVLCKit for incompatible original formats."
+  echo "Install CocoaPods first, then run this script again."
+  exit 1
+fi
+
+pod install
+
 xcodebuild \
-  -project Gallery115.xcodeproj \
+  -workspace Gallery115.xcworkspace \
   -scheme Gallery115 \
   -configuration Release \
   -sdk iphoneos \

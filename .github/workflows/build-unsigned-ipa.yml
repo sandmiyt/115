@@ -15,11 +15,16 @@ jobs:
       - name: Select latest Xcode
         run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
 
+      - name: Install CocoaPods dependencies
+        run: |
+          set -euo pipefail
+          pod install
+
       - name: Build iPhone app without signing
         run: |
           set -euo pipefail
           xcodebuild \
-            -project Gallery115.xcodeproj \
+            -workspace Gallery115.xcworkspace \
             -scheme Gallery115 \
             -configuration Release \
             -sdk iphoneos \
