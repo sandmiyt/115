@@ -36,8 +36,12 @@ struct CloudItem: Codable, Hashable, Identifiable {
     return String(format: "%02d:%02d", minutes, seconds)
   }
 
+  var isDiscImage: Bool {
+    ["iso", "img"].contains(fileExtension.lowercased())
+  }
+
   var prefersVLCForOriginal: Bool {
     let ext = fileExtension.lowercased()
-    return ["mkv", "avi", "flv", "rmvb", "wmv", "m2ts", "mts", "ts", "webm"].contains(ext)
+    return ["mkv", "avi", "flv", "rmvb", "wmv", "m2ts", "mts", "ts", "webm", "iso", "img"].contains(ext)
   }
 }

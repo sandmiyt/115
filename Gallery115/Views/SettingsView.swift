@@ -5,6 +5,8 @@ struct SettingsView: View {
   @State private var statusMessage: String?
   @State private var isCheckingConnection = false
   @State private var isChangingFaceID = false
+  @State private var showDisconnectConfirmation = false
+  @State private var showClearRecentsConfirmation = false
 
   var body: some View {
     @Bindable var appState = appState
@@ -31,7 +33,7 @@ struct SettingsView: View {
         }
 
         Button("更换或断开媒体源", role: .destructive) {
-          appState.signOut()
+          showDisconnectConfirmation = true
         }
       }
 
@@ -50,10 +52,22 @@ struct SettingsView: View {
         }
 
         if appState.browserLayout == .grid {
-          Picker("封面列数", selection: $appState.gridColumns) {
-            Text("2 列").tag(2)
-            Text("3 列").tag(3)
-            Text("4 列").tag(4)
+          LabeledContent("封面列数") {
+            Menu {
+              ForEach([2, 3, 4], id: \.self) { count in
+                Button {
+                  setGridColumnsSafely(count)
+                } label: {
+                  if appState.gridColumns == count {
+                    Label("\(count) 列", systemImage: "checkmark")
+                  } else {
+                    Text("\(count) 列")
+                  }
+                }
+              }
+            } label: {
+              Text("\(min(max(appState.gridColumns, 2), 4)) 列")
+            }
           }
         }
 
@@ -127,7 +141,7 @@ struct SettingsView: View {
         }
 
         Button("清除最近播放") {
-          appState.libraryStore.clearRecents()
+          showClearRecentsConfirmation = true
         }
       }
 
@@ -141,11 +155,41 @@ struct SettingsView: View {
               .foregroundStyle(.secondary)
           }
         }
-        LabeledContent("版本", value: "2.0")
+        LabeledContent("版本", value: "2.2.0")
         LabeledContent("挂载协议", value: "WebDAV")
       }
     }
+    .confirmationDialog("断开当前媒体源？", isPresented: $showDisconnectConfirmation, titleVisibility: .visible) {
+      Button("断开媒体源", role: .destructive) {
+        appState.signOut()
+      }
+      Button("取消", role: .cancel) {}
+    } message: {
+      Text("只会移除 Cineva 保存的 WebDAV 登录信息，不会删除 OpenList 或 115 中的文件。")
+    }
+    .confirmationDialog("清除全部最近播放？", isPresented: $showClearRecentsConfirmation, titleVisibility: .visible) {
+      Button("清除播放记录", role: .destructive) {
+        appState.libraryStore.clearRecents()
+      }
+      Button("取消", role: .cancel) {}
+    } message: {
+      Text("只清除 Cineva 本地播放历史，不会删除服务器文件。")
+    }
     .navigationTitle("设置")
+  }
+
+  @MainActor
+  private func setGridColumnsSafely(_ value: Int) {
+    let clamped = min(max(value, 2), 4)
+    guard clamped != appState.gridColumns else { return }
+    Task { @MainActor in
+      await Task.yield()
+      var transaction = Transaction(animation: nil)
+      transaction.disablesAnimations = true
+      withTransaction(transaction) {
+        appState.gridColumns = clamped
+      }
+    }
   }
 
   @ViewBuilder
@@ -170,6 +214,11 @@ struct SettingsView: View {
       }
 
       LabeledContent("读取方式", value: "WebDAV 只读")
+      if configuration.normalizedWebDAVURL?.scheme?.lowercased() == "http" {
+        Label("当前使用 HTTP，账号密码和媒体流未经过 TLS 加密。建议稳定后切换 HTTPS。", systemImage: "exclamationmark.triangle.fill")
+          .font(.caption)
+          .foregroundStyle(.orange)
+      }
       Text("115 Token、刷新、限流与 405 均由 OpenList / AList 服务器端处理；Cineva 不直接访问 115 Open API。")
         .font(.caption)
         .foregroundStyle(.secondary)
@@ -188,11 +237,13 @@ struct SettingsView: View {
         try await appState.api.validateCredentials()
         await MainActor.run {
           statusMessage = "OpenList / AList 连接正常。"
+          appState.markMediaConnected()
           isCheckingConnection = false
         }
       } catch {
         await MainActor.run {
           statusMessage = error.localizedDescription
+          appState.markMediaOffline()
           isCheckingConnection = false
         }
       }

@@ -37,6 +37,10 @@ actor APIClient {
     try await provider.videoSources(for: item)
   }
 
+  func localMetadata(for item: CloudItem) async -> LocalMediaMetadata? {
+    await provider.localMetadata(for: item)
+  }
+
   func updateVideoHistory(pickCode: String, seconds: Int, watchEnd: Bool) async {
     await provider.updateVideoHistory(
       pickCode: pickCode,

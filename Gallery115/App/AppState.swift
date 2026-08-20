@@ -81,6 +81,31 @@ final class AppState {
     }
   }
 
+  enum MediaConnectionState: Equatable {
+    case unknown
+    case connected
+    case cache
+    case offline
+
+    var title: String {
+      switch self {
+      case .unknown: return "OpenList · WebDAV"
+      case .connected: return "OpenList · 已连接"
+      case .cache: return "OpenList · 缓存"
+      case .offline: return "OpenList · 离线"
+      }
+    }
+
+    var systemImage: String {
+      switch self {
+      case .unknown: return "externaldrive.connected.to.line.below"
+      case .connected: return "checkmark.circle.fill"
+      case .cache: return "externaldrive.badge.checkmark"
+      case .offline: return "wifi.slash"
+      }
+    }
+  }
+
   let api = APIClient()
   let thumbnailService = ThumbnailService()
   let libraryStore = LibraryStore()
@@ -90,12 +115,29 @@ final class AppState {
   private(set) var isAppUnlocked: Bool
   private var biometricAuthenticationInProgress = false
 
+  private var storedGridColumns: Int
   var gridColumns: Int {
-    didSet {
-      gridColumns = min(max(gridColumns, 2), 4)
-      UserDefaults.standard.set(gridColumns, forKey: Keys.gridColumns)
+    get { storedGridColumns }
+    set {
+      let clamped = min(max(newValue, 2), 4)
+      guard storedGridColumns != clamped else { return }
+      storedGridColumns = clamped
+      UserDefaults.standard.set(clamped, forKey: Keys.gridColumns)
     }
   }
+
+  var preferredPlaybackRate: Float {
+    didSet {
+      let safeRate = min(max(preferredPlaybackRate, 0.5), 2.0)
+      if preferredPlaybackRate != safeRate {
+        preferredPlaybackRate = safeRate
+        return
+      }
+      UserDefaults.standard.set(Double(preferredPlaybackRate), forKey: Keys.preferredPlaybackRate)
+    }
+  }
+
+  var mediaConnectionState: MediaConnectionState = .unknown
 
   var artworkMode: ArtworkMode {
     didSet { UserDefaults.standard.set(artworkMode.rawValue, forKey: Keys.artworkMode) }
@@ -140,10 +182,10 @@ final class AppState {
     let defaults = UserDefaults.standard
     let storedColumns = defaults.object(forKey: Keys.gridColumns) as? Int ?? 3
     if defaults.bool(forKey: Keys.compactArtworkMigration) == false {
-      gridColumns = storedColumns == 2 ? 3 : min(max(storedColumns, 2), 4)
+      storedGridColumns = storedColumns == 2 ? 3 : min(max(storedColumns, 2), 4)
       defaults.set(true, forKey: Keys.compactArtworkMigration)
     } else {
-      gridColumns = min(max(storedColumns, 2), 4)
+      storedGridColumns = min(max(storedColumns, 2), 4)
     }
     artworkMode =
       ArtworkMode(rawValue: defaults.string(forKey: Keys.artworkMode) ?? "") ?? .fit
@@ -160,6 +202,8 @@ final class AppState {
     faceIDEnabled = defaults.bool(forKey: Keys.faceIDEnabled)
     playerGesturesEnabled = defaults.object(forKey: Keys.playerGesturesEnabled) as? Bool ?? true
     autoPlayNextEpisode = defaults.object(forKey: Keys.autoPlayNextEpisode) as? Bool ?? true
+    let storedRate = defaults.object(forKey: Keys.preferredPlaybackRate) as? Double ?? 1.0
+    preferredPlaybackRate = Float(min(max(storedRate, 0.5), 2.0))
     let storedSeek = defaults.object(forKey: Keys.doubleTapSeekSeconds) as? Int ?? 15
     doubleTapSeekSeconds = [10, 15, 30].contains(storedSeek) ? storedSeek : 15
     isAppUnlocked = !defaults.bool(forKey: Keys.faceIDEnabled)
@@ -213,6 +257,20 @@ final class AppState {
       isAppUnlocked = true
     }
     return success
+  }
+
+  func markMediaConnected() {
+    mediaConnectionState = .connected
+  }
+
+  func markMediaUsingCache() {
+    if mediaConnectionState != .offline {
+      mediaConnectionState = .cache
+    }
+  }
+
+  func markMediaOffline() {
+    mediaConnectionState = .offline
   }
 
   var canUseBiometrics: Bool {
@@ -271,6 +329,7 @@ final class AppState {
     static let gridColumns = "gallery115.gridColumns"
     static let artworkMode = "gallery115.artworkMode"
     static let browserLayout = "gallery115.browserLayout"
+    static let preferredPlaybackRate = "cineva.player.playbackRate.v1"
     static let compactArtworkMigration = "cineva.compactArtworkMigration.v1"
     static let defaultQuality = "gallery115.defaultQuality"
     static let colorScheme = "gallery115.colorScheme"

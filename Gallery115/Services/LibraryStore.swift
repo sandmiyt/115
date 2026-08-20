@@ -28,15 +28,26 @@ final class LibraryStore {
     persistFavorites()
   }
 
-  func recordPlayback(_ item: CloudItem, position: Double) {
+  func recordPlayback(_ item: CloudItem, position: Double, duration: Double? = nil) {
+    let normalizedDuration: Double? = {
+      guard let duration, duration.isFinite, duration > 0 else { return nil }
+      return duration
+    }()
+
     if let index = recents.firstIndex(where: { $0.item.id == item.id }) {
       recents[index].lastPosition = max(0, position)
       recents[index].lastPlayedAt = Date()
+      if let normalizedDuration { recents[index].knownDuration = normalizedDuration }
       let entry = recents.remove(at: index)
       recents.insert(entry, at: 0)
     } else {
       recents.insert(
-        PlaybackEntry(item: item, lastPosition: max(0, position), lastPlayedAt: Date()),
+        PlaybackEntry(
+          item: item,
+          lastPosition: max(0, position),
+          lastPlayedAt: Date(),
+          knownDuration: normalizedDuration
+        ),
         at: 0
       )
     }
@@ -48,6 +59,10 @@ final class LibraryStore {
 
   func resumePosition(for item: CloudItem) -> Double {
     recents.first(where: { $0.item.id == item.id })?.lastPosition ?? 0
+  }
+
+  func knownDuration(for item: CloudItem) -> Double {
+    recents.first(where: { $0.item.id == item.id })?.effectiveDuration ?? max(item.duration, 0)
   }
 
   func clearRecents() {

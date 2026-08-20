@@ -1,26 +1,54 @@
+import Foundation
+import Observation
 import SwiftUI
 
 #if canImport(MobileVLCKit)
   import MobileVLCKit
   import UIKit
 
-  struct VLCPlayerView: UIViewRepresentable {
-    let source: VideoSource
+  @MainActor
+  @Observable
+  final class VLCPlaybackController {
+    private(set) var currentTime: Double = 0
+    private(set) var duration: Double = 0
+    private(set) var isPlaying = false
+    private(set) var isBuffering = false
+    private(set) var didReachEnd = false
+    private(set) var networkMbps: Double = 0
+    private(set) var transferredMegabytes: Double = 0
+    private(set) var volume: Float = 1
 
-    func makeCoordinator() -> Coordinator {
-      Coordinator()
-    }
+    let player = VLCMediaPlayer()
+    private var pollTimer: Timer?
+    private var item: CloudItem?
+    private var libraryStore: LibraryStore?
+    private var lastSavedSecond = -1
+    private var lastState: VLCMediaPlayerState = .nothingSpecial
+    private var maxObservedTime: Double = 0
 
-    func makeUIView(context: Context) -> UIView {
-      let view = UIView()
-      view.backgroundColor = .black
-      let mediaPlayer = VLCMediaPlayer()
-      mediaPlayer.drawable = view
+    func configure(
+      source: VideoSource,
+      item: CloudItem,
+      libraryStore: LibraryStore,
+      playbackRate: Float
+    ) {
+      stop(saveProgress: false)
+      self.item = item
+      self.libraryStore = libraryStore
+      didReachEnd = false
+      currentTime = 0
+      duration = max(item.duration, libraryStore.knownDuration(for: item))
+      networkMbps = 0
+      transferredMegabytes = 0
+      maxObservedTime = 0
+
       let media = VLCMedia(url: source.url)
-
+      let cacheMilliseconds = item.isDiscImage ? 5000 : 1800
       var options: [String: Any] = [
         "http-user-agent": APIClient.userAgent,
-        "network-caching": 1800,
+        "network-caching": cacheMilliseconds,
+        "disc-caching": cacheMilliseconds,
+        "file-caching": cacheMilliseconds,
       ]
       if let authorization = source.headers["Authorization"],
         authorization.hasPrefix("Basic "),
@@ -32,30 +60,188 @@ import SwiftUI
         options["http-pwd"] = String(pair[pair.index(after: separator)...])
       }
       media.addOptions(options)
-      mediaPlayer.media = media
-      context.coordinator.player = mediaPlayer
-      mediaPlayer.play()
+      player.media = media
+      player.rate = min(max(playbackRate, 0.5), 2.0)
+      player.play()
+      isPlaying = true
+      isBuffering = true
+
+      let resume = libraryStore.resumePosition(for: item)
+      if resume > 2 {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+          guard let self else { return }
+          self.seek(to: resume)
+        }
+      }
+      startPolling()
+    }
+
+    func attachDrawable(_ view: UIView) {
+      player.drawable = view
+    }
+
+    func detachDrawable(_ view: UIView) {
+      if let drawable = player.drawable as? UIView, drawable === view {
+        player.drawable = nil
+      }
+    }
+
+    func pause() {
+      player.pause()
+      isPlaying = false
+      isBuffering = false
+      saveProgress(force: true)
+    }
+
+    func resume() {
+      didReachEnd = false
+      player.play()
+      isPlaying = true
+    }
+
+    func togglePlayback() {
+      isPlaying ? pause() : resume()
+    }
+
+    func seek(to seconds: Double) {
+      let upper = duration > 0 ? duration : max(seconds, currentTime + 60)
+      let target = min(max(seconds, 0), upper)
+      currentTime = target
+      player.time = VLCTime(int: Int32(min(target * 1000, Double(Int32.max))))
+    }
+
+    func seekBy(_ delta: Double) {
+      seek(to: currentTime + delta)
+    }
+
+    func setPlaybackRate(_ value: Float) {
+      player.rate = min(max(value, 0.5), 2.0)
+    }
+
+    func setVolume(_ value: Float) {
+      let clamped = min(max(value, 0), 1)
+      volume = clamped
+      player.audio.volume = Int32((clamped * 100).rounded())
+    }
+
+    func replay() {
+      didReachEnd = false
+      seek(to: 0)
+      resume()
+    }
+
+    func stop(saveProgress: Bool = true) {
+      if saveProgress { self.saveProgress(force: true) }
+      pollTimer?.invalidate()
+      pollTimer = nil
+      player.stop()
+      player.drawable = nil
+      isPlaying = false
+      isBuffering = false
+      lastState = .nothingSpecial
+    }
+
+    private func startPolling() {
+      pollTimer?.invalidate()
+      pollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+        Task { @MainActor [weak self] in
+          self?.poll()
+        }
+      }
+      pollTimer?.tolerance = 0.08
+    }
+
+    private func poll() {
+      let state = player.state
+      let milliseconds = max(player.time.intValue, 0)
+      currentTime = Double(milliseconds) / 1000
+      maxObservedTime = max(maxObservedTime, currentTime)
+
+      if let mediaLength = player.media?.length.intValue, mediaLength > 0 {
+        duration = Double(mediaLength) / 1000
+      }
+
+      isPlaying = state == .playing
+      isBuffering = state == .opening
+      volume = Float(player.audio.volume) / 100
+
+      if let media = player.media {
+        let stats = media.statistics
+        let bitrate = Double(stats.inputBitrate)
+        networkMbps = bitrate > 0 ? bitrate * 8 / 1_000_000 : 0
+        transferredMegabytes = Double(stats.readBytes) / 1_048_576
+      }
+
+      if state == .stopped, lastState == .playing, duration > 0, maxObservedTime >= duration * 0.92 {
+        didReachEnd = true
+        saveProgress(force: true)
+      }
+      lastState = state
+      saveProgress(force: false)
+    }
+
+    private func saveProgress(force: Bool) {
+      guard let item, let libraryStore else { return }
+      let second = max(0, Int(currentTime.rounded(.down)))
+      if force || second >= lastSavedSecond + 5 {
+        lastSavedSecond = second
+        libraryStore.recordPlayback(item, position: currentTime, duration: duration)
+      }
+    }
+  }
+
+  struct VLCPlayerView: UIViewRepresentable {
+    let controller: VLCPlaybackController
+
+    func makeUIView(context: Context) -> UIView {
+      let view = UIView()
+      view.backgroundColor = .black
+      controller.attachDrawable(view)
       return view
     }
 
-    func updateUIView(_ uiView: UIView, context: Context) {}
-
-    static func dismantleUIView(_ uiView: UIView, coordinator: Coordinator) {
-      coordinator.player?.stop()
-      coordinator.player = nil
+    func updateUIView(_ uiView: UIView, context: Context) {
+      controller.attachDrawable(uiView)
     }
 
-    final class Coordinator {
-      var player: VLCMediaPlayer?
-    }
+    static func dismantleUIView(_ uiView: UIView, coordinator: Void) {}
   }
 
   enum VLCAvailability {
     static let isAvailable = true
   }
 #else
+  @MainActor
+  @Observable
+  final class VLCPlaybackController {
+    private(set) var currentTime: Double = 0
+    private(set) var duration: Double = 0
+    private(set) var isPlaying = false
+    private(set) var isBuffering = false
+    private(set) var didReachEnd = false
+    private(set) var networkMbps: Double = 0
+    private(set) var transferredMegabytes: Double = 0
+    private(set) var volume: Float = 1
+
+    func configure(
+      source: VideoSource,
+      item: CloudItem,
+      libraryStore: LibraryStore,
+      playbackRate: Float
+    ) {}
+    func pause() {}
+    func resume() {}
+    func togglePlayback() {}
+    func seek(to seconds: Double) {}
+    func seekBy(_ delta: Double) {}
+    func setPlaybackRate(_ value: Float) {}
+    func setVolume(_ value: Float) {}
+    func replay() {}
+    func stop(saveProgress: Bool = true) {}
+  }
+
   struct VLCPlayerView: View {
-    let source: VideoSource
+    let controller: VLCPlaybackController
 
     var body: some View {
       ContentUnavailableView(

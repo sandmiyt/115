@@ -28,6 +28,8 @@ struct FolderView: View {
   @State private var errorMessage: String?
   @State private var transientMessage: String?
   @State private var query = ""
+  @State private var searchItems: [CloudItem]?
+  @State private var didScheduleBackgroundRefresh = false
   @State private var sortMode: SortMode = .updated
   @State private var selectedVideo: CloudItem?
   @State private var nextOffset = 0
@@ -60,7 +62,8 @@ struct FolderView: View {
     .navigationDestination(for: CloudItem.self) { item in
       FolderView(folderID: item.id, title: item.name)
     }
-    .searchable(text: $query, prompt: "搜索当前已加载内容")
+    .searchable(text: $query, prompt: "搜索当前目录")
+    .task(id: query) { await updateSearchResults() }
     .toolbar {
       ToolbarItemGroup(placement: .topBarTrailing) {
         Button {
@@ -81,10 +84,16 @@ struct FolderView: View {
 
           if appState.browserLayout == .grid {
             Section("封面墙") {
-              Picker("每行", selection: gridColumnsBinding) {
-                Text("2 列").tag(2)
-                Text("3 列").tag(3)
-                Text("4 列").tag(4)
+              ForEach([2, 3, 4], id: \.self) { count in
+                Button {
+                  setGridColumnsSafely(count)
+                } label: {
+                  if safeGridColumns == count {
+                    Label("\(count) 列", systemImage: "checkmark")
+                  } else {
+                    Text("\(count) 列")
+                  }
+                }
               }
             }
           }
@@ -127,13 +136,17 @@ struct FolderView: View {
                 FolderCard(item: item)
               }
               .buttonStyle(.plain)
-              .onAppear { loadMoreIfNeeded(around: item) }
             } else {
               VideoCard(item: item) {
                 selectedVideo = item
               }
-              .onAppear { loadMoreIfNeeded(around: item) }
             }
+          }
+
+          if query.isEmpty, hasMore {
+            Color.clear
+              .frame(height: 1)
+              .onAppear { Task { await loadNextPage() } }
           }
 
           if isLoadingMore {
@@ -141,6 +154,10 @@ struct FolderView: View {
               .frame(maxWidth: .infinity)
               .padding(.vertical, 18)
           }
+        }
+        .id("grid-\(folderID)-\(safeGridColumns)")
+        .transaction { transaction in
+          transaction.animation = nil
         }
         .padding(.horizontal, 10)
         .padding(.top, 10)
@@ -155,7 +172,6 @@ struct FolderView: View {
             NavigationLink(value: item) {
               FolderListRow(item: item)
             }
-            .onAppear { loadMoreIfNeeded(around: item) }
           } else {
             Button {
               selectedVideo = item
@@ -163,8 +179,14 @@ struct FolderView: View {
               VideoListRow(item: item)
             }
             .buttonStyle(.plain)
-            .onAppear { loadMoreIfNeeded(around: item) }
           }
+        }
+
+        if query.isEmpty, hasMore {
+          Color.clear
+            .frame(height: 1)
+            .listRowSeparator(.hidden)
+            .onAppear { Task { await loadNextPage() } }
         }
 
         if isLoadingMore {
@@ -191,22 +213,36 @@ struct FolderView: View {
     }
   }
 
-  private var gridColumnsBinding: Binding<Int> {
-    Binding(
-      get: { appState.gridColumns },
-      set: { appState.gridColumns = $0 }
-    )
+  private var safeGridColumns: Int {
+    min(max(appState.gridColumns, 2), 4)
+  }
+
+  @MainActor
+  private func setGridColumnsSafely(_ value: Int) {
+    let clamped = min(max(value, 2), 4)
+    guard clamped != safeGridColumns else { return }
+    Task { @MainActor in
+      // Let the Menu finish its own dismissal transaction before rebuilding
+      // LazyVGrid with a different column count. This avoids the SwiftUI
+      // re-entrant layout crash seen on physical devices.
+      await Task.yield()
+      var transaction = Transaction(animation: nil)
+      transaction.disablesAnimations = true
+      withTransaction(transaction) {
+        appState.gridColumns = clamped
+      }
+    }
   }
 
   private var columns: [GridItem] {
     Array(
-      repeating: GridItem(.flexible(), spacing: 9, alignment: .top),
-      count: appState.gridColumns
+      repeating: GridItem(.flexible(minimum: 0), spacing: 9, alignment: .top),
+      count: safeGridColumns
     )
   }
 
   private var filteredItems: [CloudItem] {
-    var output = items
+    var output = searchItems ?? items
     let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
     if !trimmed.isEmpty {
       output = output.filter { $0.name.localizedCaseInsensitiveContains(trimmed) }
@@ -225,16 +261,10 @@ struct FolderView: View {
   }
 
   private var loadedVideoPlaylist: [CloudItem] {
-    items.filter { !$0.isDirectory && $0.isVideo }
+    (searchItems ?? items).filter { !$0.isDirectory && $0.isVideo }
       .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
   }
 
-  private func loadMoreIfNeeded(around item: CloudItem) {
-    guard query.isEmpty, hasMore, !isLoadingMore else { return }
-    let triggerIDs = Set(items.suffix(8).map(\.id))
-    guard triggerIDs.contains(item.id) else { return }
-    Task { await loadNextPage() }
-  }
 
   @MainActor
   private func loadFirstPage(forceRefresh: Bool) async {
@@ -250,16 +280,68 @@ struct FolderView: View {
         forceRefresh: forceRefresh
       )
       items = page.items
+      searchItems = nil
       nextOffset = page.limit
       hasMore = page.hasMore
       errorMessage = nil
-      if forceRefresh, page.servedFromCache {
-        transientMessage = "媒体服务器暂时不可用，已继续使用本地资料库缓存。"
+      if page.servedFromCache {
+        appState.markMediaUsingCache()
+        transientMessage = forceRefresh ? "媒体服务器暂时不可用，已继续使用本地资料库缓存。" : nil
+        if !forceRefresh, !didScheduleBackgroundRefresh {
+          didScheduleBackgroundRefresh = true
+          Task { await refreshFirstPageSilently() }
+        }
       } else {
+        appState.markMediaConnected()
         transientMessage = nil
+        didScheduleBackgroundRefresh = true
       }
     } catch {
+      appState.markMediaOffline()
       errorMessage = error.localizedDescription
+    }
+  }
+
+  @MainActor
+  private func refreshFirstPageSilently() async {
+    do {
+      let page = try await appState.api.listFolderPage(
+        id: folderID,
+        offset: 0,
+        limit: pageSize,
+        forceRefresh: true
+      )
+      items = page.items
+      nextOffset = page.limit
+      hasMore = page.hasMore
+      if page.servedFromCache {
+        appState.markMediaUsingCache()
+      } else {
+        appState.markMediaConnected()
+      }
+    } catch {
+      // Keep the already rendered cache; a background refresh must never blank the directory.
+      appState.markMediaUsingCache()
+    }
+  }
+
+  @MainActor
+  private func updateSearchResults() async {
+    let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else {
+      searchItems = nil
+      return
+    }
+
+    try? await Task.sleep(for: .milliseconds(180))
+    guard !Task.isCancelled else { return }
+    do {
+      let all = try await appState.api.listFolder(id: folderID)
+      guard !Task.isCancelled else { return }
+      searchItems = all
+    } catch {
+      // Search the loaded page rather than failing the whole screen.
+      searchItems = items
     }
   }
 
@@ -282,13 +364,18 @@ struct FolderView: View {
       nextOffset += page.limit
       hasMore = page.hasMore
       if page.servedFromCache {
+        appState.markMediaUsingCache()
         transientMessage = "已从本地资料库缓存继续加载。"
+      } else {
+        appState.markMediaConnected()
       }
     } catch let error as CloudProviderError {
       // Keep the mounted directory visible. The user can continue browsing what has
       // already been indexed instead of losing the whole screen to a temporary 405.
+      appState.markMediaOffline()
       transientMessage = error.localizedDescription
     } catch {
+      appState.markMediaOffline()
       transientMessage = "网络暂时不可用，已保留当前资料库。"
     }
   }

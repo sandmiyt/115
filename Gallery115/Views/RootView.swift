@@ -15,10 +15,14 @@ struct RootView: View {
     Group {
       if !appState.isConfigured {
         SetupView()
-      } else if appState.faceIDEnabled && !appState.isAppUnlocked {
-        AppLockView()
       } else {
-        MainTabView()
+        ZStack {
+          MainTabView()
+          if appState.faceIDEnabled && !appState.isAppUnlocked {
+            AppLockView()
+              .zIndex(10_000)
+          }
+        }
       }
     }
   }
@@ -90,6 +94,7 @@ private struct HomeView: View {
   @Environment(AppState.self) private var appState
   @Binding var selectedTab: AppTab
   @State private var selectedVideo: CloudItem?
+  @State private var didCheckConnection = false
 
   var body: some View {
     ScrollView {
@@ -140,6 +145,16 @@ private struct HomeView: View {
     .fullScreenCover(item: $selectedVideo) { item in
       PlayerScreen(item: item)
     }
+    .task {
+      guard !didCheckConnection else { return }
+      didCheckConnection = true
+      do {
+        try await appState.api.validateCredentials()
+        appState.markMediaConnected()
+      } catch {
+        appState.markMediaOffline()
+      }
+    }
   }
 
   private var header: some View {
@@ -154,8 +169,8 @@ private struct HomeView: View {
       }
       Spacer()
       HStack(spacing: 6) {
-        Circle().fill(.green).frame(width: 7, height: 7)
-        Text("OpenList · WebDAV")
+        Circle().fill(connectionColor).frame(width: 7, height: 7)
+        Text(appState.mediaConnectionState.title)
       }
       .font(.caption.weight(.medium))
       .foregroundStyle(.secondary)
@@ -190,6 +205,15 @@ private struct HomeView: View {
           selectedTab = .recent
         }
       }
+    }
+  }
+
+  private var connectionColor: Color {
+    switch appState.mediaConnectionState {
+    case .unknown: return .secondary
+    case .connected: return .green
+    case .cache: return .orange
+    case .offline: return .red
     }
   }
 
@@ -261,8 +285,8 @@ private struct ContinueWatchingCard: View {
   private let cardWidth: CGFloat = 150
 
   private var progress: Double {
-    guard entry.item.duration > 0 else { return 0 }
-    return min(max(entry.lastPosition / entry.item.duration, 0), 1)
+    guard entry.effectiveDuration > 0 else { return 0 }
+    return min(max(entry.lastPosition / entry.effectiveDuration, 0), 1)
   }
 
   var body: some View {

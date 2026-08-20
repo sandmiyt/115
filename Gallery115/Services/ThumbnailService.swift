@@ -10,6 +10,7 @@ actor ThumbnailService {
   private let directory: URL
   private var generatorBusy = false
   private var generatorWaiters: [CheckedContinuation<Void, Never>] = []
+  private let maximumCacheBytes: Int64 = 1_073_741_824
 
   init() {
     let base = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first!
@@ -20,12 +21,35 @@ actor ThumbnailService {
   func generatedThumbnail(for item: CloudItem, api: APIClient) async -> UIImage? {
     guard item.isVideo else { return nil }
     let fileURL = cachedFileURL(for: item)
-    if let cached = loadImage(at: fileURL) { return cached }
+    if let cached = loadImage(at: fileURL) {
+      touch(fileURL)
+      return cached
+    }
+    guard !Task.isCancelled else { return nil }
 
+    if let metadata = await api.localMetadata(for: item),
+      let posterData = metadata.posterData,
+      let poster = UIImage(data: posterData)
+    {
+      guard !Task.isCancelled else { return nil }
+      storeGeneratedThumbnail(poster, for: item)
+      return poster
+    }
+
+    // Disc images are handled by the VLC/original-disc path. Asking AVFoundation
+    // to probe a remote ISO/IMG just to synthesize a thumbnail can trigger large
+    // random reads and offers no useful fallback. Local poster artwork above still works.
+    if item.isDiscImage { return nil }
+
+    guard !Task.isCancelled else { return nil }
     await acquireGenerator()
     defer { releaseGenerator() }
 
-    if let cached = loadImage(at: fileURL) { return cached }
+    if let cached = loadImage(at: fileURL) {
+      touch(fileURL)
+      return cached
+    }
+    guard !Task.isCancelled else { return nil }
 
     guard let source = try? await api.videoSources(for: item).first else { return nil }
     let asset: AVURLAsset
@@ -38,6 +62,7 @@ actor ThumbnailService {
       )
     }
 
+    guard !Task.isCancelled else { return nil }
     guard (try? await asset.load(.isPlayable)) == true else { return nil }
     let loadedDuration = try? await asset.load(.duration)
     let duration = loadedDuration?.seconds ?? 0
@@ -61,6 +86,7 @@ actor ThumbnailService {
       return nil
     }
 
+    guard !Task.isCancelled else { return nil }
     let image = UIImage(cgImage: cgImage)
     storeGeneratedThumbnail(image, for: item)
     return image
@@ -68,7 +94,22 @@ actor ThumbnailService {
 
   func storeGeneratedThumbnail(_ image: UIImage, for item: CloudItem) {
     guard let data = image.jpegData(compressionQuality: 0.80) else { return }
-    try? data.write(to: cachedFileURL(for: item), options: .atomic)
+    let url = cachedFileURL(for: item)
+    try? data.write(to: url, options: .atomic)
+    touch(url)
+    trimCacheIfNeeded()
+  }
+
+  func cacheUsageBytes() -> Int64 {
+    guard let files = try? fileManager.contentsOfDirectory(
+      at: directory,
+      includingPropertiesForKeys: [.fileSizeKey],
+      options: [.skipsHiddenFiles]
+    ) else { return 0 }
+    return files.reduce(0) { partial, url in
+      let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+      return partial + Int64(size)
+    }
   }
 
   func clearCache() {
@@ -103,6 +144,36 @@ actor ThumbnailService {
     } else {
       let next = generatorWaiters.removeFirst()
       next.resume()
+    }
+  }
+
+  private func touch(_ url: URL) {
+    try? fileManager.setAttributes([.modificationDate: Date()], ofItemAtPath: url.path)
+  }
+
+  private func trimCacheIfNeeded() {
+    guard let files = try? fileManager.contentsOfDirectory(
+      at: directory,
+      includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
+      options: [.skipsHiddenFiles]
+    ) else { return }
+
+    var entries: [(url: URL, size: Int64, date: Date)] = files.map { url in
+      let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+      return (
+        url,
+        Int64(values?.fileSize ?? 0),
+        values?.contentModificationDate ?? .distantPast
+      )
+    }
+    var total = entries.reduce(Int64(0)) { $0 + $1.size }
+    guard total > maximumCacheBytes else { return }
+
+    entries.sort { $0.date < $1.date }
+    let target = Int64(Double(maximumCacheBytes) * 0.82)
+    for entry in entries where total > target {
+      try? fileManager.removeItem(at: entry.url)
+      total -= entry.size
     }
   }
 

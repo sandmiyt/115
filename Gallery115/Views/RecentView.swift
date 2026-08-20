@@ -3,6 +3,7 @@ import SwiftUI
 struct RecentView: View {
   @Environment(AppState.self) private var appState
   @State private var selectedVideo: CloudItem?
+  @State private var showClearConfirmation = false
 
   var body: some View {
     Group {
@@ -55,7 +56,7 @@ struct RecentView: View {
         ToolbarItem(placement: .topBarTrailing) {
           Menu {
             Button("清空播放记录", role: .destructive) {
-              appState.libraryStore.clearRecents()
+              showClearConfirmation = true
             }
           } label: {
             Image(systemName: "ellipsis.circle")
@@ -64,6 +65,14 @@ struct RecentView: View {
       }
     }
     .fullScreenCover(item: $selectedVideo) { PlayerScreen(item: $0) }
+    .confirmationDialog("清空全部播放记录？", isPresented: $showClearConfirmation, titleVisibility: .visible) {
+      Button("清空播放记录", role: .destructive) {
+        appState.libraryStore.clearRecents()
+      }
+      Button("取消", role: .cancel) {}
+    } message: {
+      Text("此操作只清除 Cineva 本地播放历史，不会删除服务器文件。")
+    }
   }
 
   private func formatTime(_ seconds: Double) -> String {
@@ -81,8 +90,8 @@ private struct RecentThumbnail: View {
   let entry: PlaybackEntry
 
   private var progress: Double {
-    guard entry.item.duration > 0 else { return 0 }
-    return min(max(entry.lastPosition / entry.item.duration, 0), 1)
+    guard entry.effectiveDuration > 0 else { return 0 }
+    return min(max(entry.lastPosition / entry.effectiveDuration, 0), 1)
   }
 
   var body: some View {

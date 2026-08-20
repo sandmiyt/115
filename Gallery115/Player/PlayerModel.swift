@@ -1,7 +1,9 @@
 import AVFoundation
 import CoreGraphics
+import CoreMedia
 import Foundation
 import Observation
+import UIKit
 
 struct PlayerMediaOption: Identifiable {
   let id: String
@@ -26,6 +28,12 @@ final class PlayerModel {
   private(set) var subtitleOptions: [PlayerMediaOption] = []
   private(set) var selectedAudioOptionID: String?
   private(set) var selectedSubtitleOptionID: String?
+  private(set) var networkMbps: Double = 0
+  private(set) var transferredMegabytes: Double = 0
+  private(set) var requiresVLC = false
+  private(set) var videoCodec = "读取中"
+  private(set) var hdrFormat = "SDR"
+  private(set) var nominalFrameRate: Float = 0
 
   var errorMessage: String?
   var didFallbackFromOriginal = false
@@ -41,9 +49,13 @@ final class PlayerModel {
   nonisolated(unsafe) private var timeObserver: Any?
   nonisolated(unsafe) private var failureObserver: NSObjectProtocol?
   nonisolated(unsafe) private var endObserver: NSObjectProtocol?
+  nonisolated(unsafe) private var interruptionObserver: NSObjectProtocol?
+  nonisolated(unsafe) private var routeChangeObserver: NSObjectProtocol?
   private var lastSavedSecond = -1
   private var lastRemoteHistorySecond = -60
   private var isFallingBack = false
+  private var lastTransferredBytes: Int64 = 0
+  private var lastBandwidthSampleAt = Date()
 
   init(
     item: CloudItem, api: APIClient, libraryStore: LibraryStore,
@@ -53,7 +65,11 @@ final class PlayerModel {
     self.api = api
     self.libraryStore = libraryStore
     self.defaultQuality = defaultQuality
-    self.duration = max(item.duration, 0)
+    self.duration = max(item.duration, libraryStore.knownDuration(for: item))
+    player.automaticallyWaitsToMinimizeStalling = true
+    player.allowsExternalPlayback = true
+    configureAudioSession()
+    installAudioSessionObservers()
   }
 
   deinit {
@@ -66,10 +82,17 @@ final class PlayerModel {
     if let endObserver {
       NotificationCenter.default.removeObserver(endObserver)
     }
+    if let interruptionObserver {
+      NotificationCenter.default.removeObserver(interruptionObserver)
+    }
+    if let routeChangeObserver {
+      NotificationCenter.default.removeObserver(routeChangeObserver)
+    }
   }
 
   func prepareAndPlay() async {
     guard !isPreparing else { return }
+    activateAudioSession()
     isPreparing = true
     didReachEnd = false
     defer { isPreparing = false }
@@ -84,7 +107,7 @@ final class PlayerModel {
       let preferred: VideoSource?
       switch defaultQuality {
       case .highestTranscode:
-        preferred = bestTranscode ?? sources.first
+        preferred = bestTranscode ?? original ?? sources.first
       case .original:
         preferred = original ?? bestTranscode ?? sources.first
       }
@@ -111,6 +134,7 @@ final class PlayerModel {
 
   func resume() {
     didReachEnd = false
+    activateAudioSession()
     player.play()
     isPlaying = true
     isBuffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
@@ -146,7 +170,7 @@ final class PlayerModel {
   }
 
   func setPlaybackRate(_ rate: Float) {
-    let safeRate = min(max(rate, 0.25), 3.0)
+    let safeRate = min(max(rate, 0.5), 2.0)
     player.defaultRate = safeRate
     if player.timeControlStatus == .playing {
       player.rate = safeRate
@@ -195,18 +219,30 @@ final class PlayerModel {
     return min(max(bufferedUntil / duration, 0), 1)
   }
 
+  var bufferedDuration: Double {
+    max(bufferedUntil - currentTime, 0)
+  }
+
   private func play(_ source: VideoSource, allowFallback: Bool) async {
     selectedSource = source
     errorMessage = nil
     didReachEnd = false
     isBuffering = true
+    requiresVLC = false
     videoDisplaySize = nil
+    videoCodec = "读取中"
+    hdrFormat = "SDR"
+    nominalFrameRate = 0
     audioOptions = []
     subtitleOptions = []
     audioGroup = nil
     subtitleGroup = nil
     selectedAudioOptionID = nil
     selectedSubtitleOptionID = nil
+    networkMbps = 0
+    transferredMegabytes = 0
+    lastTransferredBytes = 0
+    lastBandwidthSampleAt = Date()
 
     let asset: AVURLAsset
     if source.headers.isEmpty {
@@ -223,24 +259,45 @@ final class PlayerModel {
       if !playable {
         throw NSError(
           domain: "Gallery115.Player", code: -1,
-          userInfo: [NSLocalizedDescriptionKey: "当前原画编码或地址无法由系统播放器打开。"])
+          userInfo: [NSLocalizedDescriptionKey: "当前原画编码或容器无法由系统播放器直接打开。"])
       }
       let loadedDuration = try? await asset.load(.duration)
       if let loadedDuration, loadedDuration.seconds.isFinite, loadedDuration.seconds > 0 {
         duration = loadedDuration.seconds
       }
-      videoDisplaySize = await detectVideoDisplaySize(asset)
+      let characteristics = await detectVideoCharacteristics(asset)
+      videoDisplaySize = characteristics.size
+      videoCodec = characteristics.codec
+      hdrFormat = characteristics.hdr
+      nominalFrameRate = characteristics.frameRate
     } catch {
+      // Direct-play-first: preserve Apple's native HDR/Dolby Vision pipeline whenever
+      // AVPlayer can open the original. VLC is only used after the system player has
+      // actually rejected the original container/codec.
+      if source.isOriginal, VLCAvailability.isAvailable {
+        player.replaceCurrentItem(with: nil)
+        requiresVLC = true
+        isPlaying = false
+        isBuffering = false
+        videoCodec = item.fileExtension.uppercased()
+        hdrFormat = "由 VLC 解码"
+        errorMessage = nil
+        return
+      }
       if source.isOriginal, allowFallback, let fallback = bestTranscode {
         didFallbackFromOriginal = true
         await play(fallback, allowFallback: false)
         return
       }
       errorMessage = error.localizedDescription
+      isBuffering = false
       return
     }
 
     let playerItem = AVPlayerItem(asset: asset)
+    // Give remote WebDAV playback a modest forward buffer without capping bitrate.
+    // Original quality remains untouched; AVPlayer still chooses the native decode path.
+    playerItem.preferredForwardBufferDuration = 20
     installItemObservers(for: playerItem)
     player.replaceCurrentItem(with: playerItem)
 
@@ -255,21 +312,83 @@ final class PlayerModel {
     }
     player.play()
     isPlaying = true
+    isBuffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
   }
 
-  private func detectVideoDisplaySize(_ asset: AVAsset) async -> CGSize? {
+  private func detectVideoCharacteristics(_ asset: AVAsset) async -> (
+    size: CGSize?, codec: String, hdr: String, frameRate: Float
+  ) {
     guard let tracks = try? await asset.loadTracks(withMediaType: .video),
-      let track = tracks.first,
-      let naturalSize = try? await track.load(.naturalSize),
-      let preferredTransform = try? await track.load(.preferredTransform)
+      let track = tracks.first
     else {
-      return nil
+      return (nil, "未知", "SDR", 0)
     }
 
-    let transformed = CGRect(origin: .zero, size: naturalSize).applying(preferredTransform)
-    let size = CGSize(width: abs(transformed.width), height: abs(transformed.height))
-    guard size.width > 0, size.height > 0 else { return nil }
-    return size
+    var displaySize: CGSize?
+    if let naturalSize = try? await track.load(.naturalSize),
+      let preferredTransform = try? await track.load(.preferredTransform)
+    {
+      let transformed = CGRect(origin: .zero, size: naturalSize).applying(preferredTransform)
+      let size = CGSize(width: abs(transformed.width), height: abs(transformed.height))
+      if size.width > 0, size.height > 0 { displaySize = size }
+    }
+
+    var codec = "未知"
+    var codecFourCC = ""
+    var hasDolbyVisionConfiguration = false
+    if let descriptions = try? await track.load(.formatDescriptions),
+      let first = descriptions.first
+    {
+      codecFourCC = fourCCString(CMFormatDescriptionGetMediaSubType(first))
+      codec = friendlyCodecName(codecFourCC)
+
+      // Dolby Vision Profile 8.4 commonly uses an hvc1 sample entry. Detect the
+      // dvcC/dvvC configuration atoms instead of relying only on a dvh1/dvhe FourCC.
+      if let atoms = CMFormatDescriptionGetExtension(
+        first,
+        extensionKey: kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms
+      ) as? NSDictionary {
+        hasDolbyVisionConfiguration = atoms["dvvC"] != nil || atoms["dvcC"] != nil
+      }
+    }
+
+    let mediaCharacteristics = (try? await track.load(.mediaCharacteristics)) ?? []
+    let containsHDR = mediaCharacteristics.contains(.containsHDRVideo)
+    let normalized = codecFourCC.lowercased()
+    let hdr: String
+    if hasDolbyVisionConfiguration || normalized == "dvh1" || normalized == "dvhe" {
+      hdr = "Dolby Vision"
+      if codec == "HEVC" { codec = "HEVC · Dolby Vision" }
+    } else if containsHDR {
+      hdr = "HDR"
+    } else {
+      hdr = "SDR"
+    }
+
+    let frameRate = (try? await track.load(.nominalFrameRate)) ?? 0
+    return (displaySize, codec, hdr, frameRate)
+  }
+
+  private func fourCCString(_ value: FourCharCode) -> String {
+    let bytes: [CChar] = [
+      CChar((value >> 24) & 0xff),
+      CChar((value >> 16) & 0xff),
+      CChar((value >> 8) & 0xff),
+      CChar(value & 0xff),
+      0,
+    ]
+    return String(cString: bytes).trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  private func friendlyCodecName(_ fourCC: String) -> String {
+    switch fourCC.lowercased() {
+    case "avc1", "avc3": return "H.264"
+    case "hvc1", "hev1": return "HEVC"
+    case "dvh1", "dvhe": return "HEVC · Dolby Vision"
+    case "av01": return "AV1"
+    case "vp09": return "VP9"
+    default: return fourCC.isEmpty ? "未知" : fourCC.uppercased()
+    }
   }
 
   private func loadMediaSelectionOptions(asset: AVAsset, playerItem: AVPlayerItem) async {
@@ -321,6 +440,25 @@ final class PlayerModel {
           self.bufferedUntil = end.isFinite ? max(end, 0) : 0
         }
 
+        if let event = self.player.currentItem?.accessLog()?.events.last {
+          let observed = event.observedBitrate
+          let bytes = event.numberOfBytesTransferred
+          self.transferredMegabytes = bytes > 0 ? Double(bytes) / 1_048_576 : 0
+
+          if observed.isFinite, observed > 0 {
+            self.networkMbps = observed / 1_000_000
+          } else {
+            let now = Date()
+            let elapsed = now.timeIntervalSince(self.lastBandwidthSampleAt)
+            if elapsed >= 0.45, bytes >= self.lastTransferredBytes {
+              let delta = bytes - self.lastTransferredBytes
+              self.networkMbps = elapsed > 0 ? Double(delta) * 8 / elapsed / 1_000_000 : 0
+              self.lastTransferredBytes = bytes
+              self.lastBandwidthSampleAt = now
+            }
+          }
+        }
+
         let second = Int(seconds)
         if second >= 0, second != self.lastSavedSecond, second % 5 == 0 {
           self.lastSavedSecond = second
@@ -368,7 +506,13 @@ final class PlayerModel {
     guard !isFallingBack else { return }
     let reason = (notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error)?
       .localizedDescription
-    if selectedSource?.isOriginal == true, let fallback = bestTranscode {
+    if selectedSource?.isOriginal == true, VLCAvailability.isAvailable {
+      requiresVLC = true
+      player.replaceCurrentItem(with: nil)
+      isPlaying = false
+      isBuffering = false
+      errorMessage = nil
+    } else if selectedSource?.isOriginal == true, let fallback = bestTranscode {
       isFallingBack = true
       didFallbackFromOriginal = true
       await play(fallback, allowFallback: false)
@@ -378,10 +522,70 @@ final class PlayerModel {
     }
   }
 
+  private func configureAudioSession() {
+    do {
+      let session = AVAudioSession.sharedInstance()
+      try session.setCategory(.playback, mode: .moviePlayback, options: [])
+    } catch {
+      // Non-fatal. Playback can still proceed on self-signed builds.
+    }
+  }
+
+  private func activateAudioSession() {
+    do {
+      try AVAudioSession.sharedInstance().setActive(true)
+    } catch {}
+  }
+
+  private func installAudioSessionObservers() {
+    interruptionObserver = NotificationCenter.default.addObserver(
+      forName: AVAudioSession.interruptionNotification,
+      object: AVAudioSession.sharedInstance(),
+      queue: .main
+    ) { [weak self] note in
+      Task { @MainActor [weak self] in
+        guard let self,
+          let rawType = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+          let type = AVAudioSession.InterruptionType(rawValue: rawType)
+        else { return }
+
+        switch type {
+        case .began:
+          self.pause()
+        case .ended:
+          let rawOptions = note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+          let options = AVAudioSession.InterruptionOptions(rawValue: rawOptions)
+          if options.contains(.shouldResume) {
+            self.activateAudioSession()
+            self.resume()
+          }
+        @unknown default:
+          break
+        }
+      }
+    }
+
+    routeChangeObserver = NotificationCenter.default.addObserver(
+      forName: AVAudioSession.routeChangeNotification,
+      object: AVAudioSession.sharedInstance(),
+      queue: .main
+    ) { [weak self] note in
+      Task { @MainActor [weak self] in
+        guard let self,
+          let rawReason = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
+          let reason = AVAudioSession.RouteChangeReason(rawValue: rawReason)
+        else { return }
+        if reason == .oldDeviceUnavailable {
+          self.pause()
+        }
+      }
+    }
+  }
+
   private func saveProgress(force: Bool) {
     let seconds = player.currentTime().seconds
     guard seconds.isFinite, seconds >= 0 else { return }
-    libraryStore.recordPlayback(item, position: seconds)
+    libraryStore.recordPlayback(item, position: seconds, duration: duration)
     let second = Int(seconds)
     let shouldSyncRemote = force || second - lastRemoteHistorySecond >= 60
     if shouldSyncRemote {

@@ -1,4 +1,5 @@
 import AVFoundation
+import MediaPlayer
 import SwiftUI
 import UIKit
 
@@ -10,7 +11,11 @@ struct PlayerScreen: View {
   @State private var playlist: [CloudItem] = []
   @State private var loadedPlaylistParentID: String?
   @State private var model: PlayerModel?
+  @State private var vlcController = VLCPlaybackController()
+  @State private var systemPresentationController = SystemPlayerPresentationController()
   @State private var useVLC = false
+  @State private var didLoadPreferredRate = false
+  @State private var localMetadata: LocalMediaMetadata?
   @State private var showInfo = false
   @State private var videoLayout: PlayerVideoLayout = .fit
   @State private var playbackRate: Float = 1.0
@@ -18,6 +23,9 @@ struct PlayerScreen: View {
   @State private var controlsVisible = true
   @State private var showSettingsPanel = false
   @State private var showSpeedPanel = false
+  @State private var showQueuePanel = false
+  @State private var showPlaybackHUD = false
+  @State private var isRoutePickerPresented = false
   @State private var gestureHUD: String?
   @State private var hudTask: Task<Void, Never>?
   @State private var controlsTask: Task<Void, Never>?
@@ -40,7 +48,7 @@ struct PlayerScreen: View {
       normalized = videos + [item]
     }
     _playlist = State(initialValue: normalized)
-    _loadedPlaylistParentID = State(initialValue: playlist.isEmpty ? nil : item.parentID)
+    _loadedPlaylistParentID = State(initialValue: nil)
   }
 
   var body: some View {
@@ -77,7 +85,20 @@ struct PlayerScreen: View {
             .zIndex(21)
         }
 
-        if model?.isBuffering == true {
+        if showQueuePanel, !isLocked {
+          queueOverlay(proxy: proxy)
+            .simultaneousGesture(controlsInteractionGesture)
+            .transition(.opacity.combined(with: .move(edge: proxy.size.width > proxy.size.height ? .trailing : .bottom)))
+            .zIndex(22)
+        }
+
+        if showPlaybackHUD, !isLocked {
+          playbackHUD(proxy: proxy)
+            .transition(.opacity)
+            .zIndex(15)
+        }
+
+        if activeIsBuffering {
           ProgressView()
             .controlSize(.large)
             .tint(.white)
@@ -98,6 +119,8 @@ struct PlayerScreen: View {
         }
       }
       .frame(width: proxy.size.width, height: proxy.size.height)
+      .animation(.easeInOut(duration: 0.20), value: controlsVisible)
+      .animation(.easeInOut(duration: 0.18), value: showPlaybackHUD)
     }
     .background(Color.black)
     .ignoresSafeArea()
@@ -108,7 +131,11 @@ struct PlayerScreen: View {
         model: model,
         videoLayout: videoLayout,
         playbackRate: playbackRate,
-        playlistCount: playlist.count
+        playlistCount: playlist.count,
+        localMetadata: localMetadata,
+        networkMbps: activeNetworkMbps,
+        bufferedDuration: activeBufferedDuration,
+        playbackEngine: useVLC ? "VLC" : "AVPlayer"
       )
       .presentationDetents([.medium, .large])
       .presentationDragIndicator(.visible)
@@ -135,14 +162,36 @@ struct PlayerScreen: View {
     .task(id: currentItem.id) {
       await prepareCurrentItem()
     }
-    .onChange(of: model?.didReachEnd ?? false) { _, ended in
+    .onChange(of: model?.requiresVLC ?? false) { _, requiresVLC in
+      guard requiresVLC, !useVLC, let model else { return }
+      activatePlaybackEngine(for: model)
+      configureRemotePlayback()
+      updateRemotePlaybackInfo()
+    }
+    .onChange(of: activeCurrentTime) { _, _ in
+      updateRemotePlaybackInfo()
+    }
+    .onChange(of: activeIsPlaying) { _, playing in
+      updateRemotePlaybackInfo()
+      if playing {
+        scheduleControlsHide()
+      } else {
+        controlsTask?.cancel()
+        showControls(animated: true)
+      }
+    }
+    .onChange(of: localMetadata?.displayTitle(fallback: currentItem.name)) { _, _ in
+      configureRemotePlayback()
+      updateRemotePlaybackInfo()
+    }
+    .onChange(of: activeDidReachEnd) { _, ended in
       guard ended else { return }
       Task { @MainActor in
         if appState.autoPlayNextEpisode, nextItem != nil {
           playNextIfAvailable()
         } else {
-          await model?.replay()
-          controlsVisible = true
+          replayActivePlayer()
+          showControls(animated: true)
           scheduleControlsHide()
         }
       }
@@ -150,10 +199,13 @@ struct PlayerScreen: View {
     .onDisappear {
       showSettingsPanel = false
       showSpeedPanel = false
+      showQueuePanel = false
       isControlsInteractionActive = false
       hudTask?.cancel()
       controlsTask?.cancel()
-      model?.pause()
+      pauseActivePlayer()
+      vlcController.stop()
+      RemotePlaybackCoordinator.shared.deactivate()
       PlayerOrientation.request(.portrait)
     }
   }
@@ -161,12 +213,14 @@ struct PlayerScreen: View {
   @ViewBuilder
   private var playerLayer: some View {
     if let model {
-      if useVLC, let source = model.selectedSource, source.isOriginal,
-        VLCAvailability.isAvailable
-      {
-        VLCPlayerView(source: source)
+      if useVLC, model.selectedSource?.isOriginal == true, VLCAvailability.isAvailable {
+        VLCPlayerView(controller: vlcController)
       } else {
-        SystemPlayerView(player: model.player, videoLayout: videoLayout, showsPlaybackControls: false)
+        SystemPlayerView(
+          player: model.player,
+          presentationController: systemPresentationController,
+          videoLayout: videoLayout
+        )
       }
     } else {
       ZStack {
@@ -237,7 +291,7 @@ struct PlayerScreen: View {
               isGestureInteracting = true
               controlsTask?.cancel()
               gestureStartBrightness = UIScreen.main.brightness
-              gestureStartVolume = model?.player.volume
+              gestureStartVolume = activeVolume
             }
 
             let normalizedDelta = -dy / availableHeight * 1.35
@@ -246,10 +300,10 @@ struct PlayerScreen: View {
               let next = min(max(start + normalizedDelta, 0), 1)
               UIScreen.main.brightness = next
               showGestureHUD("亮度  \(Int(next * 100))%")
-            } else if let model {
-              let start = CGFloat(gestureStartVolume ?? model.player.volume)
+            } else {
+              let start = CGFloat(gestureStartVolume ?? activeVolume)
               let next = min(max(start + normalizedDelta, 0), 1)
-              model.player.volume = Float(next)
+              setActiveVolume(Float(next))
               showGestureHUD("音量  \(Int(next * 100))%")
             }
           }
@@ -302,12 +356,12 @@ struct PlayerScreen: View {
 
     return HStack(spacing: landscape ? 10 : 9) {
       playerIconButton("xmark") {
-        model?.pause()
+        pauseActivePlayer()
         dismiss()
       }
 
       VStack(alignment: .leading, spacing: 2) {
-        Text(currentItem.name)
+        Text(localMetadata?.displayTitle(fallback: currentItem.name) ?? currentItem.name)
           .font(landscape ? .subheadline.weight(.semibold) : .subheadline.weight(.semibold))
           .foregroundStyle(.white)
           .lineLimit(1)
@@ -335,6 +389,37 @@ struct PlayerScreen: View {
           }
         }
         .buttonStyle(.plain)
+      }
+
+      if playlist.count > 1 {
+        playerIconButton("rectangle.stack.badge.play") {
+          openQueuePanel()
+        }
+      }
+
+      if !useVLC, systemPresentationController.isPictureInPictureSupported {
+        playerIconButton(
+          systemPresentationController.isPictureInPictureActive ? "pip.exit" : "pip.enter"
+        ) {
+          keepControlsDuringInteraction()
+          systemPresentationController.startPictureInPicture()
+          scheduleControlsHide()
+        }
+      }
+
+      if !useVLC {
+        AirPlayRoutePickerButton { presented in
+          isRoutePickerPresented = presented
+          if presented {
+            keepControlsDuringInteraction()
+          } else {
+            scheduleControlsHide()
+          }
+        }
+        .frame(width: 38, height: 38)
+        .background(.black.opacity(0.50), in: Circle())
+        .clipShape(Circle())
+        .accessibilityLabel("AirPlay")
       }
 
       playerIconButton("rectangle.landscape.rotate") {
@@ -424,8 +509,7 @@ struct PlayerScreen: View {
               formatRate(rate),
               selected: abs(Double(playbackRate) - rate) < 0.001
             ) {
-              playbackRate = Float(rate)
-              model?.setPlaybackRate(Float(rate))
+              applyPlaybackRate(Float(rate))
               closeSpeedPanel()
             }
           }
@@ -444,6 +528,167 @@ struct PlayerScreen: View {
       .padding(.leading, max(proxy.safeAreaInsets.leading, landscape ? 24 : 16))
       .padding(.bottom, max(proxy.safeAreaInsets.bottom, landscape ? 10 : 14) + 74)
     }
+  }
+
+  private func queueOverlay(proxy: GeometryProxy) -> some View {
+    let landscape = proxy.size.width > proxy.size.height
+    let panelWidth = landscape ? min(380.0, proxy.size.width * 0.45) : max(proxy.size.width - 20, 300)
+    let panelHeight = landscape ? min(proxy.size.height * 0.86, 520) : min(proxy.size.height * 0.68, 600)
+
+    return ZStack(alignment: landscape ? .trailing : .bottom) {
+      Color.black.opacity(0.30)
+        .ignoresSafeArea()
+        .contentShape(Rectangle())
+        .onTapGesture { closeQueuePanel() }
+
+      VStack(spacing: 0) {
+        HStack(spacing: 10) {
+          VStack(alignment: .leading, spacing: 2) {
+            Text("播放队列")
+              .font(.headline.weight(.semibold))
+              .foregroundStyle(.white)
+            Text("同目录 · \(playlist.count) 个视频")
+              .font(.caption)
+              .foregroundStyle(.white.opacity(0.54))
+          }
+          Spacer()
+          Button { closeQueuePanel() } label: {
+            Image(systemName: "xmark")
+              .font(.system(size: 13, weight: .bold))
+              .foregroundStyle(.white.opacity(0.86))
+              .frame(width: 32, height: 32)
+              .background(.white.opacity(0.08), in: Circle())
+          }
+          .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 18)
+        .padding(.top, 16)
+        .padding(.bottom, 12)
+
+        Divider().overlay(.white.opacity(0.08))
+
+        ScrollViewReader { reader in
+          ScrollView(showsIndicators: false) {
+            LazyVStack(spacing: 6) {
+              ForEach(Array(playlist.enumerated()), id: \.element.id) { index, item in
+                Button {
+                  closeQueuePanel(scheduleHide: false)
+                  switchTo(item)
+                } label: {
+                  HStack(spacing: 11) {
+                    ZStack {
+                      RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(item.id == currentItem.id ? CinevaTheme.accent.opacity(0.20) : .white.opacity(0.06))
+                      Text("\(index + 1)")
+                        .font(.caption2.monospacedDigit().weight(.bold))
+                        .foregroundStyle(item.id == currentItem.id ? CinevaTheme.accent : .white.opacity(0.60))
+                    }
+                    .frame(width: 34, height: 30)
+
+                    VStack(alignment: .leading, spacing: 3) {
+                      Text(item.name)
+                        .font(.subheadline.weight(item.id == currentItem.id ? .semibold : .regular))
+                        .foregroundStyle(.white)
+                        .lineLimit(2)
+                      HStack(spacing: 5) {
+                        if !item.fileExtension.isEmpty { Text(item.fileExtension.uppercased()) }
+                        Text(item.formattedSize)
+                      }
+                      .font(.caption2)
+                      .foregroundStyle(.white.opacity(0.44))
+                    }
+                    Spacer(minLength: 6)
+                    if item.id == currentItem.id {
+                      Image(systemName: activeIsPlaying ? "speaker.wave.2.fill" : "pause.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(CinevaTheme.accent)
+                    } else {
+                      Image(systemName: "play.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(0.34))
+                    }
+                  }
+                  .padding(.horizontal, 10)
+                  .padding(.vertical, 7)
+                  .background(
+                    item.id == currentItem.id ? .white.opacity(0.08) : .clear,
+                    in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+                  )
+                }
+                .buttonStyle(.plain)
+                .id(item.id)
+              }
+            }
+            .padding(12)
+          }
+          .onAppear {
+            reader.scrollTo(currentItem.id, anchor: .center)
+          }
+        }
+      }
+      .frame(width: panelWidth, height: panelHeight)
+      .background(.black.opacity(0.90))
+      .background(.ultraThinMaterial)
+      .clipShape(RoundedRectangle(cornerRadius: landscape ? 20 : 24, style: .continuous))
+      .overlay {
+        RoundedRectangle(cornerRadius: landscape ? 20 : 24, style: .continuous)
+          .stroke(.white.opacity(0.10), lineWidth: 0.8)
+      }
+      .padding(.trailing, landscape ? max(proxy.safeAreaInsets.trailing, 18) : 10)
+      .padding(.leading, landscape ? 10 : 10)
+      .padding(.bottom, landscape ? 0 : max(proxy.safeAreaInsets.bottom, 10))
+    }
+  }
+
+  private func playbackHUD(proxy: GeometryProxy) -> some View {
+    let landscape = proxy.size.width > proxy.size.height
+    let resolution: String = {
+      guard let size = model?.videoDisplaySize, size.width > 0, size.height > 0 else { return "读取中" }
+      return "\(Int(size.width.rounded()))×\(Int(size.height.rounded()))"
+    }()
+    let networkText = activeNetworkMbps > 0.01 ? String(format: "%.1f Mbps", activeNetworkMbps) : "--"
+    let bufferText = activeBufferedDuration > 0 ? "\(formatTime(activeBufferedDuration))" : "--"
+    let transferredText = activeTransferredMegabytes > 0.1 ? String(format: "%.1f MB", activeTransferredMegabytes) : "--"
+    let engine = useVLC ? "VLC" : "AVPlayer"
+    let codec = useVLC ? currentItem.fileExtension.uppercased() : (model?.videoCodec ?? "读取中")
+    let hdr = useVLC ? (currentItem.isDiscImage ? "ISO/IMG 原盘" : "VLC 原画") : (model?.hdrFormat ?? "SDR")
+    let fps = (model?.nominalFrameRate ?? 0) > 0.1 ? String(format: "%.3g fps", model?.nominalFrameRate ?? 0) : nil
+
+    return VStack(alignment: .leading, spacing: 5) {
+      HStack(spacing: 6) {
+        Image(systemName: "waveform.path.ecg")
+        Text(engine)
+        Text("·")
+        Text(currentItem.fileExtension.uppercased())
+      }
+      .font(.caption.weight(.semibold))
+      .foregroundStyle(.white)
+
+      Text([resolution, codec, hdr, fps].compactMap { $0 }.joined(separator: "  ·  "))
+      Text("网络 \(networkText)  ·  缓冲 \(bufferText)  ·  已读取 \(transferredText)")
+      if !useVLC, model?.hdrFormat == "Dolby Vision" {
+        Text(AVPlayer.eligibleForHDRPlayback ? "Dolby Vision · 系统原生 HDR 管线" : "Dolby Vision · 当前显示设备不具备 HDR 播放资格")
+          .foregroundStyle(.white.opacity(0.82))
+      } else if currentItem.isDiscImage {
+        Text("ISO/IMG：VLC 原盘主标题尝试，不启用光盘菜单")
+          .foregroundStyle(.white.opacity(0.82))
+      }
+    }
+    .font(.caption2.monospacedDigit())
+    .foregroundStyle(.white.opacity(0.70))
+    .padding(.horizontal, 11)
+    .padding(.vertical, 9)
+    .background(.black.opacity(0.64), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+    .overlay {
+      RoundedRectangle(cornerRadius: 11, style: .continuous)
+        .stroke(.white.opacity(0.08), lineWidth: 0.6)
+    }
+    .frame(maxWidth: landscape ? 360 : 320, alignment: .leading)
+    .position(
+      x: max(proxy.safeAreaInsets.leading + (landscape ? 196 : 170), landscape ? 196 : 170),
+      y: max(proxy.safeAreaInsets.top + (landscape ? 102 : 138), landscape ? 102 : 138)
+    )
+    .allowsHitTesting(false)
   }
 
   private func settingsPanel(proxy: GeometryProxy) -> some View {
@@ -517,8 +762,7 @@ struct PlayerScreen: View {
             formatRate(rate),
             selected: abs(Double(playbackRate) - rate) < 0.001
           ) {
-            playbackRate = Float(rate)
-            model.setPlaybackRate(Float(rate))
+            applyPlaybackRate(Float(rate))
             keepControlsDuringInteraction()
           }
         }
@@ -538,10 +782,11 @@ struct PlayerScreen: View {
           ) {
             keepControlsDuringInteraction()
             Task { @MainActor in
-              useVLC = shouldUseVLC(source)
               await model.select(source)
-              model.setPlaybackRate(playbackRate)
+              activatePlaybackEngine(for: model)
+              applyPlaybackRate(playbackRate, persist: false)
               applyAutomaticOrientation(for: model.videoDisplaySize)
+              configureRemotePlayback()
               keepControlsDuringInteraction()
             }
           }
@@ -638,9 +883,24 @@ struct PlayerScreen: View {
           appState.libraryStore.toggleFavorite(currentItem)
           keepControlsDuringInteraction()
         }
+        settingsActionButton(showPlaybackHUD ? "关闭 HUD" : "播放 HUD", systemName: "waveform.path.ecg") {
+          showPlaybackHUD.toggle()
+          keepControlsDuringInteraction()
+        }
+      }
+
+      HStack(spacing: 8) {
         settingsActionButton("详情", systemName: "info.circle") {
           closeSettingsPanel(scheduleHide: false)
           showInfo = true
+        }
+        settingsActionButton(
+          systemPresentationController.isPictureInPictureActive ? "退出小窗" : "小窗播放",
+          systemName: systemPresentationController.isPictureInPictureActive ? "pip.exit" : "pip.enter",
+          enabled: !useVLC && systemPresentationController.isPictureInPictureSupported
+        ) {
+          closeSettingsPanel(scheduleHide: false)
+          systemPresentationController.startPictureInPicture()
         }
       }
 
@@ -775,11 +1035,11 @@ struct PlayerScreen: View {
       }
 
       Button {
-        model.togglePlayback()
+        toggleActivePlayback()
         controlsVisible = true
         scheduleControlsHide()
       } label: {
-        Image(systemName: model.isPlaying ? "pause.fill" : "play.fill")
+        Image(systemName: activeIsPlaying ? "pause.fill" : "play.fill")
           .font(.system(size: 24, weight: .bold))
           .foregroundStyle(.black)
           .frame(width: 62, height: 62)
@@ -828,11 +1088,11 @@ struct PlayerScreen: View {
       }
 
       Button {
-        model.togglePlayback()
+        toggleActivePlayback()
         controlsVisible = true
         scheduleControlsHide()
       } label: {
-        Image(systemName: model.isPlaying ? "pause.fill" : "play.fill")
+        Image(systemName: activeIsPlaying ? "pause.fill" : "play.fill")
           .font(.system(size: 27, weight: .bold))
           .foregroundStyle(.black)
           .frame(width: 68, height: 68)
@@ -925,9 +1185,9 @@ struct PlayerScreen: View {
     VStack(spacing: 5) {
       GeometryReader { proxy in
         let width = max(proxy.size.width, 1)
-        let duration = max(model.duration, 1)
-        let current = min(max(isScrubbing ? scrubValue : model.currentTime, 0), duration)
-        let buffered = min(max(model.bufferedUntil, 0), duration)
+        let duration = max(activeDuration, 1)
+        let current = min(max(isScrubbing ? scrubValue : activeCurrentTime, 0), duration)
+        let buffered = min(max(activeBufferedUntil, 0), duration)
         let playedProgress = CGFloat(current / duration)
         let bufferedProgress = CGFloat(buffered / duration)
         let playedX = width * playedProgress
@@ -938,9 +1198,11 @@ struct PlayerScreen: View {
             .fill(.white.opacity(0.20))
             .frame(height: 3)
 
-          Capsule()
-            .fill(.white.opacity(0.32))
-            .frame(width: bufferedX, height: 3)
+          if !useVLC {
+            Capsule()
+              .fill(.white.opacity(0.32))
+              .frame(width: bufferedX, height: 3)
+          }
 
           Capsule()
             .fill(CinevaTheme.accent)
@@ -967,7 +1229,7 @@ struct PlayerScreen: View {
             .onEnded { value in
               let x = min(max(value.location.x, 0), width)
               scrubValue = Double(x / width) * duration
-              model.seek(to: scrubValue)
+              seekActive(to: scrubValue)
               isScrubbing = false
               scheduleControlsHide()
             }
@@ -976,14 +1238,14 @@ struct PlayerScreen: View {
       .frame(height: 28)
 
       HStack {
-        Text(formatTime(isScrubbing ? scrubValue : model.currentTime))
+        Text(formatTime(isScrubbing ? scrubValue : activeCurrentTime))
         Spacer()
-        if model.bufferedUntil > model.currentTime + 1 {
-          Text("已缓冲 \(formatTime(model.bufferedUntil))")
+        if !useVLC, activeBufferedUntil > activeCurrentTime + 1 {
+          Text("已缓冲 \(formatTime(activeBufferedUntil))")
             .foregroundStyle(.white.opacity(0.46))
         }
         Spacer()
-        Text(formatTime(model.duration))
+        Text(formatTime(activeDuration))
       }
       .font(.caption2.monospacedDigit().weight(.medium))
       .foregroundStyle(.white.opacity(0.72))
@@ -1058,8 +1320,16 @@ struct PlayerScreen: View {
   @MainActor
   private func prepareCurrentItem() async {
     controlsTask?.cancel()
-    PlayerOrientation.request(.portrait)
-    model?.pause()
+
+    if !didLoadPreferredRate {
+      playbackRate = appState.preferredPlaybackRate
+      didLoadPreferredRate = true
+    }
+
+    if model != nil {
+      pauseActivePlayer()
+      vlcController.stop()
+    }
 
     let newModel = PlayerModel(
       item: currentItem,
@@ -1069,27 +1339,243 @@ struct PlayerScreen: View {
     )
     model = newModel
     newModel.setPlaybackRate(playbackRate)
+
+    async let metadataTask = appState.api.localMetadata(for: currentItem)
     await newModel.prepareAndPlay()
+    localMetadata = await metadataTask
 
-    if let selected = newModel.selectedSource {
-      useVLC = shouldUseVLC(selected)
-    } else {
-      useVLC = false
-    }
-
+    activatePlaybackEngine(for: newModel)
+    applyPlaybackRate(playbackRate, persist: false)
     applyAutomaticOrientation(for: newModel.videoDisplaySize)
+    await ensureCompletePlaylist()
+    configureRemotePlayback()
+    updateRemotePlaybackInfo()
+
     controlsVisible = true
     scheduleControlsHide()
   }
 
   @MainActor
-  private func applyAutomaticOrientation(for size: CGSize?) {
-    guard let size, size.width > 0, size.height > 0 else {
-      PlayerOrientation.request(.portrait)
+  private func activatePlaybackEngine(for playerModel: PlayerModel) {
+    guard let source = playerModel.selectedSource else {
+      useVLC = false
       return
     }
-    let ratio = size.width / max(size.height, 1)
-    PlayerOrientation.request(ratio > 1.12 ? .landscape : .portrait)
+
+    if playerModel.requiresVLC, source.isOriginal, VLCAvailability.isAvailable {
+      useVLC = true
+      vlcController.configure(
+        source: source,
+        item: currentItem,
+        libraryStore: appState.libraryStore,
+        playbackRate: playbackRate
+      )
+    } else {
+      if useVLC {
+        vlcController.stop(saveProgress: false)
+      }
+      useVLC = false
+      playerModel.setPlaybackRate(playbackRate)
+    }
+  }
+
+  @MainActor
+  private func ensureCompletePlaylist() async {
+    let parent = currentItem.parentID
+    guard !parent.isEmpty, loadedPlaylistParentID != parent else { return }
+
+    do {
+      let all = try await appState.api.listFolder(id: parent)
+      var videos = all.filter { !$0.isDirectory && $0.isVideo }
+      if !videos.contains(where: { $0.id == currentItem.id }) {
+        videos.append(currentItem)
+      }
+      videos.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+      playlist = videos
+      loadedPlaylistParentID = parent
+    } catch {
+      // Keep the playlist supplied by the source screen. Queue expansion is an
+      // enhancement and must never make playback fail.
+      if !playlist.contains(where: { $0.id == currentItem.id }) {
+        playlist.append(currentItem)
+      }
+    }
+  }
+
+  @MainActor
+  private func applyPlaybackRate(_ rate: Float, persist: Bool = true) {
+    let safe = min(max(rate, 0.5), 2.0)
+    playbackRate = safe
+    if persist {
+      appState.preferredPlaybackRate = safe
+    }
+    if useVLC {
+      vlcController.setPlaybackRate(safe)
+    } else {
+      model?.setPlaybackRate(safe)
+    }
+    updateRemotePlaybackInfo()
+  }
+
+  @MainActor
+  private func toggleActivePlayback() {
+    if useVLC {
+      vlcController.togglePlayback()
+    } else {
+      model?.togglePlayback()
+    }
+    updateRemotePlaybackInfo()
+  }
+
+  @MainActor
+  private func pauseActivePlayer() {
+    if useVLC {
+      vlcController.pause()
+    } else {
+      model?.pause()
+    }
+    updateRemotePlaybackInfo()
+  }
+
+  @MainActor
+  private func resumeActivePlayer() {
+    if useVLC {
+      vlcController.resume()
+    } else {
+      model?.resume()
+    }
+    updateRemotePlaybackInfo()
+  }
+
+  @MainActor
+  private func replayActivePlayer() {
+    if useVLC {
+      vlcController.replay()
+    } else if let model {
+      Task { @MainActor in
+        await model.replay()
+      }
+    }
+  }
+
+  @MainActor
+  private func seekActive(to seconds: Double) {
+    if useVLC {
+      vlcController.seek(to: seconds)
+    } else {
+      model?.seek(to: seconds)
+    }
+    updateRemotePlaybackInfo()
+  }
+
+  @MainActor
+  private func setActiveVolume(_ volume: Float) {
+    let safe = min(max(volume, 0), 1)
+    if useVLC {
+      vlcController.setVolume(safe)
+    } else {
+      model?.player.volume = safe
+    }
+  }
+
+  private var activeCurrentTime: Double {
+    useVLC ? vlcController.currentTime : (model?.currentTime ?? 0)
+  }
+
+  private var activeDuration: Double {
+    if useVLC, vlcController.duration > 0 { return vlcController.duration }
+    if let duration = model?.duration, duration > 0 { return duration }
+    return appState.libraryStore.knownDuration(for: currentItem)
+  }
+
+  private var activeBufferedUntil: Double {
+    useVLC ? activeCurrentTime : (model?.bufferedUntil ?? 0)
+  }
+
+  private var activeBufferedDuration: Double {
+    useVLC ? 0 : (model?.bufferedDuration ?? 0)
+  }
+
+  private var activeIsPlaying: Bool {
+    useVLC ? vlcController.isPlaying : (model?.isPlaying ?? false)
+  }
+
+  private var activeIsBuffering: Bool {
+    useVLC ? vlcController.isBuffering : (model?.isBuffering ?? false)
+  }
+
+  private var activeDidReachEnd: Bool {
+    useVLC ? vlcController.didReachEnd : (model?.didReachEnd ?? false)
+  }
+
+  private var activeNetworkMbps: Double {
+    useVLC ? vlcController.networkMbps : (model?.networkMbps ?? 0)
+  }
+
+  private var activeTransferredMegabytes: Double {
+    useVLC ? vlcController.transferredMegabytes : (model?.transferredMegabytes ?? 0)
+  }
+
+  private var activeVolume: Float {
+    useVLC ? vlcController.volume : (model?.player.volume ?? 1)
+  }
+
+  @MainActor
+  private func configureRemotePlayback() {
+    RemotePlaybackCoordinator.shared.activate(
+      skipSeconds: appState.doubleTapSeekSeconds,
+      onPlay: { resumeActivePlayer() },
+      onPause: { pauseActivePlayer() },
+      onToggle: { toggleActivePlayback() },
+      onSeek: { seconds in seekActive(to: seconds) },
+      onSkipBackward: { seekBy(-Double(appState.doubleTapSeekSeconds)) },
+      onSkipForward: { seekBy(Double(appState.doubleTapSeekSeconds)) },
+      onPrevious: previousItem == nil ? nil : { playPreviousIfAvailable() },
+      onNext: nextItem == nil ? nil : { playNextIfAvailable() }
+    )
+    RemotePlaybackCoordinator.shared.setMetadata(
+      title: localMetadata?.displayTitle(fallback: currentItem.name) ?? currentItem.name,
+      subtitle: currentItem.parentID.split(separator: "/").last.map(String.init) ?? "Cineva",
+      artworkData: localMetadata?.posterData
+    )
+  }
+
+  @MainActor
+  private func updateRemotePlaybackInfo() {
+    RemotePlaybackCoordinator.shared.updatePlayback(
+      elapsed: activeCurrentTime,
+      duration: activeDuration,
+      rate: activeIsPlaying ? playbackRate : 0,
+      isPlaying: activeIsPlaying
+    )
+  }
+
+  @MainActor
+  private func showControls(animated: Bool) {
+    if animated {
+      withAnimation(.easeOut(duration: 0.18)) { controlsVisible = true }
+    } else {
+      controlsVisible = true
+    }
+  }
+
+  @MainActor
+  private func openQueuePanel() {
+    controlsTask?.cancel()
+    controlsVisible = true
+    showSettingsPanel = false
+    showSpeedPanel = false
+    withAnimation(.easeOut(duration: 0.18)) {
+      showQueuePanel = true
+    }
+  }
+
+  @MainActor
+  private func closeQueuePanel(scheduleHide: Bool = true) {
+    withAnimation(.easeIn(duration: 0.16)) {
+      showQueuePanel = false
+    }
+    if scheduleHide { scheduleControlsHide() }
   }
 
   private var currentIndex: Int {
@@ -1121,17 +1607,28 @@ struct PlayerScreen: View {
   private func switchTo(_ item: CloudItem) {
     showSettingsPanel = false
     showSpeedPanel = false
-    model?.pause()
+    showQueuePanel = false
+    pauseActivePlayer()
+    vlcController.stop()
     model = nil
     useVLC = false
+    localMetadata = nil
+    if item.parentID != loadedPlaylistParentID {
+      loadedPlaylistParentID = nil
+    }
     currentItem = item
     UIImpactFeedbackGenerator(style: .soft).impactOccurred()
   }
 
   @MainActor
   private func seekBy(_ seconds: Double) {
-    guard let model else { return }
-    model.seekBy(seconds)
+    guard model != nil else { return }
+    if useVLC {
+      vlcController.seekBy(seconds)
+    } else {
+      model?.seekBy(seconds)
+    }
+    updateRemotePlaybackInfo()
     UIImpactFeedbackGenerator(style: .soft).impactOccurred()
     let magnitude = Int(abs(seconds).rounded())
     showGestureHUD(seconds < 0 ? "⏪  \(magnitude) 秒" : "\(magnitude) 秒  ⏩")
@@ -1200,11 +1697,33 @@ struct PlayerScreen: View {
   @MainActor
   private func scheduleControlsHide() {
     controlsTask?.cancel()
-    guard model?.isPlaying == true, !isLocked, !isScrubbing, !isGestureInteracting, !isControlsInteractionActive, !showSettingsPanel, !showSpeedPanel, !showInfo else { return }
+    guard activeIsPlaying,
+      !isLocked,
+      !isScrubbing,
+      !isGestureInteracting,
+      !isControlsInteractionActive,
+      !showSettingsPanel,
+      !showSpeedPanel,
+      !showQueuePanel,
+      !showInfo,
+      !isRoutePickerPresented
+    else { return }
+
     controlsTask = Task { @MainActor in
       try? await Task.sleep(for: .seconds(2.0))
-      guard !Task.isCancelled, !showSettingsPanel, !showSpeedPanel, !showInfo, !isScrubbing, !isGestureInteracting, !isControlsInteractionActive else { return }
-      withAnimation(.easeIn(duration: 0.22)) {
+      guard !Task.isCancelled,
+        activeIsPlaying,
+        !showSettingsPanel,
+        !showSpeedPanel,
+        !showQueuePanel,
+        !showInfo,
+        !isRoutePickerPresented,
+        !isScrubbing,
+        !isGestureInteracting,
+        !isControlsInteractionActive
+      else { return }
+
+      withAnimation(.easeInOut(duration: 0.24)) {
         controlsVisible = false
       }
     }
@@ -1240,9 +1759,6 @@ struct PlayerScreen: View {
       : String(format: "%02d:%02d", minutes, secs)
   }
 
-  private func shouldUseVLC(_ source: VideoSource) -> Bool {
-    source.isOriginal && currentItem.prefersVLCForOriginal && VLCAvailability.isAvailable
-  }
 }
 
 private struct PlayerInfoSheet: View {
@@ -1252,29 +1768,84 @@ private struct PlayerInfoSheet: View {
   let videoLayout: PlayerVideoLayout
   let playbackRate: Float
   let playlistCount: Int
+  let localMetadata: LocalMediaMetadata?
+  let networkMbps: Double
+  let bufferedDuration: Double
+  let playbackEngine: String
 
   var body: some View {
     NavigationStack {
       List {
+        if let localMetadata, localMetadata.hasUsefulMetadata {
+          Section("本地元数据") {
+            if let title = localMetadata.title { LabeledContent("标题", value: title) }
+            if let year = localMetadata.year { LabeledContent("年份", value: year) }
+            if let genre = localMetadata.genre { LabeledContent("类型", value: genre) }
+            if let studio = localMetadata.studio { LabeledContent("制片", value: studio) }
+            if let showTitle = localMetadata.showTitle { LabeledContent("剧集", value: showTitle) }
+            if let season = localMetadata.season, let episode = localMetadata.episode {
+              LabeledContent("集数", value: String(format: "S%02dE%02d", season, episode))
+            }
+            if let director = localMetadata.director { LabeledContent("导演", value: director) }
+            if let rating = localMetadata.rating { LabeledContent("评分", value: rating) }
+            if let overview = localMetadata.overview {
+              VStack(alignment: .leading, spacing: 6) {
+                Text("简介").font(.caption).foregroundStyle(.secondary)
+                Text(overview).font(.subheadline)
+              }
+            }
+          }
+        }
+
         Section("视频") {
           LabeledContent("名称", value: item.name)
           LabeledContent("大小", value: item.formattedSize)
-          if !item.formattedDuration.isEmpty {
-            LabeledContent("时长", value: item.formattedDuration)
-          }
           if !item.fileExtension.isEmpty {
             LabeledContent("格式", value: item.fileExtension.uppercased())
+          }
+          if let size = model?.videoDisplaySize, size.width > 0, size.height > 0 {
+            LabeledContent("分辨率", value: "\(Int(size.width.rounded())) × \(Int(size.height.rounded()))")
+          }
+          if let codec = model?.videoCodec, !codec.isEmpty {
+            LabeledContent("视频编码", value: codec)
+          }
+          if let hdr = model?.hdrFormat, !hdr.isEmpty {
+            LabeledContent("HDR", value: hdr)
+          }
+          if let fps = model?.nominalFrameRate, fps > 0.1 {
+            LabeledContent("帧率", value: String(format: "%.3g fps", fps))
+          }
+          if item.isDiscImage {
+            LabeledContent("原盘模式", value: "ISO/IMG 主标题尝试")
           }
         }
 
         Section("播放") {
-          LabeledContent("当前清晰度", value: model?.selectedSource?.title ?? "读取中")
+          LabeledContent("播放内核", value: playbackEngine)
+          LabeledContent("当前清晰度", value: model?.selectedSource?.title ?? "原画")
           LabeledContent("画面模式", value: videoLayout.title)
           LabeledContent("播放速度", value: playbackRate == 1 ? "1x" : String(format: "%gx", playbackRate))
           LabeledContent("同目录队列", value: "\(playlistCount) 个视频")
           LabeledContent("音轨", value: "\(model?.audioOptions.count ?? 0) 个可选")
           LabeledContent("字幕", value: "\(model?.subtitleOptions.count ?? 0) 个可选")
-          LabeledContent("画中画", value: "支持")
+          LabeledContent("画中画", value: playbackEngine == "AVPlayer" ? "支持" : "当前内核不支持")
+          if model?.hdrFormat == "Dolby Vision" {
+            LabeledContent(
+              "Dolby Vision",
+              value: AVPlayer.eligibleForHDRPlayback ? "系统原生 HDR 管线" : "当前显示设备不具备 HDR 播放资格"
+            )
+          }
+        }
+
+        Section("网络") {
+          LabeledContent(
+            "实时速度",
+            value: networkMbps > 0.01 ? String(format: "%.1f Mbps", networkMbps) : "--"
+          )
+          LabeledContent(
+            "已缓冲",
+            value: bufferedDuration > 0 ? formatTime(bufferedDuration) : "--"
+          )
         }
 
         Section("手势") {
@@ -1298,6 +1869,161 @@ private struct PlayerInfoSheet: View {
       .navigationTitle("播放详情")
       .navigationBarTitleDisplayMode(.inline)
     }
+  }
+
+  private func formatTime(_ seconds: Double) -> String {
+    let value = max(0, Int(seconds.rounded()))
+    let hours = value / 3600
+    let minutes = (value % 3600) / 60
+    let secs = value % 60
+    return hours > 0
+      ? String(format: "%d:%02d:%02d", hours, minutes, secs)
+      : String(format: "%02d:%02d", minutes, secs)
+  }
+}
+
+
+@MainActor
+private final class RemotePlaybackCoordinator {
+  static let shared = RemotePlaybackCoordinator()
+
+  private let commandCenter = MPRemoteCommandCenter.shared()
+  private let nowPlayingCenter = MPNowPlayingInfoCenter.default()
+  private var commandTokens: [Any] = []
+
+  private var onPlay: (() -> Void)?
+  private var onPause: (() -> Void)?
+  private var onToggle: (() -> Void)?
+  private var onSeek: ((Double) -> Void)?
+  private var onSkipBackward: (() -> Void)?
+  private var onSkipForward: (() -> Void)?
+  private var onPrevious: (() -> Void)?
+  private var onNext: (() -> Void)?
+
+  private init() {
+    commandTokens.append(commandCenter.playCommand.addTarget { [weak self] _ in
+      Task { @MainActor in self?.onPlay?() }
+      return .success
+    })
+    commandTokens.append(commandCenter.pauseCommand.addTarget { [weak self] _ in
+      Task { @MainActor in self?.onPause?() }
+      return .success
+    })
+    commandTokens.append(commandCenter.togglePlayPauseCommand.addTarget { [weak self] _ in
+      Task { @MainActor in self?.onToggle?() }
+      return .success
+    })
+    commandTokens.append(commandCenter.skipBackwardCommand.addTarget { [weak self] _ in
+      Task { @MainActor in self?.onSkipBackward?() }
+      return .success
+    })
+    commandTokens.append(commandCenter.skipForwardCommand.addTarget { [weak self] _ in
+      Task { @MainActor in self?.onSkipForward?() }
+      return .success
+    })
+    commandTokens.append(commandCenter.previousTrackCommand.addTarget { [weak self] _ in
+      Task { @MainActor in self?.onPrevious?() }
+      return .success
+    })
+    commandTokens.append(commandCenter.nextTrackCommand.addTarget { [weak self] _ in
+      Task { @MainActor in self?.onNext?() }
+      return .success
+    })
+    commandTokens.append(commandCenter.changePlaybackPositionCommand.addTarget { [weak self] event in
+      guard let event = event as? MPChangePlaybackPositionCommandEvent else {
+        return .commandFailed
+      }
+      let position = event.positionTime
+      Task { @MainActor in self?.onSeek?(position) }
+      return .success
+    })
+
+    setCommandsEnabled(false)
+  }
+
+  func activate(
+    skipSeconds: Int,
+    onPlay: @escaping () -> Void,
+    onPause: @escaping () -> Void,
+    onToggle: @escaping () -> Void,
+    onSeek: @escaping (Double) -> Void,
+    onSkipBackward: @escaping () -> Void,
+    onSkipForward: @escaping () -> Void,
+    onPrevious: (() -> Void)?,
+    onNext: (() -> Void)?
+  ) {
+    self.onPlay = onPlay
+    self.onPause = onPause
+    self.onToggle = onToggle
+    self.onSeek = onSeek
+    self.onSkipBackward = onSkipBackward
+    self.onSkipForward = onSkipForward
+    self.onPrevious = onPrevious
+    self.onNext = onNext
+
+    commandCenter.playCommand.isEnabled = true
+    commandCenter.pauseCommand.isEnabled = true
+    commandCenter.togglePlayPauseCommand.isEnabled = true
+    commandCenter.changePlaybackPositionCommand.isEnabled = true
+    commandCenter.skipBackwardCommand.isEnabled = true
+    commandCenter.skipForwardCommand.isEnabled = true
+    commandCenter.previousTrackCommand.isEnabled = onPrevious != nil
+    commandCenter.nextTrackCommand.isEnabled = onNext != nil
+    commandCenter.skipBackwardCommand.preferredIntervals = [NSNumber(value: skipSeconds)]
+    commandCenter.skipForwardCommand.preferredIntervals = [NSNumber(value: skipSeconds)]
+  }
+
+  func setMetadata(title: String, subtitle: String, artworkData: Data?) {
+    var info = nowPlayingCenter.nowPlayingInfo ?? [:]
+    info[MPMediaItemPropertyTitle] = title
+    info[MPMediaItemPropertyAlbumTitle] = subtitle
+    info[MPNowPlayingInfoPropertyMediaType] = NSNumber(value: MPNowPlayingInfoMediaType.video.rawValue)
+
+    if let artworkData, let image = UIImage(data: artworkData) {
+      info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+    } else {
+      info.removeValue(forKey: MPMediaItemPropertyArtwork)
+    }
+    nowPlayingCenter.nowPlayingInfo = info
+  }
+
+  func updatePlayback(elapsed: Double, duration: Double, rate: Float, isPlaying: Bool) {
+    var info = nowPlayingCenter.nowPlayingInfo ?? [:]
+    if elapsed.isFinite {
+      info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = max(elapsed, 0)
+    }
+    if duration.isFinite, duration > 0 {
+      info[MPMediaItemPropertyPlaybackDuration] = duration
+    }
+    info[MPNowPlayingInfoPropertyPlaybackRate] = rate
+    info[MPNowPlayingInfoPropertyDefaultPlaybackRate] = rate > 0 ? rate : 1.0
+    nowPlayingCenter.nowPlayingInfo = info
+    nowPlayingCenter.playbackState = isPlaying ? .playing : .paused
+  }
+
+  func deactivate() {
+    onPlay = nil
+    onPause = nil
+    onToggle = nil
+    onSeek = nil
+    onSkipBackward = nil
+    onSkipForward = nil
+    onPrevious = nil
+    onNext = nil
+    setCommandsEnabled(false)
+    nowPlayingCenter.nowPlayingInfo = nil
+    nowPlayingCenter.playbackState = .stopped
+  }
+
+  private func setCommandsEnabled(_ enabled: Bool) {
+    commandCenter.playCommand.isEnabled = enabled
+    commandCenter.pauseCommand.isEnabled = enabled
+    commandCenter.togglePlayPauseCommand.isEnabled = enabled
+    commandCenter.changePlaybackPositionCommand.isEnabled = enabled
+    commandCenter.skipBackwardCommand.isEnabled = enabled
+    commandCenter.skipForwardCommand.isEnabled = enabled
+    commandCenter.previousTrackCommand.isEnabled = enabled
+    commandCenter.nextTrackCommand.isEnabled = enabled
   }
 }
 

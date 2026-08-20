@@ -14,16 +14,18 @@ struct FavoritesView: View {
         )
       } else {
         ScrollView {
-          LazyVGrid(columns: columns, spacing: 18) {
+          LazyVGrid(columns: columns, spacing: 14) {
             ForEach(appState.libraryStore.favorites) { item in
               VideoCard(item: item) {
                 selectedVideo = item
               }
             }
           }
-          .padding(.horizontal, 14)
-          .padding(.top, 10)
-          .padding(.bottom, 30)
+          .id("favorites-grid-\(safeGridColumns)")
+          .transaction { transaction in
+            transaction.animation = nil
+          }
+          .padding(14)
         }
       }
     }
@@ -31,10 +33,14 @@ struct FavoritesView: View {
     .fullScreenCover(item: $selectedVideo) { PlayerScreen(item: $0) }
   }
 
+  private var safeGridColumns: Int {
+    min(max(appState.gridColumns, 2), 4)
+  }
+
   private var columns: [GridItem] {
     Array(
-      repeating: GridItem(.flexible(), spacing: 11, alignment: .top),
-      count: appState.gridColumns
+      repeating: GridItem(.flexible(minimum: 0), spacing: 10, alignment: .top),
+      count: safeGridColumns
     )
   }
 }

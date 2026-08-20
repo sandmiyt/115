@@ -9,6 +9,39 @@ struct CloudFolderPage {
   let servedFromCache: Bool
 }
 
+struct LocalMediaMetadata: Sendable {
+  let title: String?
+  let overview: String?
+  let year: String?
+  let genre: String?
+  let studio: String?
+  let showTitle: String?
+  let season: Int?
+  let episode: Int?
+  let director: String?
+  let rating: String?
+  let posterData: Data?
+  let fanartData: Data?
+
+  var hasUsefulMetadata: Bool {
+    title != nil || overview != nil || year != nil || genre != nil || studio != nil
+      || showTitle != nil || season != nil || episode != nil || director != nil || rating != nil
+      || posterData != nil || fanartData != nil
+  }
+
+  func displayTitle(fallback: String) -> String {
+    if let showTitle, !showTitle.isEmpty, let season, let episode {
+      let episodeCode = String(format: "S%02dE%02d", season, episode)
+      if let title, !title.isEmpty {
+        return "\(showTitle) · \(episodeCode) · \(title)"
+      }
+      return "\(showTitle) · \(episodeCode)"
+    }
+    if let title, !title.isEmpty { return title }
+    return fallback
+  }
+}
+
 protocol CloudProvider {
   func validateCredentials() async throws
   func listFolder(id: String) async throws -> [CloudItem]
@@ -19,6 +52,7 @@ protocol CloudProvider {
     forceRefresh: Bool
   ) async throws -> CloudFolderPage
   func videoSources(for item: CloudItem) async throws -> [VideoSource]
+  func localMetadata(for item: CloudItem) async -> LocalMediaMetadata?
   func updateVideoHistory(pickCode: String, seconds: Int, watchEnd: Bool) async
   func clearMountCache() async
 }
@@ -43,6 +77,7 @@ extension CloudProvider {
     return all
   }
 
+  func localMetadata(for item: CloudItem) async -> LocalMediaMetadata? { nil }
   func clearMountCache() async {}
 }
 

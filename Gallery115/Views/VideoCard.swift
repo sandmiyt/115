@@ -45,14 +45,16 @@ struct VideoCard: View {
   }
 
   private var resumeProgress: Double {
-    guard item.duration > 0 else { return 0 }
+    let duration = appState.libraryStore.knownDuration(for: item)
+    guard duration > 0 else { return 0 }
     let position = appState.libraryStore.resumePosition(for: item)
-    guard position > 2, position < item.duration - 8 else { return 0 }
-    return min(max(position / item.duration, 0), 1)
+    guard position > 2, position < duration - 8 else { return 0 }
+    return min(max(position / duration, 0), 1)
   }
 }
 
 struct MediaArtworkCard: View {
+  @Environment(AppState.self) private var appState
   let item: CloudItem
   let progress: Double?
 
@@ -79,8 +81,8 @@ struct MediaArtworkCard: View {
 
         Spacer(minLength: 6)
 
-        if !item.formattedDuration.isEmpty {
-          Text(item.formattedDuration)
+        if !effectiveDurationText.isEmpty {
+          Text(effectiveDurationText)
             .font(.caption2.monospacedDigit().weight(.semibold))
             .foregroundStyle(.white)
             .padding(.horizontal, 6)
@@ -112,6 +114,18 @@ struct MediaArtworkCard: View {
         .stroke(.primary.opacity(0.08), lineWidth: 0.6)
     }
     .shadow(color: .black.opacity(0.08), radius: 8, y: 3)
+  }
+
+  private var effectiveDurationText: String {
+    let duration = appState.libraryStore.knownDuration(for: item)
+    guard duration > 0 else { return "" }
+    let total = Int(duration.rounded())
+    let hours = total / 3600
+    let minutes = (total % 3600) / 60
+    let seconds = total % 60
+    return hours > 0
+      ? String(format: "%d:%02d:%02d", hours, minutes, seconds)
+      : String(format: "%02d:%02d", minutes, seconds)
   }
 }
 
