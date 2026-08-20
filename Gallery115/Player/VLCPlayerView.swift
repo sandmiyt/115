@@ -23,7 +23,7 @@ import SwiftUI
     private var item: CloudItem?
     private var libraryStore: LibraryStore?
     private var lastSavedSecond = -1
-    private var lastState: VLCMediaPlayerState = .nothingSpecial
+    private var lastState: VLCMediaPlayerState = .stopped
     private var maxObservedTime: Double = 0
 
     func configure(
@@ -121,7 +121,9 @@ import SwiftUI
     func setVolume(_ value: Float) {
       let clamped = min(max(value, 0), 1)
       volume = clamped
-      player.audio.volume = Int32((clamped * 100).rounded())
+      if let audio = player.audio {
+        audio.volume = Int32((clamped * 100).rounded())
+      }
     }
 
     func replay() {
@@ -138,7 +140,7 @@ import SwiftUI
       player.drawable = nil
       isPlaying = false
       isBuffering = false
-      lastState = .nothingSpecial
+      lastState = .stopped
     }
 
     private func startPolling() {
@@ -163,7 +165,9 @@ import SwiftUI
 
       isPlaying = state == .playing
       isBuffering = state == .opening
-      volume = Float(player.audio.volume) / 100
+      if let audio = player.audio {
+        volume = Float(audio.volume) / 100
+      }
 
       if let media = player.media {
         let stats = media.statistics
