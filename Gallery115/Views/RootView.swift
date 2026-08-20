@@ -164,22 +164,25 @@ private struct LaunchHeroOverlay: View {
         x: endCenter.x - distanceX * 0.10 + 6,
         y: endCenter.y - distanceY * 0.16 + 12
       )
-      var center = cubicPoint(
+      let pathCenter = cubicPoint(
         from: startCenter,
         control1: control1,
         control2: control2,
         to: endCenter,
         progress: systemEase(t)
       )
-      center.y -= 3.5 * liftAmount
+      let center = CGPoint(
+        x: pathCenter.x,
+        y: pathCenter.y - 3.5 * liftAmount
+      )
 
       let destinationSize = max(destination.width, 48)
       // Keep scaleProgress unclamped on purpose. A snappy spring can briefly
       // travel a few percent beyond 1, producing a tiny magnetic settle at the
       // destination without making the position itself bounce.
       let sizeP = max(0, scaleProgress)
-      var logoSize = 120 + (destinationSize - 120) * sizeP
-      logoSize *= 1 + 0.022 * liftAmount
+      let baseLogoSize = 120 + (destinationSize - 120) * sizeP
+      let logoSize = baseLogoSize * (1 + 0.022 * liftAmount)
 
       // Preserve the launch screen for the first beat, then reveal Home a touch
       // faster near the end so the destination is visually ready before the

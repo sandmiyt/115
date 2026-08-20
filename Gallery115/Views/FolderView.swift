@@ -73,20 +73,10 @@ struct FolderView: View {
     .onChange(of: sortMode) { _, _ in rebuildDisplayItems() }
     .task(id: query) { await updateSearchResults() }
     .toolbar {
-      ToolbarItemGroup(placement: .topBarTrailing) {
-        Button {
-          Task { await refreshCurrentFolder() }
-        } label: {
-          if isRefreshing {
-            ProgressView()
-              .controlSize(.small)
-          } else {
-            Image(systemName: "arrow.clockwise")
-          }
-        }
-        .disabled(isRefreshing)
-        .accessibilityLabel(isRefreshing ? "正在刷新资料库" : "刷新资料库")
-
+      ToolbarItem(placement: .topBarTrailing) {
+        // The visible control is now the refresh button the user asked for.
+        // A long press still exposes the existing view/sort options, so this
+        // change does not remove stable browsing features or add toolbar clutter.
         Menu {
           Section("视图") {
             Button {
@@ -133,8 +123,19 @@ struct FolderView: View {
             }
           }
         } label: {
-          Image(systemName: "line.3.horizontal.decrease.circle")
+          if isRefreshing {
+            ProgressView()
+              .controlSize(.small)
+          } else {
+            Image(systemName: "arrow.clockwise")
+          }
+        } primaryAction: {
+          guard !isRefreshing else { return }
+          Task { await refreshCurrentFolder() }
         }
+        .disabled(isRefreshing)
+        .accessibilityLabel(isRefreshing ? "正在刷新资料库" : "刷新资料库")
+        .accessibilityHint("轻点立即刷新；长按可调整视图和排序")
       }
     }
     .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -346,12 +347,12 @@ struct FolderView: View {
     isRefreshing = true
     defer { isRefreshing = false }
 
-    // Keep roughly the same amount of the directory mounted on screen after a
-    // refresh. The first forced page makes WebDAVProvider replace its complete
-    // directory cache from OpenList; the following pages are sliced from that
-    // fresh in-memory snapshot, so additions and removals stay synchronized
-    // without throwing away the user's already-loaded scroll range.
-    let desiredCount = max(items.count, pageSize)
+    // Manual refresh means a real directory synchronization, not just a repaint
+    // of the currently visible page. The first forced page invalidates both
+    // OpenList's storage cache and Cineva's WebDAV caches; the following slices
+    // come from that fresh snapshot. Reading every slice guarantees a new file
+    // is visible even when its name would sort beyond the pages already loaded,
+    // and guarantees remote deletions disappear immediately.
     var refreshed: [CloudItem] = []
     var offset = 0
     var lastPage: CloudFolderPage?
@@ -367,7 +368,7 @@ struct FolderView: View {
         lastPage = page
         refreshed.append(contentsOf: page.items)
         offset += page.limit
-        if !page.hasMore || refreshed.count >= desiredCount { break }
+        if !page.hasMore { break }
       } while true
 
       var known = Set<String>()

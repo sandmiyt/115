@@ -76,7 +76,17 @@ actor WebDAVProvider: CloudProvider {
     } else {
       do {
         if forceRefresh {
+          // Cineva's local caches are only half of the story. OpenList/AList
+          // itself caches mounted-storage directory listings (commonly for
+          // tens of minutes). Best-effort refresh that server-side cache first
+          // using the already saved OpenList account, then re-read through
+          // WebDAV so newly added/removed cloud files become visible now.
+          _ = await refreshOpenListDirectoryCache(
+            configuration: configuration,
+            logicalPath: path
+          )
           rawDirectoryCache.removeValue(forKey: configuration.cacheNamespace + "|raw|" + path)
+          memoryCache.removeValue(forKey: cacheKey)
           metadataCache.removeAll()
           metadataMisses.removeAll()
         }
@@ -320,6 +330,96 @@ actor WebDAVProvider: CloudProvider {
     )
   }
 
+  /// Best-effort invalidation of OpenList/AList's own storage listing cache.
+  ///
+  /// The WebDAV endpoint can legitimately return an old directory even after
+  /// Cineva clears its local caches because OpenList caches storage listings on
+  /// the server. We deliberately obtain a short-lived login token only for this
+  /// manual refresh and never persist it. If the account has 2FA enabled, lacks
+  /// refresh permission, or the server is not OpenList/AList-compatible, normal
+  /// forced WebDAV refresh continues as a safe fallback.
+  private func refreshOpenListDirectoryCache(
+    configuration: WebDAVMountConfiguration,
+    logicalPath: String
+  ) async -> Bool {
+    guard !configuration.username.isEmpty,
+      let baseURL = openListBaseURL(configuration: configuration)
+    else { return false }
+
+    do {
+      let loginURL = baseURL
+        .appending(path: "api")
+        .appending(path: "auth")
+        .appending(path: "login")
+      var loginRequest = URLRequest(url: loginURL)
+      loginRequest.httpMethod = "POST"
+      loginRequest.timeoutInterval = 15
+      loginRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+      loginRequest.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+      loginRequest.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+      loginRequest.httpBody = try JSONSerialization.data(withJSONObject: [
+        "username": configuration.username,
+        "password": configuration.password,
+        "otp_code": "",
+      ])
+
+      let (loginData, loginResponse) = try await session.data(for: loginRequest)
+      guard let loginHTTP = loginResponse as? HTTPURLResponse,
+        (200...299).contains(loginHTTP.statusCode),
+        let loginJSON = try JSONSerialization.jsonObject(with: loginData) as? [String: Any],
+        (loginJSON["code"] as? NSNumber)?.intValue == 200,
+        let loginPayload = loginJSON["data"] as? [String: Any],
+        let token = loginPayload["token"] as? String,
+        !token.isEmpty
+      else { return false }
+
+      let listURL = baseURL
+        .appending(path: "api")
+        .appending(path: "fs")
+        .appending(path: "list")
+      var listRequest = URLRequest(url: listURL)
+      listRequest.httpMethod = "POST"
+      listRequest.timeoutInterval = 25
+      listRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+      listRequest.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+      listRequest.setValue(token, forHTTPHeaderField: "Authorization")
+      listRequest.setValue("no-cache, no-store, max-age=0", forHTTPHeaderField: "Cache-Control")
+      listRequest.setValue("no-cache", forHTTPHeaderField: "Pragma")
+      listRequest.httpBody = try JSONSerialization.data(withJSONObject: [
+        "path": normalizeLogicalPath(logicalPath),
+        "password": "",
+        "page": 1,
+        "per_page": 1,
+        "refresh": true,
+      ])
+
+      let (listData, listResponse) = try await session.data(for: listRequest)
+      guard let listHTTP = listResponse as? HTTPURLResponse,
+        (200...299).contains(listHTTP.statusCode),
+        let listJSON = try JSONSerialization.jsonObject(with: listData) as? [String: Any],
+        (listJSON["code"] as? NSNumber)?.intValue == 200
+      else { return false }
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  private func openListBaseURL(configuration: WebDAVMountConfiguration) -> URL? {
+    guard let webDAVURL = configuration.normalizedWebDAVURL,
+      var components = URLComponents(url: webDAVURL, resolvingAgainstBaseURL: false)
+    else { return nil }
+
+    var segments = components.path.split(separator: "/").map(String.init)
+    if segments.last?.lowercased() == "dav" {
+      segments.removeLast()
+    }
+    components.path = segments.isEmpty ? "/" : "/" + segments.joined(separator: "/")
+    components.query = nil
+    components.fragment = nil
+    return components.url
+  }
+
   private func fetchDirectory(
     configuration: WebDAVMountConfiguration,
     logicalPath: String
@@ -454,6 +554,8 @@ actor WebDAVProvider: CloudProvider {
     request.setValue(depth, forHTTPHeaderField: "Depth")
     request.setValue("application/xml; charset=utf-8", forHTTPHeaderField: "Content-Type")
     request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+    request.setValue("no-cache, no-store, max-age=0", forHTTPHeaderField: "Cache-Control")
+    request.setValue("no-cache", forHTTPHeaderField: "Pragma")
     if let authorization = configuration.authorizationHeader {
       request.setValue(authorization, forHTTPHeaderField: "Authorization")
     }
