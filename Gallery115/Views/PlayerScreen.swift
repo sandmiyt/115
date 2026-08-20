@@ -37,6 +37,9 @@ struct PlayerScreen: View {
   @State private var isControlsInteractionActive = false
   @State private var gestureStartBrightness: CGFloat?
   @State private var gestureStartVolume: Float?
+  @State private var videoScale: CGFloat = 1.0
+  @State private var pinchStartScale: CGFloat = 1.0
+  @State private var isPinchInteracting = false
   @State private var externalSubtitleTracks: [ExternalSubtitleTrack] = []
   @State private var selectedExternalSubtitleID: String?
   @State private var externalSubtitleCues: [SubtitleCue] = []
@@ -73,7 +76,9 @@ struct PlayerScreen: View {
 
         playerLayer
           .frame(width: proxy.size.width, height: proxy.size.height)
+          .scaleEffect(videoScale, anchor: .center)
           .background(Color.black)
+          .clipped()
           .ignoresSafeArea()
 
         interactionLayer(proxy: proxy)
@@ -350,7 +355,40 @@ struct PlayerScreen: View {
       gestureSurface(isLeft: false, proxy: proxy)
     }
     .ignoresSafeArea()
+    .highPriorityGesture(videoPinchGesture)
     .allowsHitTesting(!isLocked)
+  }
+
+  private var videoPinchGesture: some Gesture {
+    MagnificationGesture()
+      .onChanged { value in
+        guard appState.playerGesturesEnabled, !isLocked else { return }
+        if !isPinchInteracting {
+          isPinchInteracting = true
+          pinchStartScale = videoScale
+          // A pinch is always a two-finger picture gesture. Clear any pending
+          // one-finger brightness/volume baseline so the two gesture families
+          // cannot keep updating each other during the same touch sequence.
+          gestureStartBrightness = nil
+          gestureStartVolume = nil
+          isGestureInteracting = false
+          controlsTask?.cancel()
+        }
+        let next = min(max(pinchStartScale * value, 0.75), 3.0)
+        videoScale = next
+        updateContinuousGestureHUD("画面  \(Int((next * 100).rounded()))%")
+      }
+      .onEnded { value in
+        guard appState.playerGesturesEnabled, !isLocked else {
+          isPinchInteracting = false
+          return
+        }
+        videoScale = min(max(pinchStartScale * value, 0.75), 3.0)
+        pinchStartScale = videoScale
+        isPinchInteracting = false
+        finishContinuousGestureHUD()
+        scheduleControlsHide()
+      }
   }
 
   @ViewBuilder
@@ -390,7 +428,7 @@ struct PlayerScreen: View {
       .simultaneousGesture(
         DragGesture(minimumDistance: 16)
           .onChanged { value in
-            guard appState.playerGesturesEnabled else { return }
+            guard appState.playerGesturesEnabled, !isPinchInteracting else { return }
             let dx = value.translation.width
             let dy = value.translation.height
             guard abs(dy) >= abs(dx) else { return }
@@ -407,16 +445,22 @@ struct PlayerScreen: View {
               let start = gestureStartBrightness ?? UIScreen.main.brightness
               let next = min(max(start + normalizedDelta, 0), 1)
               UIScreen.main.brightness = next
-              showGestureHUD("亮度  \(Int(next * 100))%")
+              updateContinuousGestureHUD("亮度  \(Int((next * 100).rounded()))%")
             } else {
               let start = CGFloat(gestureStartVolume ?? activeVolume)
               let next = min(max(start + normalizedDelta, 0), 1)
               setActiveVolume(Float(next))
-              showGestureHUD("音量  \(Int(next * 100))%")
+              updateContinuousGestureHUD("音量  \(Int((next * 100).rounded()))%")
             }
           }
           .onEnded { value in
             guard appState.playerGesturesEnabled else { return }
+            if isPinchInteracting {
+              gestureStartBrightness = nil
+              gestureStartVolume = nil
+              isGestureInteracting = false
+              return
+            }
             let dx = value.translation.width
             let dy = value.translation.height
 
@@ -429,6 +473,7 @@ struct PlayerScreen: View {
 
             gestureStartBrightness = nil
             gestureStartVolume = nil
+            if isGestureInteracting { finishContinuousGestureHUD() }
             isGestureInteracting = false
             scheduleControlsHide()
           }
@@ -2062,6 +2107,9 @@ struct PlayerScreen: View {
     model = nil
     useVLC = false
     localMetadata = nil
+    videoScale = 1.0
+    pinchStartScale = 1.0
+    isPinchInteracting = false
     if item.parentID != loadedPlaylistParentID {
       loadedPlaylistParentID = nil
     }
@@ -2163,17 +2211,40 @@ struct PlayerScreen: View {
   }
 
   @MainActor
+  private func updateContinuousGestureHUD(_ message: String) {
+    hudTask?.cancel()
+    if gestureHUD == nil {
+      withAnimation(.easeOut(duration: 0.10)) { gestureHUD = message }
+    } else {
+      // During a live drag/pinch, update the monospaced number directly. Starting
+      // a new transition animation and hide task for every touch sample made the
+      // brightness/volume HUD visibly lag behind the finger.
+      gestureHUD = message
+    }
+  }
+
+  @MainActor
+  private func finishContinuousGestureHUD() {
+    hudTask?.cancel()
+    hudTask = Task { @MainActor in
+      try? await Task.sleep(for: .milliseconds(650))
+      guard !Task.isCancelled else { return }
+      withAnimation(.easeIn(duration: 0.14)) { gestureHUD = nil }
+    }
+  }
+
+  @MainActor
   private func showGestureHUD(_ message: String) {
     hudTask?.cancel()
-    withAnimation(.easeOut(duration: 0.16)) {
+    if gestureHUD == nil {
+      withAnimation(.easeOut(duration: 0.12)) { gestureHUD = message }
+    } else {
       gestureHUD = message
     }
     hudTask = Task { @MainActor in
       try? await Task.sleep(for: .milliseconds(950))
       guard !Task.isCancelled else { return }
-      withAnimation(.easeIn(duration: 0.18)) {
-        gestureHUD = nil
-      }
+      withAnimation(.easeIn(duration: 0.16)) { gestureHUD = nil }
     }
   }
 

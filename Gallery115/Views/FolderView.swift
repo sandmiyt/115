@@ -36,6 +36,7 @@ struct FolderView: View {
   @State private var selectedVideo: CloudItem?
   @State private var nextOffset = 0
   @State private var hasMore = true
+  @State private var isRefreshing = false
   @State private var showMediaSetup = false
 
   var body: some View {
@@ -74,13 +75,40 @@ struct FolderView: View {
     .toolbar {
       ToolbarItemGroup(placement: .topBarTrailing) {
         Button {
-          appState.browserLayout = appState.browserLayout == .grid ? .list : .grid
+          Task { await refreshCurrentFolder() }
         } label: {
-          Image(systemName: appState.browserLayout == .grid ? "list.bullet" : "square.grid.2x2")
+          if isRefreshing {
+            ProgressView()
+              .controlSize(.small)
+          } else {
+            Image(systemName: "arrow.clockwise")
+          }
         }
-        .accessibilityLabel(appState.browserLayout == .grid ? "切换列表" : "切换封面墙")
+        .disabled(isRefreshing)
+        .accessibilityLabel(isRefreshing ? "正在刷新资料库" : "刷新资料库")
 
         Menu {
+          Section("视图") {
+            Button {
+              appState.browserLayout = .grid
+            } label: {
+              if appState.browserLayout == .grid {
+                Label("封面墙", systemImage: "checkmark")
+              } else {
+                Text("封面墙")
+              }
+            }
+            Button {
+              appState.browserLayout = .list
+            } label: {
+              if appState.browserLayout == .list {
+                Label("列表", systemImage: "checkmark")
+              } else {
+                Text("列表")
+              }
+            }
+          }
+
           Section("排序") {
             Picker("排序", selection: $sortMode) {
               ForEach(SortMode.allCases) { mode in
@@ -205,7 +233,7 @@ struct FolderView: View {
         .padding(.top, 10)
         .padding(.bottom, 30)
       }
-      .refreshable { await loadFirstPage(forceRefresh: true) }
+      .refreshable { await refreshCurrentFolder() }
 
     case .list:
       List {
@@ -241,7 +269,7 @@ struct FolderView: View {
         }
       }
       .listStyle(.plain)
-      .refreshable { await loadFirstPage(forceRefresh: true) }
+      .refreshable { await refreshCurrentFolder() }
     }
   }
 
@@ -311,6 +339,62 @@ struct FolderView: View {
       .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
   }
 
+
+  @MainActor
+  private func refreshCurrentFolder() async {
+    guard appState.isConfigured, appState.isAppUnlocked, !isRefreshing else { return }
+    isRefreshing = true
+    defer { isRefreshing = false }
+
+    // Keep roughly the same amount of the directory mounted on screen after a
+    // refresh. The first forced page makes WebDAVProvider replace its complete
+    // directory cache from OpenList; the following pages are sliced from that
+    // fresh in-memory snapshot, so additions and removals stay synchronized
+    // without throwing away the user's already-loaded scroll range.
+    let desiredCount = max(items.count, pageSize)
+    var refreshed: [CloudItem] = []
+    var offset = 0
+    var lastPage: CloudFolderPage?
+
+    do {
+      repeat {
+        let page = try await appState.api.listFolderPage(
+          id: folderID,
+          offset: offset,
+          limit: pageSize,
+          forceRefresh: offset == 0
+        )
+        lastPage = page
+        refreshed.append(contentsOf: page.items)
+        offset += page.limit
+        if !page.hasMore || refreshed.count >= desiredCount { break }
+      } while true
+
+      var known = Set<String>()
+      items = refreshed.filter { known.insert($0.id).inserted }
+      searchItems = nil
+      rebuildDisplayItems()
+      nextOffset = offset
+      hasMore = lastPage?.hasMore ?? false
+      errorMessage = nil
+
+      if lastPage?.servedFromCache == true {
+        appState.markMediaUsingCache()
+        transientMessage = "媒体服务器暂时不可用，已保留当前资料库缓存。"
+      } else {
+        appState.markMediaConnected()
+        transientMessage = nil
+        didScheduleBackgroundRefresh = true
+      }
+
+      if !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        await updateSearchResults()
+      }
+    } catch {
+      appState.markMediaOffline()
+      transientMessage = "刷新失败，已保留当前资料库。"
+    }
+  }
 
   @MainActor
   private func loadFirstPage(forceRefresh: Bool) async {
