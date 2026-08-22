@@ -64,7 +64,6 @@ struct PlayerScreen: View {
   @State private var dismissControlsWereVisible = false
   @State private var dismissRestoreTask: Task<Void, Never>?
   @State private var dragIntent: PlayerDragIntent = .undecided
-  @State private var dismissDragOriginTranslation: CGSize = .zero
   @State private var singleFingerGestureSuppressedUntil: TimeInterval = 0
   @State private var externalSubtitleTracks: [ExternalSubtitleTrack] = []
   @State private var selectedExternalSubtitleID: String?
@@ -423,11 +422,11 @@ struct PlayerScreen: View {
   }
 
   private var interactiveDismissProgress: CGFloat {
-    let downwardTravel = max(dismissDragOffset.height, 0)
+    let verticalTravel = abs(dismissDragOffset.height)
     // One normalized, vertical progress value drives scale, corner radius,
     // backdrop and chrome. Horizontal finger drift no longer makes the player
     // unexpectedly shrink or reveal the library underneath.
-    return CGFloat(1.0 - exp(-Double(downwardTravel) / 235.0))
+    return CGFloat(1.0 - exp(-Double(verticalTravel) / 235.0))
   }
 
   private var interactiveDismissMediaScale: CGFloat {
@@ -747,13 +746,12 @@ struct PlayerScreen: View {
     let dy = value.translation.height
     guard hypot(dx, dy) >= 12 else { return }
 
-    // Match a photo viewer's gesture gate: dismissal owns only a deliberate
-    // downward, vertically dominant swipe. Taps, horizontal movement and
-    // upward swipes never make the whole player "float" under the finger.
-    if dy > 0, abs(dy) > abs(dx) * 1.08 {
+    // Acquire the viewer only after the gesture has a clear vertical intent.
+    // Once acquired, movement remains bidirectional so reversing across the
+    // touch origin never changes resistance or creates a sticky top edge.
+    if abs(dy) > abs(dx) * 1.08 {
       dragIntent = .portraitDismiss
-      dismissDragOriginTranslation = value.translation
-    } else if abs(dx) > abs(dy) || dy < 0 {
+    } else if abs(dx) > abs(dy) {
       dragIntent = .ignored
     }
   }
@@ -775,7 +773,6 @@ struct PlayerScreen: View {
 
   private func resetDragIntent() {
     dragIntent = .undecided
-    dismissDragOriginTranslation = .zero
     gestureStartBrightness = nil
     gestureStartVolume = nil
     isGestureInteracting = false
@@ -802,11 +799,7 @@ struct PlayerScreen: View {
       gestureHUD = nil
     }
 
-    let translation = CGSize(
-      width: value.translation.width - dismissDragOriginTranslation.width,
-      height: value.translation.height - dismissDragOriginTranslation.height
-    )
-    dismissDragOffset = rubberBandedDismissTranslation(translation, viewport: viewport)
+    dismissDragOffset = rubberBandedDismissTranslation(value.translation, viewport: viewport)
   }
 
   @MainActor
@@ -822,27 +815,21 @@ struct PlayerScreen: View {
   }
 
   private func rubberBandedDismissTranslation(_ translation: CGSize, viewport: CGSize) -> CGSize {
-    let vertical: CGFloat
-    if translation.height >= 0 {
-      vertical = rubberBandedAxis(translation.height, dimension: viewport.height)
-    } else {
-      // Once a downward dismissal has begun, reversing the finger is allowed
-      // but resisted; it communicates cancellation without turning into an
-      // upward-dismiss gesture.
-      vertical = -rubberBandedBoundedValue(abs(translation.height) * 0.28, limit: 0, dimension: viewport.height)
-    }
     return CGSize(
-      width: rubberBandedAxis(translation.width * 0.92, dimension: viewport.width),
-      height: vertical
+      width: rubberBandedDismissAxis(translation.width, dimension: viewport.width),
+      height: rubberBandedDismissAxis(translation.height, dimension: viewport.height)
     )
   }
 
-  private func rubberBandedAxis(_ value: CGFloat, dimension: CGFloat) -> CGFloat {
+  private func rubberBandedDismissAxis(_ value: CGFloat, dimension: CGFloat) -> CGFloat {
     let sign: CGFloat = value < 0 ? -1 : 1
     let magnitude = abs(value)
-    let threshold = max(dimension, 1) * 0.28
+    // Stay directly under the finger throughout the useful dismissal range.
+    // Resistance begins only after the media is already mostly off-screen,
+    // preventing the "magnetic" edge sensation during a direction reversal.
+    let threshold = max(dimension, 1) * 0.72
     guard magnitude > threshold else { return value }
-    let resistance = max(dimension, 1) * 0.22
+    let resistance = max(dimension, 1) * 0.24
     let overflow = magnitude - threshold
     return sign * (threshold + resistance * (1 - exp(-overflow / resistance)))
   }
@@ -855,21 +842,28 @@ struct PlayerScreen: View {
     }
 
     let height = max(viewport.height, 1)
-    let actualTranslation = CGSize(
-      width: value.translation.width - dismissDragOriginTranslation.width,
-      height: value.translation.height - dismissDragOriginTranslation.height
-    )
-    let projectedTranslation = CGSize(
-      width: value.predictedEndTranslation.width - dismissDragOriginTranslation.width,
-      height: value.predictedEndTranslation.height - dismissDragOriginTranslation.height
-    )
-    let actualY = max(actualTranslation.height, 0)
-    let projectedY = max(projectedTranslation.height, 0)
+    let actualY = value.translation.height
+    let projectedY = value.predictedEndTranslation.height
     let dismissDistance = min(max(height * 0.22, 140), 220)
-    let fastDownwardFlick = value.velocity.height > 650 && projectedY > dismissDistance * 0.72
-    let shouldDismiss = actualY >= dismissDistance
-      || projectedY >= dismissDistance * 1.12
-      || fastDownwardFlick
+    let hasMeaningfulOffset = abs(actualY) > 8
+    let velocityContinuesCurrentDirection = !hasMeaningfulOffset
+      || value.velocity.height * actualY >= 0
+    let projectionStaysOnCurrentSide = !hasMeaningfulOffset
+      || projectedY * actualY >= 0
+    let releaseDirection: CGFloat = {
+      if hasMeaningfulOffset { return actualY < 0 ? -1 : 1 }
+      if abs(projectedY) > 1 { return projectedY < 0 ? -1 : 1 }
+      return value.velocity.height < 0 ? -1 : 1
+    }()
+    let fastVerticalFlick = abs(value.velocity.height) > 650
+      && abs(projectedY) > dismissDistance * 0.72
+      && projectionStaysOnCurrentSide
+      && velocityContinuesCurrentDirection
+    let shouldDismiss = (abs(actualY) >= dismissDistance && velocityContinuesCurrentDirection)
+      || (abs(projectedY) >= dismissDistance * 1.12
+        && projectionStaysOnCurrentSide
+        && velocityContinuesCurrentDirection)
+      || fastVerticalFlick
 
     dismissRestoreTask?.cancel()
     isDismissDragging = false
@@ -881,7 +875,7 @@ struct PlayerScreen: View {
       let horizontalMomentum = min(max(value.velocity.width * 0.12, -viewport.width * 0.24), viewport.width * 0.24)
       let target = CGSize(
         width: dismissDragOffset.width + horizontalMomentum,
-        height: height * 1.08
+        height: releaseDirection * height * 1.08
       )
 
       // SwiftUI springs preserve the gesture's current velocity when the same
@@ -2202,17 +2196,12 @@ struct PlayerScreen: View {
 
   @MainActor
   private func toggleActivePlayback(userInitiated: Bool = false) {
-    let wasPlaying = activeIsPlaying
     withActiveEngine { $0.engineTogglePlayback() }
     updateRemotePlaybackInfo()
     if userInitiated {
       let feedback = UIImpactFeedbackGenerator(style: .soft)
       feedback.prepare()
       feedback.impactOccurred(intensity: 0.72)
-      showPlaybackFeedback(
-        systemName: wasPlaying ? "pause.fill" : "play.fill",
-        title: wasPlaying ? "暂停" : "播放"
-      )
     }
   }
 
@@ -2597,7 +2586,6 @@ struct PlayerScreen: View {
     isDismissDragging = false
     isDismissSettling = false
     dragIntent = .undecided
-    dismissDragOriginTranslation = .zero
     dismissRestoreTask?.cancel()
     isPinchInteracting = false
     singleFingerGestureSuppressedUntil = 0
