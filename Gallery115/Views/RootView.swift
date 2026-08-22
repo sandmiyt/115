@@ -328,9 +328,11 @@ private struct HomeView: View {
                   }
                 }
               }
+              .scrollTargetLayout()
               .padding(.horizontal, 1)
             }
             .scrollIndicators(.hidden)
+            .scrollTargetBehavior(.viewAligned)
           }
         }
 
@@ -379,15 +381,26 @@ private struct HomeView: View {
           .foregroundStyle(.secondary)
       }
       Spacer()
-      HStack(spacing: 6) {
-        Circle().fill(connectionColor).frame(width: 7, height: 7)
-        Text(appState.isConfigured ? appState.mediaConnectionState.title : "未连接媒体源")
+      ViewThatFits(in: .horizontal) {
+        HStack(spacing: 6) {
+          Circle().fill(connectionColor).frame(width: 7, height: 7)
+          Text(appState.isConfigured ? appState.mediaConnectionState.title : "未连接媒体源")
+            .lineLimit(1)
+        }
+        .font(.caption.weight(.medium))
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 10)
+        .frame(height: 32)
+        .background(panelBackground, in: Capsule())
+        .fixedSize(horizontal: true, vertical: false)
+
+        Circle()
+          .fill(connectionColor)
+          .frame(width: 10, height: 10)
+          .padding(11)
+          .background(panelBackground, in: Circle())
+          .accessibilityLabel(appState.isConfigured ? appState.mediaConnectionState.title : "未连接媒体源")
       }
-      .font(.caption.weight(.medium))
-      .foregroundStyle(.secondary)
-      .padding(.horizontal, 10)
-      .frame(height: 32)
-      .background(panelBackground, in: Capsule())
     }
     .padding(.top, 6)
   }
@@ -431,7 +444,7 @@ private struct ContinueWatchingCard: View {
   let entry: PlaybackEntry
   let action: () -> Void
 
-  private let cardWidth: CGFloat = 150
+  private let cardWidth: CGFloat = 210
 
   private var progress: Double {
     guard entry.effectiveDuration > 0 else { return 0 }
@@ -454,7 +467,7 @@ private struct ContinueWatchingCard: View {
           .foregroundStyle(.secondary)
       }
     }
-    .buttonStyle(.plain)
+    .buttonStyle(HomeMediaButtonStyle())
   }
 
   private func formatTime(_ seconds: Double) -> String {
@@ -463,6 +476,15 @@ private struct ContinueWatchingCard: View {
     let m = (value % 3600) / 60
     let s = value % 60
     return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%02d:%02d", m, s)
+  }
+}
+
+private struct HomeMediaButtonStyle: ButtonStyle {
+  func makeBody(configuration: Configuration) -> some View {
+    configuration.label
+      .scaleEffect(configuration.isPressed ? 0.985 : 1)
+      .opacity(configuration.isPressed ? 0.90 : 1)
+      .animation(.spring(response: 0.24, dampingFraction: 0.86), value: configuration.isPressed)
   }
 }
 
@@ -476,4 +498,3 @@ private struct HomeLandscapeArtwork: View {
       .frame(width: width)
   }
 }
-

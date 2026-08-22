@@ -8,31 +8,29 @@ struct VideoCard: View {
 
   var body: some View {
     Button(action: onOpen) {
-      VStack(alignment: .leading, spacing: 5) {
+      VStack(alignment: .leading, spacing: 7) {
         MediaArtworkCard(item: item, progress: resumeProgress)
+          .overlay(alignment: .topTrailing) {
+            if appState.libraryStore.isFavorite(item) {
+              Image(systemName: "heart.fill")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundStyle(.white)
+                .frame(width: 25, height: 25)
+                .background(.ultraThinMaterial, in: Circle())
+                .background(CinevaTheme.accent.opacity(0.62), in: Circle())
+                .padding(7)
+            }
+          }
 
         Text(item.name)
           .font(.caption.weight(.semibold))
           .foregroundStyle(.primary)
           .lineLimit(2)
           .multilineTextAlignment(.leading)
-
-        HStack(spacing: 5) {
-          Text(item.formattedSize)
-            .font(.caption2)
-            .foregroundStyle(.secondary)
-            .lineLimit(1)
-          Spacer(minLength: 2)
-          if appState.libraryStore.isFavorite(item) {
-            Image(systemName: "heart.fill")
-              .font(.caption2)
-              .foregroundStyle(CinevaTheme.accent)
-          }
-        }
       }
       .contentShape(Rectangle())
     }
-    .buttonStyle(.plain)
+    .buttonStyle(MediaCardButtonStyle())
     .contextMenu {
       Button {
         appState.libraryStore.toggleFavorite(item)
@@ -74,16 +72,7 @@ struct MediaArtworkCard: View {
       .allowsHitTesting(false)
 
       HStack(alignment: .bottom) {
-        if !item.fileExtension.isEmpty {
-          Text(item.fileExtension.uppercased())
-            .font(.system(size: 9, weight: .bold, design: .rounded))
-            .foregroundStyle(.white.opacity(0.92))
-            .padding(.horizontal, 6)
-            .padding(.vertical, 3)
-            .background(.black.opacity(0.58), in: Capsule())
-        }
-
-        Spacer(minLength: 6)
+        Spacer(minLength: 0)
 
         if !effectiveDurationText.isEmpty {
           Text(effectiveDurationText)
@@ -112,12 +101,12 @@ struct MediaArtworkCard: View {
         .allowsHitTesting(false)
       }
     }
-    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
     .overlay {
-      RoundedRectangle(cornerRadius: 12, style: .continuous)
+      RoundedRectangle(cornerRadius: 14, style: .continuous)
         .stroke(.primary.opacity(0.08), lineWidth: 0.6)
     }
-    .shadow(color: .black.opacity(0.08), radius: 8, y: 3)
+    .shadow(color: .black.opacity(0.10), radius: 10, y: 4)
   }
 
   private var effectiveDurationText: String {
@@ -200,19 +189,14 @@ struct VideoArtwork: View {
     switch appState.artworkMode {
     case .fit:
       ZStack {
-        // Fill the full 16:9 card with a soft background, but never crop
-        // the actual thumbnail. This keeps ultrawide / landscape frames
-        // centered and guarantees the complete card remains visible.
-        image
-          .resizable()
-          .scaledToFill()
-          .frame(width: size.width, height: size.height)
-          .clipped()
-          .blur(radius: 18)
-          .opacity(0.34)
-
-        Color.black.opacity(0.08)
-          .frame(width: size.width, height: size.height)
+        // A static cinema-toned bed avoids a second full-size image render and
+        // per-card blur during fast scrolling while the real artwork remains
+        // completely visible and uncropped.
+        LinearGradient(
+          colors: [.black.opacity(0.92), .black.opacity(0.72)],
+          startPoint: .topLeading,
+          endPoint: .bottomTrailing
+        )
 
         image
           .resizable()
@@ -250,5 +234,14 @@ struct VideoArtwork: View {
         .foregroundStyle(.secondary.opacity(0.72))
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
+  }
+}
+
+private struct MediaCardButtonStyle: ButtonStyle {
+  func makeBody(configuration: Configuration) -> some View {
+    configuration.label
+      .scaleEffect(configuration.isPressed ? 0.985 : 1)
+      .opacity(configuration.isPressed ? 0.90 : 1)
+      .animation(.spring(response: 0.24, dampingFraction: 0.86), value: configuration.isPressed)
   }
 }

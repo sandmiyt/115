@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct RecentView: View {
   @Environment(AppState.self) private var appState
@@ -17,6 +18,7 @@ struct RecentView: View {
         List {
           ForEach(appState.libraryStore.recents) { entry in
             Button {
+              UIImpactFeedbackGenerator(style: .soft).impactOccurred(intensity: 0.65)
               selectedVideo = entry.item
             } label: {
               HStack(spacing: 13) {
@@ -42,12 +44,21 @@ struct RecentView: View {
                   .font(.caption.weight(.semibold))
                   .foregroundStyle(.tertiary)
               }
-              .padding(.vertical, 5)
+              .padding(12)
+              .background(
+                Color(uiColor: .secondarySystemGroupedBackground),
+                in: RoundedRectangle(cornerRadius: 18, style: .continuous)
+              )
             }
-            .buttonStyle(.plain)
+            .buttonStyle(RecentRowButtonStyle())
+            .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
+            .listRowSeparator(.hidden)
+            .listRowBackground(Color.clear)
           }
         }
         .listStyle(.plain)
+        .scrollContentBackground(.hidden)
+        .background(Color(uiColor: .systemGroupedBackground))
       }
     }
     .navigationTitle("最近播放")
@@ -83,6 +94,15 @@ struct RecentView: View {
     return hours > 0
       ? String(format: "%d:%02d:%02d", hours, minutes, secs)
       : String(format: "%02d:%02d", minutes, secs)
+  }
+}
+
+private struct RecentRowButtonStyle: ButtonStyle {
+  func makeBody(configuration: Configuration) -> some View {
+    configuration.label
+      .scaleEffect(configuration.isPressed ? 0.988 : 1)
+      .opacity(configuration.isPressed ? 0.88 : 1)
+      .animation(.spring(response: 0.24, dampingFraction: 0.86), value: configuration.isPressed)
   }
 }
 

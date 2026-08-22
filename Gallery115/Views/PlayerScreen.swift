@@ -27,10 +27,13 @@ struct PlayerScreen: View {
   @State private var showPlaybackHUD = false
   @State private var isRoutePickerPresented = false
   @State private var gestureHUD: String?
+  @State private var gestureHUDSystemName = "sparkles"
+  @State private var playbackFeedback: PlayerPlaybackFeedback?
   @State private var showFavoriteHeart = false
   @State private var favoriteHUDIsRemoval = false
   @State private var lastFavoriteToggleUptime: TimeInterval = 0
   @State private var hudTask: Task<Void, Never>?
+  @State private var playbackFeedbackTask: Task<Void, Never>?
   @State private var favoriteHUDTask: Task<Void, Never>?
   @State private var controlsTask: Task<Void, Never>?
   @State private var scrubValue: Double = 0
@@ -103,6 +106,13 @@ struct PlayerScreen: View {
           playerChrome(proxy: proxy)
             .simultaneousGesture(controlsInteractionGesture)
             .opacity(chromeShouldBeVisible ? interactiveDismissChromeOpacity : 0)
+            .scaleEffect(chromeShouldBeVisible ? 1 : 0.982)
+            .animation(
+              chromeShouldBeVisible
+                ? .spring(response: 0.34, dampingFraction: 0.88, blendDuration: 0.08)
+                : .easeOut(duration: 0.22),
+              value: chromeShouldBeVisible
+            )
             .allowsHitTesting(chromeShouldBeVisible && !isDismissMotionActive && !showSettingsPanel && !showSpeedPanel && !showQueuePanel)
             .accessibilityHidden(!chromeShouldBeVisible || isDismissMotionActive)
         }
@@ -144,22 +154,37 @@ struct PlayerScreen: View {
             .allowsHitTesting(false)
         }
 
+        if let playbackFeedback {
+          PlayerPlaybackFeedbackView(feedback: playbackFeedback)
+            .transition(.scale(scale: 0.84).combined(with: .opacity))
+            .allowsHitTesting(false)
+            .zIndex(35)
+        }
+
         if let gestureHUD {
-          Text(gestureHUD)
-            .font(.subheadline.monospacedDigit().weight(.semibold))
-            .foregroundStyle(.white)
-            .padding(.horizontal, 16)
-            .frame(height: 44)
-            .background(.black.opacity(0.76), in: Capsule())
-            .transition(.scale.combined(with: .opacity))
+          PlayerGestureFeedbackView(systemName: gestureHUDSystemName, message: gestureHUD)
+            .transition(.scale(scale: 0.90).combined(with: .opacity))
             .allowsHitTesting(false)
         }
 
         if showFavoriteHeart {
-          Image(systemName: favoriteHUDIsRemoval ? "heart.slash" : "heart.fill")
-            .font(.system(size: 72, weight: .bold))
-            .foregroundStyle(.red)
-            .shadow(color: .black.opacity(0.35), radius: 18, y: 6)
+          VStack(spacing: 9) {
+            Image(systemName: favoriteHUDIsRemoval ? "heart.slash" : "heart.fill")
+              .font(.system(size: 48, weight: .semibold))
+              .symbolRenderingMode(.hierarchical)
+              .foregroundStyle(.red)
+            Text(favoriteHUDIsRemoval ? "已取消收藏" : "已收藏")
+              .font(.subheadline.weight(.semibold))
+              .foregroundStyle(.white)
+          }
+            .frame(width: 142, height: 126)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+            .background(.black.opacity(0.30), in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+            .overlay {
+              RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .stroke(.white.opacity(0.12), lineWidth: 0.7)
+            }
+            .shadow(color: .black.opacity(0.28), radius: 24, y: 10)
             .transition(.scale(scale: 0.55).combined(with: .opacity))
             .allowsHitTesting(false)
             .zIndex(40)
@@ -190,12 +215,12 @@ struct PlayerScreen: View {
         }
       }
       .frame(width: proxy.size.width, height: proxy.size.height)
-      .animation(.easeInOut(duration: chromeShouldBeVisible ? 0.18 : 0.26), value: chromeShouldBeVisible)
       .animation(.easeInOut(duration: 0.18), value: showPlaybackHUD)
     }
     .background(Color.clear)
     .ignoresSafeArea()
     .statusBarHidden(true)
+    .persistentSystemOverlays(.hidden)
   }
 
   private var playerPresentationView: some View {
@@ -314,6 +339,7 @@ struct PlayerScreen: View {
     showQueuePanel = false
     isControlsInteractionActive = false
     hudTask?.cancel()
+    playbackFeedbackTask?.cancel()
     favoriteHUDTask?.cancel()
     controlsTask?.cancel()
     subtitleLoadTask?.cancel()
@@ -445,6 +471,7 @@ struct PlayerScreen: View {
           gestureStartVolume = nil
           isGestureInteracting = false
           controlsTask?.cancel()
+          cancelInteractiveDismissForPinch()
         }
 
         singleFingerGestureSuppressedUntil = ProcessInfo.processInfo.systemUptime + 0.22
@@ -569,7 +596,7 @@ struct PlayerScreen: View {
         // finger in two dimensions while the library underneath is revealed.
         // Timeline scrubbing still wins inside the visible progress bar.
         if !isLandscape {
-          updatePortraitDismissDrag(value)
+          updatePortraitDismissDrag(value, viewport: proxy.size)
           return
         }
 
@@ -591,12 +618,18 @@ struct PlayerScreen: View {
           let start = gestureStartBrightness ?? UIScreen.main.brightness
           let next = min(max(start + normalizedDelta, 0), 1)
           UIScreen.main.brightness = next
-          updateContinuousGestureHUD("亮度  \(Int((next * 100).rounded()))%")
+          updateContinuousGestureHUD(
+            "亮度  \(Int((next * 100).rounded()))%",
+            systemName: "sun.max.fill"
+          )
         } else {
           let start = CGFloat(gestureStartVolume ?? activeVolume)
           let next = min(max(start + normalizedDelta, 0), 1)
           setActiveVolume(Float(next))
-          updateContinuousGestureHUD("音量  \(Int((next * 100).rounded()))%")
+          updateContinuousGestureHUD(
+            "音量  \(Int((next * 100).rounded()))%",
+            systemName: "speaker.wave.3.fill"
+          )
         }
       }
       .onEnded { value in
@@ -645,7 +678,7 @@ struct PlayerScreen: View {
   }
 
   @MainActor
-  private func updatePortraitDismissDrag(_ value: DragGesture.Value) {
+  private func updatePortraitDismissDrag(_ value: DragGesture.Value, viewport: CGSize) {
     guard !isScrubbing,
       !isControlsInteractionActive,
       !showSettingsPanel,
@@ -665,10 +698,38 @@ struct PlayerScreen: View {
       gestureHUD = nil
     }
 
-    // True two-dimensional Photos-style drag: no directional lock and no
-    // upward resistance. The current video stays directly under the finger in
-    // every direction; distance only changes scale/backdrop/chrome progress.
-    dismissDragOffset = value.translation
+    // Follow the finger directly near the center, then add continuous resistance
+    // near the display edges. The derivative remains smooth at the handoff, so
+    // the media never hits a hard wall or jumps when the user changes direction.
+    dismissDragOffset = rubberBandedDismissTranslation(value.translation, viewport: viewport)
+  }
+
+  @MainActor
+  private func cancelInteractiveDismissForPinch() {
+    guard isDismissDragging || dismissDragOffset != .zero else { return }
+    isDismissDragging = false
+    isDismissSettling = false
+    dismissRestoreTask?.cancel()
+    withAnimation(.spring(response: 0.24, dampingFraction: 0.90)) {
+      dismissDragOffset = .zero
+    }
+  }
+
+  private func rubberBandedDismissTranslation(_ translation: CGSize, viewport: CGSize) -> CGSize {
+    CGSize(
+      width: rubberBandedAxis(translation.width, dimension: viewport.width),
+      height: rubberBandedAxis(translation.height, dimension: viewport.height)
+    )
+  }
+
+  private func rubberBandedAxis(_ value: CGFloat, dimension: CGFloat) -> CGFloat {
+    let sign: CGFloat = value < 0 ? -1 : 1
+    let magnitude = abs(value)
+    let threshold = max(dimension, 1) * 0.28
+    guard magnitude > threshold else { return value }
+    let resistance = max(dimension, 1) * 0.22
+    let overflow = magnitude - threshold
+    return sign * (threshold + resistance * (1 - exp(-overflow / resistance)))
   }
 
   @MainActor
@@ -773,12 +834,12 @@ struct PlayerScreen: View {
       Color.clear
         .contentShape(Rectangle())
         .ignoresSafeArea()
-        .onTapGesture { showGestureHUD("控制已锁定") }
+        .onTapGesture { showGestureHUD("控制已锁定", systemName: "lock.fill") }
 
       Button {
         isLocked = false
         controlsVisible = true
-        showGestureHUD("已解锁")
+        showGestureHUD("已解锁", systemName: "lock.open.fill")
         scheduleControlsHide()
       } label: {
         Image(systemName: "lock.open.fill")
@@ -827,7 +888,9 @@ struct PlayerScreen: View {
           }
         }
         .frame(width: 38, height: 38)
-        .background(.black.opacity(0.46), in: Circle())
+        .background(.ultraThinMaterial, in: Circle())
+        .background(.black.opacity(0.28), in: Circle())
+        .overlay { Circle().stroke(.white.opacity(0.10), lineWidth: 0.7) }
         .clipShape(Circle())
         .accessibilityLabel("AirPlay")
       }
@@ -857,7 +920,7 @@ struct PlayerScreen: View {
           isLocked = true
           controlsVisible = false
           controlsTask?.cancel()
-          showGestureHUD("控制已锁定")
+          showGestureHUD("控制已锁定", systemName: "lock.fill")
         }
       }
 
@@ -1497,18 +1560,19 @@ struct PlayerScreen: View {
 
   private func portraitCenterTransport(model: PlayerModel) -> some View {
     Button {
-      toggleActivePlayback()
+      toggleActivePlayback(userInitiated: true)
       controlsVisible = true
       scheduleControlsHide()
     } label: {
       Image(systemName: activeIsPlaying ? "pause.fill" : "play.fill")
         .font(.system(size: 24, weight: .bold))
+        .contentTransition(.symbolEffect)
         .foregroundStyle(.black)
         .frame(width: 62, height: 62)
         .background(.white, in: Circle())
         .shadow(color: .black.opacity(0.30), radius: 14, y: 5)
     }
-    .buttonStyle(.plain)
+    .buttonStyle(PlayerPressScaleStyle(pressedScale: 0.92))
     // `onLongPressGesture` fires as soon as the minimum duration is reached;
     // it does not wait for the finger to lift. A small toggle gate below also
     // prevents an overlapping player surface from firing the same press twice.
@@ -1536,18 +1600,19 @@ struct PlayerScreen: View {
 
   private func landscapeCenterTransport(model: PlayerModel) -> some View {
     Button {
-      toggleActivePlayback()
+      toggleActivePlayback(userInitiated: true)
       controlsVisible = true
       scheduleControlsHide()
     } label: {
       Image(systemName: activeIsPlaying ? "pause.fill" : "play.fill")
         .font(.system(size: 27, weight: .bold))
+        .contentTransition(.symbolEffect)
         .foregroundStyle(.black)
         .frame(width: 68, height: 68)
         .background(.white, in: Circle())
         .shadow(color: .black.opacity(0.34), radius: 16, y: 6)
     }
-    .buttonStyle(.plain)
+    .buttonStyle(PlayerPressScaleStyle(pressedScale: 0.92))
     // `onLongPressGesture` fires as soon as the minimum duration is reached;
     // it does not wait for the finger to lift. A small toggle gate below also
     // prevents an overlapping player surface from firing the same press twice.
@@ -1604,7 +1669,9 @@ struct PlayerScreen: View {
       .foregroundStyle(.white.opacity(0.88))
       .padding(.horizontal, 10)
       .frame(height: 34)
-      .background(.white.opacity(0.075), in: Capsule())
+      .background(.ultraThinMaterial, in: Capsule())
+      .background(.black.opacity(0.22), in: Capsule())
+      .overlay { Capsule().stroke(.white.opacity(0.08), lineWidth: 0.6) }
     }
     .buttonStyle(.plain)
   }
@@ -1619,7 +1686,8 @@ struct PlayerScreen: View {
         .font(.system(size: 14, weight: .semibold))
         .foregroundStyle(enabled ? .white.opacity(0.88) : .white.opacity(0.24))
         .frame(width: 34, height: 34)
-        .background(.white.opacity(enabled ? 0.07 : 0.035), in: Circle())
+        .background(.ultraThinMaterial, in: Circle())
+        .background(.black.opacity(enabled ? 0.22 : 0.12), in: Circle())
     }
     .buttonStyle(.plain)
     .disabled(!enabled)
@@ -1780,7 +1848,9 @@ struct PlayerScreen: View {
       .font(.system(size: 15, weight: .semibold))
       .foregroundStyle(.white)
       .frame(width: 38, height: 38)
-      .background(.black.opacity(0.50), in: Circle())
+      .background(.ultraThinMaterial, in: Circle())
+      .background(.black.opacity(0.28), in: Circle())
+      .overlay { Circle().stroke(.white.opacity(0.10), lineWidth: 0.7) }
       .contentShape(Circle())
   }
 
@@ -1801,7 +1871,10 @@ struct PlayerScreen: View {
     let now = ProcessInfo.processInfo.systemUptime
     // The center control and the transparent gesture surface overlap by design.
     // One physical long press must still toggle exactly once.
-    guard now - lastFavoriteToggleUptime > 0.36 else { return }
+    guard !isPinchInteracting,
+      now >= singleFingerGestureSuppressedUntil,
+      now - lastFavoriteToggleUptime > 0.36
+    else { return }
     lastFavoriteToggleUptime = now
 
     let wasFavorite = appState.libraryStore.isFavorite(currentItem)
@@ -2025,15 +2098,34 @@ struct PlayerScreen: View {
   private func applyPlaybackRate(_ rate: Float, persist: Bool = true) {
     let safe = min(max(rate, 0.5), 2.0)
     playbackRate = safe
-    if persist { appState.preferredPlaybackRate = safe }
+    if persist {
+      appState.preferredPlaybackRate = safe
+      let feedback = UISelectionFeedbackGenerator()
+      feedback.prepare()
+      feedback.selectionChanged()
+      showPlaybackFeedback(
+        systemName: "speedometer",
+        title: safe == 1 ? "正常速度" : formatRate(Double(safe))
+      )
+    }
     withActiveEngine { $0.engineSetPlaybackRate(safe) }
     updateRemotePlaybackInfo()
   }
 
   @MainActor
-  private func toggleActivePlayback() {
+  private func toggleActivePlayback(userInitiated: Bool = false) {
+    let wasPlaying = activeIsPlaying
     withActiveEngine { $0.engineTogglePlayback() }
     updateRemotePlaybackInfo()
+    if userInitiated {
+      let feedback = UIImpactFeedbackGenerator(style: .soft)
+      feedback.prepare()
+      feedback.impactOccurred(intensity: 0.72)
+      showPlaybackFeedback(
+        systemName: wasPlaying ? "pause.fill" : "play.fill",
+        title: wasPlaying ? "暂停" : "播放"
+      )
+    }
   }
 
   @MainActor
@@ -2278,12 +2370,14 @@ struct PlayerScreen: View {
           selectedExternalSubtitleID == track.id
         else { return }
         externalSubtitleCues = cues.sorted { $0.start < $1.start }
-        if cues.isEmpty { showGestureHUD("字幕文件没有可识别时间轴") }
+        if cues.isEmpty {
+          showGestureHUD("字幕文件没有可识别时间轴", systemName: "captions.bubble.fill")
+        }
       } catch {
         guard !Task.isCancelled, currentItem.id == expectedID else { return }
         selectedExternalSubtitleID = nil
         externalSubtitleCues = []
-        showGestureHUD("字幕读取失败")
+        showGestureHUD("字幕读取失败", systemName: "exclamationmark.triangle.fill")
       }
     }
   }
@@ -2345,7 +2439,9 @@ struct PlayerScreen: View {
   @MainActor
   private func showControls(animated: Bool) {
     if animated {
-      withAnimation(.easeOut(duration: 0.18)) { controlsVisible = true }
+      withAnimation(.spring(response: 0.32, dampingFraction: 0.88, blendDuration: 0.06)) {
+        controlsVisible = true
+      }
     } else {
       controlsVisible = true
     }
@@ -2433,14 +2529,27 @@ struct PlayerScreen: View {
     updateRemotePlaybackInfo()
     UIImpactFeedbackGenerator(style: .soft).impactOccurred()
     let magnitude = Int(abs(seconds).rounded())
-    showGestureHUD(seconds < 0 ? "⏪  \(magnitude) 秒" : "\(magnitude) 秒  ⏩")
+    showGestureHUD(
+      seconds < 0 ? "后退 \(magnitude) 秒" : "前进 \(magnitude) 秒",
+      systemName: seconds < 0 ? "gobackward" : "goforward"
+    )
     scheduleControlsHide()
   }
 
   @MainActor
   private func toggleControls() {
-    guard !isLocked else { return }
-    withAnimation(.easeOut(duration: 0.18)) {
+    let now = ProcessInfo.processInfo.systemUptime
+    guard !isLocked,
+      !isPinchInteracting,
+      !isDismissMotionActive,
+      now >= singleFingerGestureSuppressedUntil
+    else { return }
+    let revealing = !controlsVisible
+    withAnimation(
+      revealing
+        ? .spring(response: 0.32, dampingFraction: 0.88, blendDuration: 0.06)
+        : .easeOut(duration: 0.22)
+    ) {
       controlsVisible.toggle()
     }
     if controlsVisible {
@@ -2509,15 +2618,16 @@ struct PlayerScreen: View {
         !autoHideSuspended
       else { return }
 
-      withAnimation(.easeInOut(duration: 0.26)) {
+      withAnimation(.easeOut(duration: 0.24)) {
         controlsVisible = false
       }
     }
   }
 
   @MainActor
-  private func updateContinuousGestureHUD(_ message: String) {
+  private func updateContinuousGestureHUD(_ message: String, systemName: String) {
     hudTask?.cancel()
+    gestureHUDSystemName = systemName
     if gestureHUD == nil {
       withAnimation(.easeOut(duration: 0.10)) { gestureHUD = message }
     } else {
@@ -2539,8 +2649,9 @@ struct PlayerScreen: View {
   }
 
   @MainActor
-  private func showGestureHUD(_ message: String) {
+  private func showGestureHUD(_ message: String, systemName: String = "checkmark.circle.fill") {
     hudTask?.cancel()
+    gestureHUDSystemName = systemName
     if gestureHUD == nil {
       withAnimation(.easeOut(duration: 0.12)) { gestureHUD = message }
     } else {
@@ -2550,6 +2661,22 @@ struct PlayerScreen: View {
       try? await Task.sleep(for: .milliseconds(950))
       guard !Task.isCancelled else { return }
       withAnimation(.easeIn(duration: 0.16)) { gestureHUD = nil }
+    }
+  }
+
+  @MainActor
+  private func showPlaybackFeedback(systemName: String, title: String) {
+    playbackFeedbackTask?.cancel()
+    playbackFeedback = nil
+    withAnimation(.spring(response: 0.24, dampingFraction: 0.76)) {
+      playbackFeedback = PlayerPlaybackFeedback(systemName: systemName, title: title)
+    }
+    playbackFeedbackTask = Task { @MainActor in
+      try? await Task.sleep(for: .milliseconds(620))
+      guard !Task.isCancelled else { return }
+      withAnimation(.easeOut(duration: 0.16)) {
+        playbackFeedback = nil
+      }
     }
   }
 
@@ -2568,6 +2695,74 @@ struct PlayerScreen: View {
       : String(format: "%02d:%02d", minutes, secs)
   }
 
+}
+
+private struct PlayerPlaybackFeedback: Equatable {
+  let systemName: String
+  let title: String
+}
+
+private struct PlayerPlaybackFeedbackView: View {
+  let feedback: PlayerPlaybackFeedback
+
+  var body: some View {
+    VStack(spacing: 10) {
+      Image(systemName: feedback.systemName)
+        .font(.system(size: 42, weight: .semibold))
+        .symbolRenderingMode(.hierarchical)
+      Text(feedback.title)
+        .font(.subheadline.weight(.semibold))
+    }
+    .foregroundStyle(.white)
+    .frame(width: 126, height: 116)
+    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+    .background(.black.opacity(0.30), in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+    .overlay {
+      RoundedRectangle(cornerRadius: 28, style: .continuous)
+        .stroke(.white.opacity(0.12), lineWidth: 0.7)
+    }
+    .shadow(color: .black.opacity(0.26), radius: 22, y: 9)
+    .accessibilityElement(children: .combine)
+  }
+}
+
+private struct PlayerGestureFeedbackView: View {
+  let systemName: String
+  let message: String
+
+  var body: some View {
+    HStack(spacing: 10) {
+      Image(systemName: systemName)
+        .font(.system(size: 19, weight: .semibold))
+        .symbolRenderingMode(.hierarchical)
+        .frame(width: 24)
+      Text(message)
+        .font(.subheadline.monospacedDigit().weight(.semibold))
+        .lineLimit(1)
+    }
+    .foregroundStyle(.white)
+    .padding(.horizontal, 16)
+    .frame(minWidth: 112, minHeight: 48)
+    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    .background(.black.opacity(0.32), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    .overlay {
+      RoundedRectangle(cornerRadius: 18, style: .continuous)
+        .stroke(.white.opacity(0.10), lineWidth: 0.7)
+    }
+    .shadow(color: .black.opacity(0.22), radius: 16, y: 6)
+    .accessibilityElement(children: .combine)
+  }
+}
+
+private struct PlayerPressScaleStyle: ButtonStyle {
+  var pressedScale: CGFloat = 0.94
+
+  func makeBody(configuration: Configuration) -> some View {
+    configuration.label
+      .scaleEffect(configuration.isPressed ? pressedScale : 1)
+      .opacity(configuration.isPressed ? 0.86 : 1)
+      .animation(.spring(response: 0.22, dampingFraction: 0.78), value: configuration.isPressed)
+  }
 }
 
 private struct PlayerInfoSheet: View {

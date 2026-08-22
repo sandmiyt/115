@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import ImageIO
 import UIKit
 
 /// Generates missing video artwork through the mounted WebDAV stream, never through
@@ -8,20 +9,29 @@ import UIKit
 actor ThumbnailService {
   private let fileManager = FileManager.default
   private let directory: URL
+  private let memoryCache = NSCache<NSString, UIImage>()
   private var generatorBusy = false
   private var generatorWaiters: [CheckedContinuation<Void, Never>] = []
   private let maximumCacheBytes: Int64 = 1_073_741_824
+  private var lastCacheTrimAt = Date.distantPast
 
   init() {
     let base = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first!
     directory = base.appending(path: "GeneratedThumbnails", directoryHint: .isDirectory)
+    memoryCache.countLimit = 160
+    memoryCache.totalCostLimit = 72 * 1_024 * 1_024
     try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
   }
 
   func generatedThumbnail(for item: CloudItem, api: APIClient) async -> UIImage? {
     guard item.isVideo else { return nil }
+    let cacheKey = thumbnailCacheKey(for: item)
+    if let cached = memoryCache.object(forKey: cacheKey as NSString) {
+      return cached
+    }
     let fileURL = cachedFileURL(for: item)
     if let cached = loadImage(at: fileURL) {
+      cacheInMemory(cached, key: cacheKey)
       touch(fileURL)
       return cached
     }
@@ -29,7 +39,7 @@ actor ThumbnailService {
 
     if let metadata = await api.localMetadata(for: item),
       let posterData = metadata.posterData,
-      let poster = UIImage(data: posterData)
+      let poster = downsampledImage(from: posterData, maximumPixelSize: 960)
     {
       guard !Task.isCancelled else { return nil }
       storeGeneratedThumbnail(poster, for: item)
@@ -46,6 +56,7 @@ actor ThumbnailService {
     defer { releaseGenerator() }
 
     if let cached = loadImage(at: fileURL) {
+      cacheInMemory(cached, key: cacheKey)
       touch(fileURL)
       return cached
     }
@@ -93,6 +104,7 @@ actor ThumbnailService {
   }
 
   func storeGeneratedThumbnail(_ image: UIImage, for item: CloudItem) {
+    cacheInMemory(image, key: thumbnailCacheKey(for: item))
     guard let data = image.jpegData(compressionQuality: 0.80) else { return }
     let url = cachedFileURL(for: item)
     try? data.write(to: url, options: .atomic)
@@ -113,19 +125,44 @@ actor ThumbnailService {
   }
 
   func clearCache() {
+    memoryCache.removeAllObjects()
     try? fileManager.removeItem(at: directory)
     try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
     URLCache.shared.removeAllCachedResponses()
   }
 
   private func cachedFileURL(for item: CloudItem) -> URL {
-    let key = item.sha1.isEmpty ? item.id : item.sha1
-    return directory.appending(path: "\(stableHash(key)).jpg")
+    directory.appending(path: "\(stableHash(thumbnailCacheKey(for: item))).jpg")
+  }
+
+  private func thumbnailCacheKey(for item: CloudItem) -> String {
+    item.sha1.isEmpty ? item.id : item.sha1
   }
 
   private func loadImage(at url: URL) -> UIImage? {
     guard let data = try? Data(contentsOf: url) else { return nil }
-    return UIImage(data: data)
+    return downsampledImage(from: data, maximumPixelSize: 960)
+  }
+
+  private func cacheInMemory(_ image: UIImage, key: String) {
+    let pixelWidth = max(Int(image.size.width * image.scale), 1)
+    let pixelHeight = max(Int(image.size.height * image.scale), 1)
+    let cost = min(pixelWidth * pixelHeight * 4, 16 * 1_024 * 1_024)
+    memoryCache.setObject(image, forKey: key as NSString, cost: cost)
+  }
+
+  private func downsampledImage(from data: Data, maximumPixelSize: Int) -> UIImage? {
+    guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+    let options: [CFString: Any] = [
+      kCGImageSourceCreateThumbnailFromImageAlways: true,
+      kCGImageSourceCreateThumbnailWithTransform: true,
+      kCGImageSourceThumbnailMaxPixelSize: maximumPixelSize,
+      kCGImageSourceShouldCacheImmediately: true,
+    ]
+    guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+      return nil
+    }
+    return UIImage(cgImage: image)
   }
 
   private func acquireGenerator() async {
@@ -152,6 +189,12 @@ actor ThumbnailService {
   }
 
   private func trimCacheIfNeeded() {
+    // Directory enumeration gets increasingly expensive in large libraries.
+    // At most one trim pass per minute keeps insertion latency predictable while
+    // still enforcing the disk budget during sustained thumbnail generation.
+    let now = Date()
+    guard now.timeIntervalSince(lastCacheTrimAt) >= 60 else { return }
+    lastCacheTrimAt = now
     guard let files = try? fileManager.contentsOfDirectory(
       at: directory,
       includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],

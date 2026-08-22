@@ -248,7 +248,7 @@ struct FolderView: View {
               NavigationLink(value: item) {
                 FolderCard(item: item)
               }
-              .buttonStyle(.plain)
+              .buttonStyle(FolderCardButtonStyle())
             } else if item.isPhoto {
               PhotoFileCard(item: item)
             } else {
@@ -628,6 +628,15 @@ struct FolderView: View {
       appState.markMediaOffline()
       transientMessage = "网络暂时不可用，已保留当前资料库。"
     }
+  }
+}
+
+private struct FolderCardButtonStyle: ButtonStyle {
+  func makeBody(configuration: Configuration) -> some View {
+    configuration.label
+      .scaleEffect(configuration.isPressed ? 0.985 : 1)
+      .opacity(configuration.isPressed ? 0.90 : 1)
+      .animation(.spring(response: 0.24, dampingFraction: 0.86), value: configuration.isPressed)
   }
 }
 
