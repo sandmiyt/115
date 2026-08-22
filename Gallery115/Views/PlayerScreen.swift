@@ -3,6 +3,16 @@ import MediaPlayer
 import SwiftUI
 import UIKit
 
+private enum PlayerDragIntent {
+  case undecided
+  case zoomPan
+  case portraitDismiss
+  case landscapeBrightness
+  case landscapeVolume
+  case landscapeSeek
+  case ignored
+}
+
 struct PlayerScreen: View {
   @Environment(\.dismiss) private var dismiss
   @Environment(AppState.self) private var appState
@@ -53,6 +63,8 @@ struct PlayerScreen: View {
   @State private var isDismissSettling = false
   @State private var dismissControlsWereVisible = false
   @State private var dismissRestoreTask: Task<Void, Never>?
+  @State private var dragIntent: PlayerDragIntent = .undecided
+  @State private var dismissDragOriginTranslation: CGSize = .zero
   @State private var singleFingerGestureSuppressedUntil: TimeInterval = 0
   @State private var externalSubtitleTracks: [ExternalSubtitleTrack] = []
   @State private var selectedExternalSubtitleID: String?
@@ -411,12 +423,11 @@ struct PlayerScreen: View {
   }
 
   private var interactiveDismissProgress: CGFloat {
-    let distance = max(hypot(dismissDragOffset.width, dismissDragOffset.height), 0)
-    // Avoid a hard clamp at a fixed distance. Photos-like interactive motion
-    // keeps changing continuously as the finger approaches/leaves an edge; a
-    // saturating exponential curve has no derivative discontinuity to feel as
-    // a magnetic "snap" at the screen boundary.
-    return CGFloat(1.0 - exp(-Double(distance) / 225.0))
+    let downwardTravel = max(dismissDragOffset.height, 0)
+    // One normalized, vertical progress value drives scale, corner radius,
+    // backdrop and chrome. Horizontal finger drift no longer makes the player
+    // unexpectedly shrink or reveal the library underneath.
+    return CGFloat(1.0 - exp(-Double(downwardTravel) / 235.0))
   }
 
   private var interactiveDismissMediaScale: CGFloat {
@@ -463,6 +474,7 @@ struct PlayerScreen: View {
         guard appState.playerGesturesEnabled, !isLocked else { return }
         if !isPinchInteracting {
           isPinchInteracting = true
+          dragIntent = .undecided
           pinchStartScale = max(videoScale, 1.0)
           // Pinch always wins over the one-finger gesture family. A short
           // suppression tail prevents one finger from a just-finished pinch
@@ -522,12 +534,53 @@ struct PlayerScreen: View {
 
   private func clampedVideoOffset(_ offset: CGSize, scale: CGFloat, viewport: CGSize) -> CGSize {
     guard scale > 1.001 else { return .zero }
-    let maxX = max(0, viewport.width * (scale - 1.0) * 0.5)
-    let maxY = max(0, viewport.height * (scale - 1.0) * 0.5)
+    let limits = videoPanLimits(scale: scale, viewport: viewport)
     return CGSize(
-      width: min(max(offset.width, -maxX), maxX),
-      height: min(max(offset.height, -maxY), maxY)
+      width: min(max(offset.width, -limits.width), limits.width),
+      height: min(max(offset.height, -limits.height), limits.height)
     )
+  }
+
+  private func rubberBandedVideoOffset(_ offset: CGSize, scale: CGFloat, viewport: CGSize) -> CGSize {
+    guard scale > 1.001 else { return .zero }
+    let limits = videoPanLimits(scale: scale, viewport: viewport)
+    return CGSize(
+      width: rubberBandedBoundedValue(offset.width, limit: limits.width, dimension: viewport.width),
+      height: rubberBandedBoundedValue(offset.height, limit: limits.height, dimension: viewport.height)
+    )
+  }
+
+  private func videoPanLimits(scale: CGFloat, viewport: CGSize) -> CGSize {
+    let contentSize = fittedVideoContentSize(in: viewport)
+    return CGSize(
+      width: max(0, contentSize.width * scale - viewport.width) * 0.5,
+      height: max(0, contentSize.height * scale - viewport.height) * 0.5
+    )
+  }
+
+  private func fittedVideoContentSize(in viewport: CGSize) -> CGSize {
+    // Aspect-fill is already cropped to the player's viewport. In aspect-fit,
+    // clamp against the visible video rather than the full black player layer;
+    // this prevents wide movies from being dragged deep into letterbox space.
+    guard videoLayout == .fit,
+      let source = model?.videoDisplaySize,
+      source.width > 0,
+      source.height > 0,
+      viewport.width > 0,
+      viewport.height > 0
+    else { return viewport }
+
+    let factor = min(viewport.width / source.width, viewport.height / source.height)
+    return CGSize(width: source.width * factor, height: source.height * factor)
+  }
+
+  private func rubberBandedBoundedValue(_ value: CGFloat, limit: CGFloat, dimension: CGFloat) -> CGFloat {
+    let magnitude = abs(value)
+    guard magnitude > limit else { return value }
+    let overflow = magnitude - limit
+    let resistanceLength = max(dimension * 0.18, 48)
+    let resisted = (overflow * 0.42 * resistanceLength) / (resistanceLength + overflow)
+    return (value < 0 ? -1 : 1) * (limit + resisted)
   }
 
   @ViewBuilder
@@ -577,7 +630,8 @@ struct PlayerScreen: View {
         // is intentionally disabled above 1x so panning a magnified frame can
         // never accidentally leave the player.
         if videoScale > 1.001 {
-          if !isGestureInteracting {
+          if dragIntent != .zoomPan {
+            dragIntent = .zoomPan
             isGestureInteracting = true
             panStartOffset = videoOffset
             gestureStartBrightness = nil
@@ -588,24 +642,33 @@ struct PlayerScreen: View {
             width: panStartOffset.width + value.translation.width,
             height: panStartOffset.height + value.translation.height
           )
-          videoOffset = clampedVideoOffset(candidate, scale: videoScale, viewport: proxy.size)
+          videoOffset = rubberBandedVideoOffset(candidate, scale: videoScale, viewport: proxy.size)
           return
         }
 
-        // Portrait gets an iOS Photos-style free drag. The media follows the
-        // finger in two dimensions while the library underneath is revealed.
-        // Timeline scrubbing still wins inside the visible progress bar.
         if !isLandscape {
+          classifyPortraitDragIfNeeded(value)
+          guard dragIntent == .portraitDismiss else { return }
           updatePortraitDismissDrag(value, viewport: proxy.size)
           return
         }
 
         let dx = value.translation.width
         let dy = value.translation.height
-        guard abs(dy) >= abs(dx) else { return }
+        classifyLandscapeDragIfNeeded(value, availableWidth: availableWidth)
 
-        // In landscape the starting finger position decides the channel once:
-        // left half = brightness, right half = volume.
+        if dragIntent == .landscapeSeek {
+          isGestureInteracting = true
+          controlsTask?.cancel()
+          let delta = Double(dx / availableWidth) * 180
+          updateContinuousGestureHUD(
+            delta < 0 ? "后退  \(Int(abs(delta).rounded())) 秒" : "前进  \(Int(abs(delta).rounded())) 秒",
+            systemName: delta < 0 ? "gobackward" : "goforward"
+          )
+          return
+        }
+
+        guard dragIntent == .landscapeBrightness || dragIntent == .landscapeVolume else { return }
         if !isGestureInteracting {
           isGestureInteracting = true
           controlsTask?.cancel()
@@ -614,7 +677,7 @@ struct PlayerScreen: View {
         }
 
         let normalizedDelta = -dy / availableHeight * 1.35
-        if value.startLocation.x < availableWidth * 0.5 {
+        if dragIntent == .landscapeBrightness {
           let start = gestureStartBrightness ?? UIScreen.main.brightness
           let next = min(max(start + normalizedDelta, 0), 1)
           UIScreen.main.brightness = next
@@ -635,46 +698,87 @@ struct PlayerScreen: View {
       .onEnded { value in
         guard appState.playerGesturesEnabled else { return }
         if isPinchInteracting || ProcessInfo.processInfo.systemUptime < singleFingerGestureSuppressedUntil {
-          gestureStartBrightness = nil
-          gestureStartVolume = nil
-          isGestureInteracting = false
+          resetDragIntent()
           return
         }
 
-        if videoScale > 1.001 {
-          withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
-            videoOffset = clampedVideoOffset(videoOffset, scale: videoScale, viewport: proxy.size)
+        if dragIntent == .zoomPan || videoScale > 1.001 {
+          let residualProjection = CGSize(
+            width: (value.predictedEndTranslation.width - value.translation.width) * 0.42,
+            height: (value.predictedEndTranslation.height - value.translation.height) * 0.42
+          )
+          let projectedOffset = CGSize(
+            width: videoOffset.width + residualProjection.width,
+            height: videoOffset.height + residualProjection.height
+          )
+          let targetOffset = clampedVideoOffset(projectedOffset, scale: videoScale, viewport: proxy.size)
+          withAnimation(.spring(duration: 0.40, bounce: 0.0)) {
+            videoOffset = targetOffset
           }
-          panStartOffset = videoOffset
-          gestureStartBrightness = nil
-          gestureStartVolume = nil
-          isGestureInteracting = false
+          panStartOffset = targetOffset
+          resetDragIntent()
           scheduleControlsHide()
           return
         }
 
         if !isLandscape {
-          finishPortraitDismissDrag(value, viewport: proxy.size)
+          if dragIntent == .portraitDismiss {
+            finishPortraitDismissDrag(value, viewport: proxy.size)
+          } else {
+            resetDragIntent()
+          }
           return
         }
 
-        let dx = value.translation.width
-        let dy = value.translation.height
-
-        // Landscape retains the quick horizontal seek gesture. Portrait uses
-        // the Photos-style drag-to-dismiss instead; precision seeking lives on
-        // the timeline there, avoiding a gesture conflict.
-        if abs(dx) > abs(dy) {
-          let delta = Double(dx / availableWidth) * 180
+        if dragIntent == .landscapeSeek {
+          let delta = Double(value.translation.width / availableWidth) * 180
           if abs(delta) > 2 { seekBy(delta) }
         }
 
-        gestureStartBrightness = nil
-        gestureStartVolume = nil
         if isGestureInteracting { finishContinuousGestureHUD() }
-        isGestureInteracting = false
+        resetDragIntent()
         scheduleControlsHide()
       }
+  }
+
+  private func classifyPortraitDragIfNeeded(_ value: DragGesture.Value) {
+    guard dragIntent == .undecided else { return }
+    let dx = value.translation.width
+    let dy = value.translation.height
+    guard hypot(dx, dy) >= 12 else { return }
+
+    // Match a photo viewer's gesture gate: dismissal owns only a deliberate
+    // downward, vertically dominant swipe. Taps, horizontal movement and
+    // upward swipes never make the whole player "float" under the finger.
+    if dy > 0, abs(dy) > abs(dx) * 1.08 {
+      dragIntent = .portraitDismiss
+      dismissDragOriginTranslation = value.translation
+    } else if abs(dx) > abs(dy) || dy < 0 {
+      dragIntent = .ignored
+    }
+  }
+
+  private func classifyLandscapeDragIfNeeded(_ value: DragGesture.Value, availableWidth: CGFloat) {
+    guard dragIntent == .undecided else { return }
+    let dx = value.translation.width
+    let dy = value.translation.height
+    guard hypot(dx, dy) >= 11 else { return }
+
+    if abs(dx) > abs(dy) * 1.08 {
+      dragIntent = .landscapeSeek
+    } else if abs(dy) > abs(dx) * 1.08 {
+      dragIntent = value.startLocation.x < availableWidth * 0.5
+        ? .landscapeBrightness
+        : .landscapeVolume
+    }
+  }
+
+  private func resetDragIntent() {
+    dragIntent = .undecided
+    dismissDragOriginTranslation = .zero
+    gestureStartBrightness = nil
+    gestureStartVolume = nil
+    isGestureInteracting = false
   }
 
   @MainActor
@@ -698,10 +802,11 @@ struct PlayerScreen: View {
       gestureHUD = nil
     }
 
-    // Follow the finger directly near the center, then add continuous resistance
-    // near the display edges. The derivative remains smooth at the handoff, so
-    // the media never hits a hard wall or jumps when the user changes direction.
-    dismissDragOffset = rubberBandedDismissTranslation(value.translation, viewport: viewport)
+    let translation = CGSize(
+      width: value.translation.width - dismissDragOriginTranslation.width,
+      height: value.translation.height - dismissDragOriginTranslation.height
+    )
+    dismissDragOffset = rubberBandedDismissTranslation(translation, viewport: viewport)
   }
 
   @MainActor
@@ -709,6 +814,7 @@ struct PlayerScreen: View {
     guard isDismissDragging || dismissDragOffset != .zero else { return }
     isDismissDragging = false
     isDismissSettling = false
+    resetDragIntent()
     dismissRestoreTask?.cancel()
     withAnimation(.spring(response: 0.24, dampingFraction: 0.90)) {
       dismissDragOffset = .zero
@@ -716,9 +822,18 @@ struct PlayerScreen: View {
   }
 
   private func rubberBandedDismissTranslation(_ translation: CGSize, viewport: CGSize) -> CGSize {
-    CGSize(
-      width: rubberBandedAxis(translation.width, dimension: viewport.width),
-      height: rubberBandedAxis(translation.height, dimension: viewport.height)
+    let vertical: CGFloat
+    if translation.height >= 0 {
+      vertical = rubberBandedAxis(translation.height, dimension: viewport.height)
+    } else {
+      // Once a downward dismissal has begun, reversing the finger is allowed
+      // but resisted; it communicates cancellation without turning into an
+      // upward-dismiss gesture.
+      vertical = -rubberBandedBoundedValue(abs(translation.height) * 0.28, limit: 0, dimension: viewport.height)
+    }
+    return CGSize(
+      width: rubberBandedAxis(translation.width * 0.92, dimension: viewport.width),
+      height: vertical
     )
   }
 
@@ -734,34 +849,27 @@ struct PlayerScreen: View {
 
   @MainActor
   private func finishPortraitDismissDrag(_ value: DragGesture.Value, viewport: CGSize) {
-    guard isDismissDragging else { return }
+    guard isDismissDragging else {
+      resetDragIntent()
+      return
+    }
 
-    let width = max(viewport.width, 1)
     let height = max(viewport.height, 1)
-    let diagonal = hypot(width, height)
-    let actualDistance = hypot(value.translation.width, value.translation.height)
-    let projectedDistance = hypot(value.predictedEndTranslation.width, value.predictedEndTranslation.height)
-    let dismissDistance = min(max(min(width, height) * 0.28, 92), 138)
-    let projectedThreshold = dismissDistance * 1.50
-
-    // If the finger physically reaches an edge while still travelling outward,
-    // finish the dismissal instead of making the page feel as if that edge is a
-    // spring-loaded wall. This is especially important when swiping upward: the
-    // finger cannot continue beyond the display, so distance alone can otherwise
-    // make a valid Photos-style escape bounce back to center.
-    let edgeMargin: CGFloat = 24
-    let nearTop = value.location.y <= edgeMargin && value.translation.height < -8
-    let nearBottom = value.location.y >= height - edgeMargin && value.translation.height > 8
-    let nearLeft = value.location.x <= edgeMargin && value.translation.width < -8
-    let nearRight = value.location.x >= width - edgeMargin && value.translation.width > 8
-    let reachedEscapeEdge = nearTop || nearBottom || nearLeft || nearRight
-
-    let releaseSpeed = hypot(value.velocity.width, value.velocity.height)
-    let fastFlick = releaseSpeed > 720 && projectedDistance > dismissDistance * 0.90
-    let shouldDismiss = reachedEscapeEdge
-      || actualDistance >= dismissDistance
-      || projectedDistance >= projectedThreshold
-      || fastFlick
+    let actualTranslation = CGSize(
+      width: value.translation.width - dismissDragOriginTranslation.width,
+      height: value.translation.height - dismissDragOriginTranslation.height
+    )
+    let projectedTranslation = CGSize(
+      width: value.predictedEndTranslation.width - dismissDragOriginTranslation.width,
+      height: value.predictedEndTranslation.height - dismissDragOriginTranslation.height
+    )
+    let actualY = max(actualTranslation.height, 0)
+    let projectedY = max(projectedTranslation.height, 0)
+    let dismissDistance = min(max(height * 0.22, 140), 220)
+    let fastDownwardFlick = value.velocity.height > 650 && projectedY > dismissDistance * 0.72
+    let shouldDismiss = actualY >= dismissDistance
+      || projectedY >= dismissDistance * 1.12
+      || fastDownwardFlick
 
     dismissRestoreTask?.cancel()
     isDismissDragging = false
@@ -770,54 +878,33 @@ struct PlayerScreen: View {
     if shouldDismiss {
       UIImpactFeedbackGenerator(style: .soft).impactOccurred()
 
-      // Keep travelling along the true release velocity when available. This
-      // makes the finger-to-animation handoff continuous instead of aiming at a
-      // new arbitrary vector after the touch ends.
-      let velocityMagnitude = hypot(value.velocity.width, value.velocity.height)
-      let vector: CGSize
-      if velocityMagnitude > 80 {
-        vector = value.velocity
-      } else if projectedDistance > actualDistance {
-        vector = value.predictedEndTranslation
-      } else {
-        vector = value.translation
-      }
-      let magnitude = max(hypot(vector.width, vector.height), 1)
-      let escapeDistance = diagonal * 0.82
+      let horizontalMomentum = min(max(value.velocity.width * 0.12, -viewport.width * 0.24), viewport.width * 0.24)
       let target = CGSize(
-        width: vector.width / magnitude * escapeDistance,
-        height: vector.height / magnitude * escapeDistance
+        width: dismissDragOffset.width + horizontalMomentum,
+        height: height * 1.08
       )
 
-      withAnimation(.interpolatingSpring(duration: 0.28, bounce: 0.0, initialVelocity: min(Double(releaseSpeed / max(actualDistance, 60)), 8))) {
+      // SwiftUI springs preserve the gesture's current velocity when the same
+      // property is handed from direct manipulation into animation.
+      withAnimation(.spring(duration: 0.32, bounce: 0.0)) {
         dismissDragOffset = target
       }
 
       dismissRestoreTask = Task { @MainActor in
-        try? await Task.sleep(for: .milliseconds(105))
+        try? await Task.sleep(for: .milliseconds(235))
         guard !Task.isCancelled else { return }
         dismiss()
       }
       return
     }
 
-    // Preserve the component of the user's real release velocity along the
-    // return-to-center path. SwiftUI's interpolating spring preserves velocity
-    // across overlapping animations, removing the tiny stop/restart sensation
-    // that is very noticeable in a Photos-style interaction.
-    let distance = max(actualDistance, 1)
-    let towardCenterX = -value.translation.width / distance
-    let towardCenterY = -value.translation.height / distance
-    let velocityTowardCenter = value.velocity.width * towardCenterX + value.velocity.height * towardCenterY
-    let normalizedInitialVelocity = min(max(Double(velocityTowardCenter / distance), -6), 6)
-
-    withAnimation(.interpolatingSpring(duration: 0.40, bounce: 0.0, initialVelocity: normalizedInitialVelocity)) {
+    withAnimation(.spring(duration: 0.42, bounce: 0.0)) {
       dismissDragOffset = .zero
     }
 
     let shouldRestoreControls = dismissControlsWereVisible
     dismissRestoreTask = Task { @MainActor in
-      try? await Task.sleep(for: .milliseconds(390))
+      try? await Task.sleep(for: .milliseconds(420))
       guard !Task.isCancelled else { return }
       isDismissSettling = false
       if shouldRestoreControls {
@@ -826,6 +913,7 @@ struct PlayerScreen: View {
       } else {
         controlsVisible = false
       }
+      resetDragIntent()
     }
   }
 
@@ -2508,6 +2596,8 @@ struct PlayerScreen: View {
     dismissDragOffset = .zero
     isDismissDragging = false
     isDismissSettling = false
+    dragIntent = .undecided
+    dismissDragOriginTranslation = .zero
     dismissRestoreTask?.cancel()
     isPinchInteracting = false
     singleFingerGestureSuppressedUntil = 0
