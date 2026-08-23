@@ -16,6 +16,7 @@ private enum PlayerDragIntent {
 struct PlayerScreen: View {
   @Environment(\.dismiss) private var dismiss
   @Environment(AppState.self) private var appState
+  @Environment(\.verticalSizeClass) private var verticalSizeClass
 
   @State private var currentItem: CloudItem
   @State private var playlist: [CloudItem] = []
@@ -53,6 +54,8 @@ struct PlayerScreen: View {
   @State private var isControlsInteractionActive = false
   @State private var gestureStartBrightness: CGFloat?
   @State private var gestureStartVolume: Float?
+  @State private var volumeBeforeMute: Float = 1.0
+  @State private var isPlayerMuted = false
   @State private var videoScale: CGFloat = 1.0
   @State private var pinchStartScale: CGFloat = 1.0
   @State private var pinchStartOffset: CGSize = .zero
@@ -94,6 +97,22 @@ struct PlayerScreen: View {
       // background transparent lets the existing library remain alive and
       // visible underneath during the Photos-style interactive dismiss.
       .presentationBackground(.clear)
+      .interactiveDismissDisabled(shouldDisableSystemInteractiveDismiss)
+  }
+
+  private var shouldDisableSystemInteractiveDismiss: Bool {
+    if #available(iOS 18.0, *) {
+      // Native card-linked dismissal owns the unzoomed portrait experience.
+      // Landscape keeps its seek/brightness/volume gestures, and locked or
+      // magnified video must never escape through a competing system gesture.
+      return verticalSizeClass == .compact
+        || isLocked
+        || videoScale > 1.001
+        || !appState.playerGesturesEnabled
+    }
+    // iOS 17 has no card-linked zoom transition; retain the existing custom
+    // direct-manipulation fallback without the modal recognizer competing.
+    return true
   }
 
   private var playerBaseView: some View {
@@ -646,6 +665,11 @@ struct PlayerScreen: View {
         }
 
         if !isLandscape {
+          // On iOS 18 the cover is linked to its originating card with the
+          // system zoom transition. Let that continuously interactive gesture
+          // own dismissal end-to-end, otherwise this local translation fights
+          // it and the return animation can restart from an arbitrary edge.
+          if #available(iOS 18.0, *) { return }
           classifyPortraitDragIfNeeded(value)
           guard dragIntent == .portraitDismiss else { return }
           updatePortraitDismissDrag(value, viewport: proxy.size)
@@ -721,6 +745,10 @@ struct PlayerScreen: View {
         }
 
         if !isLandscape {
+          if #available(iOS 18.0, *) {
+            resetDragIntent()
+            return
+          }
           if dragIntent == .portraitDismiss {
             finishPortraitDismissDrag(value, viewport: proxy.size)
           } else {
@@ -799,7 +827,13 @@ struct PlayerScreen: View {
       gestureHUD = nil
     }
 
-    dismissDragOffset = rubberBandedDismissTranslation(value.translation, viewport: viewport)
+    var transaction = Transaction(animation: nil)
+    transaction.disablesAnimations = true
+    withTransaction(transaction) {
+      // Direct manipulation must remain exactly under the finger. Springing is
+      // reserved for finishPortraitDismissDrag after the touch has ended.
+      dismissDragOffset = rubberBandedDismissTranslation(value.translation, viewport: viewport)
+    }
   }
 
   @MainActor
@@ -850,11 +884,6 @@ struct PlayerScreen: View {
       || value.velocity.height * actualY >= 0
     let projectionStaysOnCurrentSide = !hasMeaningfulOffset
       || projectedY * actualY >= 0
-    let releaseDirection: CGFloat = {
-      if hasMeaningfulOffset { return actualY < 0 ? -1 : 1 }
-      if abs(projectedY) > 1 { return projectedY < 0 ? -1 : 1 }
-      return value.velocity.height < 0 ? -1 : 1
-    }()
     let fastVerticalFlick = abs(value.velocity.height) > 650
       && abs(projectedY) > dismissDistance * 0.72
       && projectionStaysOnCurrentSide
@@ -872,23 +901,11 @@ struct PlayerScreen: View {
     if shouldDismiss {
       UIImpactFeedbackGenerator(style: .soft).impactOccurred()
 
-      let horizontalMomentum = min(max(value.velocity.width * 0.12, -viewport.width * 0.24), viewport.width * 0.24)
-      let target = CGSize(
-        width: dismissDragOffset.width + horizontalMomentum,
-        height: releaseDirection * height * 1.08
-      )
-
-      // SwiftUI springs preserve the gesture's current velocity when the same
-      // property is handed from direct manipulation into animation.
-      withAnimation(.spring(duration: 0.32, bounce: 0.0)) {
-        dismissDragOffset = target
-      }
-
-      dismissRestoreTask = Task { @MainActor in
-        try? await Task.sleep(for: .milliseconds(235))
-        guard !Task.isCancelled else { return }
-        dismiss()
-      }
+      // Keep the rendered surface at the exact release position and hand that
+      // snapshot straight to the presentation dismissal. Moving it off-screen
+      // first creates a second, disconnected animation whose starting edge is
+      // undefined.
+      dismiss()
       return
     }
 
@@ -947,7 +964,7 @@ struct PlayerScreen: View {
 
       Spacer(minLength: 6)
 
-      playerIconButton("ellipsis.circle") {
+      playerIconButton("ellipsis") {
         openSettingsPanel()
       }
       .accessibilityLabel("播放设置")
@@ -957,8 +974,8 @@ struct PlayerScreen: View {
     .padding(
       .top,
       landscape
-        ? max(proxy.safeAreaInsets.top + 10, 18)
-        : max(proxy.safeAreaInsets.top + 10, 26)
+        ? max(proxy.safeAreaInsets.top + 18, 26)
+        : max(proxy.safeAreaInsets.top + 20, 36)
     )
     .padding(.bottom, landscape ? 20 : 12)
     .background(
@@ -1434,6 +1451,12 @@ struct PlayerScreen: View {
         }
       }
 
+      if playlist.count > 1 {
+        settingsActionButton("播放列表", systemName: "rectangle.stack.badge.play") {
+          openQueuePanel()
+        }
+      }
+
       settingsActionButton(showPlaybackHUD ? "关闭 HUD" : "播放 HUD", systemName: "waveform.path.ecg") {
         showPlaybackHUD.toggle()
         keepControlsDuringInteraction()
@@ -1587,18 +1610,18 @@ struct PlayerScreen: View {
       }
 
       if let model {
-        timeline(model: model)
-        if landscape {
-          landscapeUtilityBar(model: model)
-        } else {
-          portraitUtilityBar(model: model)
+        HStack(alignment: .top, spacing: landscape ? 14 : 11) {
+          compactPlayPauseButton()
+          timeline(model: model)
+            .frame(maxWidth: .infinity)
+          muteButton()
         }
       }
     }
     .padding(.leading, max(proxy.safeAreaInsets.leading, landscape ? 24 : 16))
     .padding(.trailing, max(proxy.safeAreaInsets.trailing, landscape ? 24 : 16))
-    .padding(.top, landscape ? 34 : 28)
-    .padding(.bottom, max(proxy.safeAreaInsets.bottom, landscape ? 8 : 12) + 2)
+    .padding(.top, landscape ? 30 : 24)
+    .padding(.bottom, max(proxy.safeAreaInsets.bottom, landscape ? 10 : 14) + 4)
     .background(
       LinearGradient(
         colors: [.clear, .black.opacity(landscape ? 0.58 : 0.70)],
@@ -1608,73 +1631,6 @@ struct PlayerScreen: View {
     )
   }
 
-  private func portraitUtilityBar(model: PlayerModel) -> some View {
-    HStack(spacing: 8) {
-      utilityButton(title: formatRate(Double(playbackRate)), systemName: "speedometer") {
-        openSpeedPanel()
-      }
-
-      Spacer(minLength: 8)
-
-      compactPlayPauseButton()
-
-      Spacer(minLength: 8)
-
-      if playlist.count > 1 {
-        utilityIconButton("rectangle.stack.badge.play") {
-          openQueuePanel()
-        }
-        .accessibilityLabel("播放队列")
-      } else {
-        Color.clear.frame(width: 34, height: 34)
-      }
-    }
-  }
-
-  private func centerTransportButton(
-    _ systemName: String,
-    enabled: Bool = true,
-    size: CGFloat = 20,
-    action: @escaping () -> Void
-  ) -> some View {
-    Button(action: action) {
-      Image(systemName: systemName)
-        .font(.system(size: size, weight: .semibold))
-        .foregroundStyle(enabled ? .white : .white.opacity(0.24))
-        .frame(width: 46, height: 46)
-        .background(.black.opacity(enabled ? 0.20 : 0.12), in: Circle())
-        .overlay {
-          Circle().stroke(.white.opacity(enabled ? 0.08 : 0.04), lineWidth: 0.6)
-        }
-        .contentShape(Circle())
-    }
-    .buttonStyle(.plain)
-    .disabled(!enabled)
-  }
-
-  private func landscapeUtilityBar(model: PlayerModel) -> some View {
-    HStack(spacing: 8) {
-      utilityButton(title: formatRate(Double(playbackRate)), systemName: "speedometer") {
-        openSpeedPanel()
-      }
-
-      Spacer(minLength: 8)
-
-      compactPlayPauseButton()
-
-      Spacer(minLength: 8)
-
-      if playlist.count > 1 {
-        utilityIconButton("rectangle.stack.badge.play") {
-          openQueuePanel()
-        }
-        .accessibilityLabel("播放队列")
-      } else {
-        Color.clear.frame(width: 34, height: 34)
-      }
-    }
-  }
-
   private func compactPlayPauseButton() -> some View {
     Button {
       toggleActivePlayback(userInitiated: true)
@@ -1682,49 +1638,37 @@ struct PlayerScreen: View {
       scheduleControlsHide()
     } label: {
       Image(systemName: activeIsPlaying ? "pause.fill" : "play.fill")
-        .font(.system(size: 16, weight: .bold))
+        .font(.system(size: 17, weight: .semibold))
         .contentTransition(.symbolEffect)
-        .foregroundStyle(.black)
-        .frame(width: 38, height: 38)
-        .background(.white, in: Circle())
-        .shadow(color: .black.opacity(0.22), radius: 8, y: 3)
+        .foregroundStyle(.white)
+        .frame(width: 42, height: 44)
+        .contentShape(Rectangle())
     }
     .buttonStyle(PlayerPressScaleStyle(pressedScale: 0.92))
     .accessibilityLabel(activeIsPlaying ? "暂停" : "播放")
   }
 
-  private func utilityButton(title: String, systemName: String, action: @escaping () -> Void) -> some View {
-    Button(action: action) {
-      HStack(spacing: 6) {
-        Image(systemName: systemName)
-        Text(title)
+  private func muteButton() -> some View {
+    return Button {
+      if isPlayerMuted {
+        setActiveVolume(max(volumeBeforeMute, 0.35))
+      } else {
+        volumeBeforeMute = max(activeVolume, 0.05)
+        setActiveVolume(0)
       }
-      .font(.caption.weight(.semibold))
-      .foregroundStyle(.white.opacity(0.88))
-      .padding(.horizontal, 10)
-      .frame(height: 34)
-      .background(.ultraThinMaterial, in: Capsule())
-      .background(.black.opacity(0.22), in: Capsule())
-      .overlay { Capsule().stroke(.white.opacity(0.08), lineWidth: 0.6) }
+      UIImpactFeedbackGenerator(style: .soft).impactOccurred(intensity: 0.62)
+      controlsVisible = true
+      scheduleControlsHide()
+    } label: {
+      Image(systemName: isPlayerMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+        .font(.system(size: 16, weight: .semibold))
+        .contentTransition(.symbolEffect)
+        .foregroundStyle(.white)
+        .frame(width: 42, height: 44)
+        .contentShape(Rectangle())
     }
-    .buttonStyle(.plain)
-  }
-
-  private func utilityIconButton(
-    _ systemName: String,
-    enabled: Bool = true,
-    action: @escaping () -> Void
-  ) -> some View {
-    Button(action: action) {
-      Image(systemName: systemName)
-        .font(.system(size: 14, weight: .semibold))
-        .foregroundStyle(enabled ? .white.opacity(0.88) : .white.opacity(0.24))
-        .frame(width: 34, height: 34)
-        .background(.ultraThinMaterial, in: Circle())
-        .background(.black.opacity(enabled ? 0.22 : 0.12), in: Circle())
-    }
-    .buttonStyle(.plain)
-    .disabled(!enabled)
+    .buttonStyle(PlayerPressScaleStyle(pressedScale: 0.92))
+    .accessibilityLabel(isPlayerMuted ? "恢复声音" : "静音")
   }
 
   private func timeline(model: PlayerModel) -> some View {
@@ -1738,7 +1682,7 @@ struct PlayerScreen: View {
         let bufferedProgress = CGFloat(buffered / duration)
         let playedX = width * playedProgress
         let bufferedX = width * bufferedProgress
-        let trackHeight: CGFloat = isScrubbing ? 5 : 3
+        let trackHeight: CGFloat = isScrubbing ? 5 : 2.5
 
         ZStack(alignment: .leading) {
           Capsule()
@@ -1767,9 +1711,9 @@ struct PlayerScreen: View {
 
           Circle()
             .fill(.white)
-            .frame(width: isScrubbing ? 10 : 8, height: isScrubbing ? 10 : 8)
+            .frame(width: isScrubbing ? 11 : 6, height: isScrubbing ? 11 : 6)
             .shadow(color: .black.opacity(0.22), radius: 2, y: 1)
-            .offset(x: min(max(playedX - (isScrubbing ? 5 : 4), 0), max(width - (isScrubbing ? 10 : 8), 0)))
+            .offset(x: min(max(playedX - (isScrubbing ? 5.5 : 3), 0), max(width - (isScrubbing ? 11 : 6), 0)))
         }
         .frame(maxHeight: .infinity)
         .animation(.spring(response: 0.22, dampingFraction: 0.88), value: isScrubbing)
@@ -1839,17 +1783,8 @@ struct PlayerScreen: View {
       }
       .frame(height: 44)
 
-      HStack {
+      HStack(spacing: 8) {
         Text(formatTime(isScrubbing ? scrubValue : activeCurrentTime))
-        Spacer()
-        if let chapter = currentChapter {
-          Text(chapter.title)
-            .lineLimit(1)
-            .foregroundStyle(.white.opacity(0.52))
-        } else if !useVLC, activeBufferedUntil > activeCurrentTime + 1 {
-          Text("已缓冲 \(formatTime(activeBufferedUntil))")
-            .foregroundStyle(.white.opacity(0.46))
-        }
         Spacer()
         Text(formatTime(activeDuration))
       }
@@ -2192,6 +2127,7 @@ struct PlayerScreen: View {
   private func setActiveVolume(_ volume: Float) {
     let safe = min(max(volume, 0), 1)
     withActiveEngine { $0.engineSetVolume(safe) }
+    isPlayerMuted = safe <= 0.001
   }
 
   private var activeCurrentTime: Double {
