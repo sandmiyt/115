@@ -50,7 +50,7 @@ actor ThumbnailService {
       return nil
     }
 
-    let task = Task { [weak self] in
+    let task = Task<UIImage?, Never> { [weak self] in
       guard let self else { return nil }
       return await self.loadAndPersistThumbnail(for: item, api: api)
     }
