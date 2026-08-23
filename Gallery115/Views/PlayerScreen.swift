@@ -16,7 +16,6 @@ private enum PlayerDragIntent {
 struct PlayerScreen: View {
   @Environment(\.dismiss) private var dismiss
   @Environment(AppState.self) private var appState
-  @Environment(\.verticalSizeClass) private var verticalSizeClass
 
   @State private var currentItem: CloudItem
   @State private var playlist: [CloudItem] = []
@@ -97,22 +96,10 @@ struct PlayerScreen: View {
       // background transparent lets the existing library remain alive and
       // visible underneath during the Photos-style interactive dismiss.
       .presentationBackground(.clear)
-      .interactiveDismissDisabled(shouldDisableSystemInteractiveDismiss)
-  }
-
-  private var shouldDisableSystemInteractiveDismiss: Bool {
-    if #available(iOS 18.0, *) {
-      // Native card-linked dismissal owns the unzoomed portrait experience.
-      // Landscape keeps its seek/brightness/volume gestures, and locked or
-      // magnified video must never escape through a competing system gesture.
-      return verticalSizeClass == .compact
-        || isLocked
-        || videoScale > 1.001
-        || !appState.playerGesturesEnabled
-    }
-    // iOS 17 has no card-linked zoom transition; retain the existing custom
-    // direct-manipulation fallback without the modal recognizer competing.
-    return true
+      // This screen supplies its own bidirectional direct-manipulation gesture.
+      // Prevent the modal recognizer from stealing the same finger stream; the
+      // committed dismissal still uses the existing card-linked zoom transition.
+      .interactiveDismissDisabled()
   }
 
   private var playerBaseView: some View {
@@ -665,11 +652,6 @@ struct PlayerScreen: View {
         }
 
         if !isLandscape {
-          // On iOS 18 the cover is linked to its originating card with the
-          // system zoom transition. Let that continuously interactive gesture
-          // own dismissal end-to-end, otherwise this local translation fights
-          // it and the return animation can restart from an arbitrary edge.
-          if #available(iOS 18.0, *) { return }
           classifyPortraitDragIfNeeded(value)
           guard dragIntent == .portraitDismiss else { return }
           updatePortraitDismissDrag(value, viewport: proxy.size)
@@ -745,10 +727,6 @@ struct PlayerScreen: View {
         }
 
         if !isLandscape {
-          if #available(iOS 18.0, *) {
-            resetDragIntent()
-            return
-          }
           if dragIntent == .portraitDismiss {
             finishPortraitDismissDrag(value, viewport: proxy.size)
           } else {
@@ -1610,12 +1588,36 @@ struct PlayerScreen: View {
       }
 
       if let model {
-        HStack(alignment: .top, spacing: landscape ? 14 : 11) {
+        HStack(alignment: .bottom, spacing: landscape ? 13 : 10) {
           compactPlayPauseButton()
           timeline(model: model)
             .frame(maxWidth: .infinity)
           muteButton()
         }
+        // Keep horizontal geometry stable while seeking so the timestamp does
+        // not jump when the glass card expands around the same finger position.
+        .padding(.horizontal, 11)
+        .padding(.vertical, isScrubbing ? 10 : 6)
+        .background {
+          RoundedRectangle(cornerRadius: isScrubbing ? 24 : 20, style: .continuous)
+            .fill(.ultraThinMaterial)
+            .overlay {
+              RoundedRectangle(cornerRadius: isScrubbing ? 24 : 20, style: .continuous)
+                .fill(
+                  LinearGradient(
+                    colors: [.white.opacity(isScrubbing ? 0.13 : 0.09), .white.opacity(0.025)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                  )
+                )
+            }
+        }
+        .overlay {
+          RoundedRectangle(cornerRadius: isScrubbing ? 24 : 20, style: .continuous)
+            .stroke(.white.opacity(isScrubbing ? 0.20 : 0.13), lineWidth: 0.7)
+        }
+        .shadow(color: .black.opacity(isScrubbing ? 0.30 : 0.22), radius: isScrubbing ? 18 : 12, y: 6)
+        .animation(.spring(response: 0.34, dampingFraction: 0.86, blendDuration: 0.08), value: isScrubbing)
       }
     }
     .padding(.leading, max(proxy.safeAreaInsets.leading, landscape ? 24 : 16))
@@ -1672,7 +1674,24 @@ struct PlayerScreen: View {
   }
 
   private func timeline(model: PlayerModel) -> some View {
-    VStack(spacing: 5) {
+    let remaining = max(activeDuration - scrubValue, 0)
+
+    return VStack(spacing: isScrubbing ? 5 : 0) {
+      if isScrubbing {
+        HStack(spacing: 8) {
+          Text(formatPreciseTime(scrubValue))
+          Spacer(minLength: 8)
+          Text("−\(formatPreciseTime(remaining))")
+        }
+        .font(.caption2.monospacedDigit().weight(.semibold))
+        .foregroundStyle(.white.opacity(0.82))
+        .lineLimit(1)
+        .contentTransition(.numericText())
+        .transition(.opacity.combined(with: .move(edge: .bottom)))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("当前位置 \(formatPreciseTime(scrubValue))，剩余 \(formatPreciseTime(remaining))")
+      }
+
       GeometryReader { proxy in
         let width = max(proxy.size.width, 1)
         let duration = max(activeDuration, 1)
@@ -1682,24 +1701,24 @@ struct PlayerScreen: View {
         let bufferedProgress = CGFloat(buffered / duration)
         let playedX = width * playedProgress
         let bufferedX = width * bufferedProgress
-        let trackHeight: CGFloat = isScrubbing ? 5 : 2.5
+        let trackHeight: CGFloat = isScrubbing ? 6 : 4
 
         ZStack(alignment: .leading) {
           Capsule()
-            .fill(.white.opacity(0.20))
+            .fill(.white.opacity(isScrubbing ? 0.20 : 0.32))
             .frame(height: trackHeight)
 
-          if !useVLC {
+          if !isScrubbing, !useVLC {
             Capsule()
-              .fill(.white.opacity(0.32))
+              .fill(.white.opacity(0.48))
               .frame(width: bufferedX, height: trackHeight)
           }
 
           Capsule()
-            .fill(.white)
+            .fill(isScrubbing ? Color.white.opacity(0.70) : Color.white)
             .frame(width: playedX, height: trackHeight)
 
-          if appState.showChapterMarkers, activeDuration > 0 {
+          if !isScrubbing, appState.showChapterMarkers, activeDuration > 0 {
             ForEach(activeChapters) { chapter in
               let markerX = width * CGFloat(min(max(chapter.start / duration, 0), 1))
               Rectangle()
@@ -1708,12 +1727,6 @@ struct PlayerScreen: View {
                 .offset(x: min(max(markerX, 0), width - 1))
             }
           }
-
-          Circle()
-            .fill(.white)
-            .frame(width: isScrubbing ? 11 : 6, height: isScrubbing ? 11 : 6)
-            .shadow(color: .black.opacity(0.22), radius: 2, y: 1)
-            .offset(x: min(max(playedX - (isScrubbing ? 5.5 : 3), 0), max(width - (isScrubbing ? 11 : 6), 0)))
         }
         .frame(maxHeight: .infinity)
         .animation(.spring(response: 0.22, dampingFraction: 0.88), value: isScrubbing)
@@ -1782,15 +1795,8 @@ struct PlayerScreen: View {
         )
       }
       .frame(height: 44)
-
-      HStack(spacing: 8) {
-        Text(formatTime(isScrubbing ? scrubValue : activeCurrentTime))
-        Spacer()
-        Text(formatTime(activeDuration))
-      }
-      .font(.caption2.monospacedDigit().weight(.medium))
-      .foregroundStyle(.white.opacity(0.72))
     }
+    .animation(.spring(response: 0.34, dampingFraction: 0.86, blendDuration: 0.08), value: isScrubbing)
   }
 
   private func controlCircle(
@@ -1811,17 +1817,30 @@ struct PlayerScreen: View {
 
   private func playerIconButton(_ systemName: String, action: @escaping () -> Void) -> some View {
     Button(action: action) { playerIcon(systemName) }
-      .buttonStyle(.plain)
+      .buttonStyle(PlayerPressScaleStyle(pressedScale: 0.92))
   }
 
   private func playerIcon(_ systemName: String) -> some View {
     Image(systemName: systemName)
       .font(.system(size: 15, weight: .semibold))
       .foregroundStyle(.white)
-      .frame(width: 38, height: 38)
-      .background(.ultraThinMaterial, in: Circle())
-      .background(.black.opacity(0.28), in: Circle())
-      .overlay { Circle().stroke(.white.opacity(0.10), lineWidth: 0.7) }
+      .frame(width: 40, height: 40)
+      .background {
+        Circle()
+          .fill(.ultraThinMaterial)
+          .overlay {
+            Circle()
+              .fill(
+                LinearGradient(
+                  colors: [.white.opacity(0.16), .white.opacity(0.035)],
+                  startPoint: .topLeading,
+                  endPoint: .bottomTrailing
+                )
+              )
+          }
+      }
+      .overlay { Circle().stroke(.white.opacity(0.20), lineWidth: 0.7) }
+      .shadow(color: .black.opacity(0.24), radius: 10, y: 4)
       .contentShape(Circle())
   }
 
@@ -2662,6 +2681,18 @@ struct PlayerScreen: View {
     return hours > 0
       ? String(format: "%d:%02d:%02d", hours, minutes, secs)
       : String(format: "%02d:%02d", minutes, secs)
+  }
+
+  private func formatPreciseTime(_ seconds: Double) -> String {
+    guard seconds.isFinite else { return "00:00.000" }
+    let totalMilliseconds = max(0, Int((seconds * 1_000).rounded()))
+    let hours = totalMilliseconds / 3_600_000
+    let minutes = (totalMilliseconds % 3_600_000) / 60_000
+    let secs = (totalMilliseconds % 60_000) / 1_000
+    let milliseconds = totalMilliseconds % 1_000
+    return hours > 0
+      ? String(format: "%d:%02d:%02d.%03d", hours, minutes, secs, milliseconds)
+      : String(format: "%02d:%02d.%03d", minutes, secs, milliseconds)
   }
 
 }
