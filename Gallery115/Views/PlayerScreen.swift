@@ -1588,24 +1588,36 @@ struct PlayerScreen: View {
       }
 
       if let model {
-        HStack(alignment: .bottom, spacing: landscape ? 13 : 10) {
-          compactPlayPauseButton()
+        ZStack(alignment: .bottom) {
           timeline(model: model)
             .frame(maxWidth: .infinity)
-          muteButton()
+            // The gesture geometry stays fixed; only the drawn capsule insets
+            // animate. This prevents a seek jump as the bar extends sideways.
+            .padding(.horizontal, 8)
+            .zIndex(0)
+
+          HStack {
+            compactPlayPauseButton()
+            Spacer(minLength: 0)
+            muteButton()
+          }
+          .opacity(isScrubbing ? 0.12 : 1)
+          .scaleEffect(isScrubbing ? 0.88 : 1)
+          .blur(radius: isScrubbing ? 0.35 : 0)
+          .allowsHitTesting(!isScrubbing)
+          .zIndex(1)
         }
-        // Keep horizontal geometry stable while seeking so the timestamp does
-        // not jump when the glass card expands around the same finger position.
-        .padding(.horizontal, 11)
-        .padding(.vertical, isScrubbing ? 10 : 6)
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 8)
+        .padding(.vertical, isScrubbing ? 7 : 6)
         .background {
-          RoundedRectangle(cornerRadius: isScrubbing ? 24 : 20, style: .continuous)
+          RoundedRectangle(cornerRadius: isScrubbing ? 20 : 18, style: .continuous)
             .fill(.ultraThinMaterial)
             .overlay {
-              RoundedRectangle(cornerRadius: isScrubbing ? 24 : 20, style: .continuous)
+              RoundedRectangle(cornerRadius: isScrubbing ? 20 : 18, style: .continuous)
                 .fill(
                   LinearGradient(
-                    colors: [.white.opacity(isScrubbing ? 0.13 : 0.09), .white.opacity(0.025)],
+                    colors: [.white.opacity(isScrubbing ? 0.12 : 0.08), .white.opacity(0.02)],
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
                   )
@@ -1613,11 +1625,11 @@ struct PlayerScreen: View {
             }
         }
         .overlay {
-          RoundedRectangle(cornerRadius: isScrubbing ? 24 : 20, style: .continuous)
-            .stroke(.white.opacity(isScrubbing ? 0.20 : 0.13), lineWidth: 0.7)
+          RoundedRectangle(cornerRadius: isScrubbing ? 20 : 18, style: .continuous)
+            .stroke(.white.opacity(isScrubbing ? 0.18 : 0.12), lineWidth: 0.7)
         }
-        .shadow(color: .black.opacity(isScrubbing ? 0.30 : 0.22), radius: isScrubbing ? 18 : 12, y: 6)
-        .animation(.spring(response: 0.34, dampingFraction: 0.86, blendDuration: 0.08), value: isScrubbing)
+        .shadow(color: .black.opacity(isScrubbing ? 0.27 : 0.20), radius: isScrubbing ? 15 : 10, y: 5)
+        .animation(.spring(response: 0.30, dampingFraction: 0.88, blendDuration: 0.06), value: isScrubbing)
       }
     }
     .padding(.leading, max(proxy.safeAreaInsets.leading, landscape ? 24 : 16))
@@ -1676,20 +1688,20 @@ struct PlayerScreen: View {
   private func timeline(model: PlayerModel) -> some View {
     let remaining = max(activeDuration - scrubValue, 0)
 
-    return VStack(spacing: isScrubbing ? 5 : 0) {
+    return VStack(spacing: isScrubbing ? 1 : 0) {
       if isScrubbing {
         HStack(spacing: 8) {
-          Text(formatPreciseTime(scrubValue))
+          Text(formatTime(scrubValue))
           Spacer(minLength: 8)
-          Text("−\(formatPreciseTime(remaining))")
+          Text("−\(formatTime(remaining))")
         }
         .font(.caption2.monospacedDigit().weight(.semibold))
-        .foregroundStyle(.white.opacity(0.82))
+        .foregroundStyle(.white.opacity(0.78))
         .lineLimit(1)
         .contentTransition(.numericText())
         .transition(.opacity.combined(with: .move(edge: .bottom)))
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("当前位置 \(formatPreciseTime(scrubValue))，剩余 \(formatPreciseTime(remaining))")
+        .accessibilityLabel("当前位置 \(formatTime(scrubValue))，剩余 \(formatTime(remaining))")
       }
 
       GeometryReader { proxy in
@@ -1699,28 +1711,33 @@ struct PlayerScreen: View {
         let buffered = min(max(activeBufferedUntil, 0), duration)
         let playedProgress = CGFloat(current / duration)
         let bufferedProgress = CGFloat(buffered / duration)
-        let playedX = width * playedProgress
-        let bufferedX = width * bufferedProgress
+        let trackInset: CGFloat = isScrubbing ? 0 : 44
+        let trackWidth = max(width - trackInset * 2, 1)
+        let playedX = trackWidth * playedProgress
+        let bufferedX = trackWidth * bufferedProgress
         let trackHeight: CGFloat = isScrubbing ? 6 : 4
 
         ZStack(alignment: .leading) {
           Capsule()
             .fill(.white.opacity(isScrubbing ? 0.20 : 0.32))
-            .frame(height: trackHeight)
+            .frame(width: trackWidth, height: trackHeight)
+            .offset(x: trackInset)
 
           if !isScrubbing, !useVLC {
             Capsule()
               .fill(.white.opacity(0.48))
               .frame(width: bufferedX, height: trackHeight)
+              .offset(x: trackInset)
           }
 
           Capsule()
             .fill(isScrubbing ? Color.white.opacity(0.70) : Color.white)
             .frame(width: playedX, height: trackHeight)
+            .offset(x: trackInset)
 
           if !isScrubbing, appState.showChapterMarkers, activeDuration > 0 {
             ForEach(activeChapters) { chapter in
-              let markerX = width * CGFloat(min(max(chapter.start / duration, 0), 1))
+              let markerX = trackInset + trackWidth * CGFloat(min(max(chapter.start / duration, 0), 1))
               Rectangle()
                 .fill(.white.opacity(0.70))
                 .frame(width: 1, height: 9)
@@ -1728,33 +1745,9 @@ struct PlayerScreen: View {
             }
           }
         }
-        .frame(maxHeight: .infinity)
+        .frame(maxHeight: .infinity, alignment: isScrubbing ? .top : .center)
         .animation(.spring(response: 0.22, dampingFraction: 0.88), value: isScrubbing)
         .contentShape(Rectangle())
-        .overlay(alignment: .top) {
-          if isScrubbing, appState.timelinePreviewEnabled, !useVLC {
-            let previewWidth: CGFloat = 168
-            let clampedCenterX = min(max(playedX, previewWidth * 0.5), max(width - previewWidth * 0.5, previewWidth * 0.5))
-
-            VStack(spacing: 5) {
-              // Mirror the exact frame currently presented by the main AVPlayer
-              // layer. Unlike AVAssetImageGenerator this cannot drift to a
-              // neighboring timestamp and it creates zero extra Range requests.
-              SystemPlayerScrubPreviewView(presentationController: systemPresentationController)
-                .frame(width: previewWidth, height: 94)
-                .clipped()
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-
-              Text(formatTime(scrubValue))
-                .font(.caption2.monospacedDigit().weight(.semibold))
-                .foregroundStyle(.white.opacity(0.86))
-            }
-            .padding(6)
-            .background(.black.opacity(0.78), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
-            .offset(x: clampedCenterX - width * 0.5, y: -118)
-            .allowsHitTesting(false)
-          }
-        }
         .gesture(
           DragGesture(minimumDistance: 0)
             .onChanged { value in
@@ -1794,9 +1787,9 @@ struct PlayerScreen: View {
             }
         )
       }
-      .frame(height: 44)
+      .frame(height: isScrubbing ? 32 : 44)
     }
-    .animation(.spring(response: 0.34, dampingFraction: 0.86, blendDuration: 0.08), value: isScrubbing)
+    .animation(.spring(response: 0.30, dampingFraction: 0.88, blendDuration: 0.06), value: isScrubbing)
   }
 
   private func controlCircle(
@@ -2681,18 +2674,6 @@ struct PlayerScreen: View {
     return hours > 0
       ? String(format: "%d:%02d:%02d", hours, minutes, secs)
       : String(format: "%02d:%02d", minutes, secs)
-  }
-
-  private func formatPreciseTime(_ seconds: Double) -> String {
-    guard seconds.isFinite else { return "00:00.000" }
-    let totalMilliseconds = max(0, Int((seconds * 1_000).rounded()))
-    let hours = totalMilliseconds / 3_600_000
-    let minutes = (totalMilliseconds % 3_600_000) / 60_000
-    let secs = (totalMilliseconds % 60_000) / 1_000
-    let milliseconds = totalMilliseconds % 1_000
-    return hours > 0
-      ? String(format: "%d:%02d:%02d.%03d", hours, minutes, secs, milliseconds)
-      : String(format: "%02d:%02d.%03d", minutes, secs, milliseconds)
   }
 
 }
