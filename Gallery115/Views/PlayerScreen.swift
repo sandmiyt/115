@@ -55,6 +55,7 @@ struct PlayerScreen: View {
   @State private var gestureStartVolume: Float?
   @State private var videoScale: CGFloat = 1.0
   @State private var pinchStartScale: CGFloat = 1.0
+  @State private var pinchStartOffset: CGSize = .zero
   @State private var videoOffset: CGSize = .zero
   @State private var panStartOffset: CGSize = .zero
   @State private var isPinchInteracting = false
@@ -121,7 +122,7 @@ struct PlayerScreen: View {
             .animation(
               chromeShouldBeVisible
                 ? .spring(response: 0.34, dampingFraction: 0.88, blendDuration: 0.08)
-                : .easeOut(duration: 0.22),
+                : .easeOut(duration: 0.28),
               value: chromeShouldBeVisible
             )
             .allowsHitTesting(chromeShouldBeVisible && !isDismissMotionActive && !showSettingsPanel && !showSpeedPanel && !showQueuePanel)
@@ -385,36 +386,22 @@ struct PlayerScreen: View {
   }
 
   private func mediaPresentation(proxy: GeometryProxy) -> some View {
-    ZStack {
+    PlayerMediaRenderingSurface(
+      viewport: proxy.size,
+      videoScale: videoScale,
+      videoOffset: videoOffset,
+      dismissScale: interactiveDismissMediaScale,
+      dismissOffset: dismissDragOffset,
+      dismissCornerRadius: interactiveDismissCornerRadius,
+      dismissProgress: interactiveDismissProgress
+    ) {
       playerLayer
-        .frame(width: proxy.size.width, height: proxy.size.height)
-        .scaleEffect(videoScale, anchor: .center)
-        .offset(videoOffset)
-        .frame(width: proxy.size.width, height: proxy.size.height)
-        .background(Color.black)
-        .clipped()
-        .ignoresSafeArea()
-
+    } overlay: {
       if let subtitleText = activeExternalSubtitleText {
         externalSubtitleOverlay(text: subtitleText, proxy: proxy)
           .zIndex(8)
       }
     }
-    .frame(width: proxy.size.width, height: proxy.size.height)
-    .scaleEffect(interactiveDismissMediaScale, anchor: .center)
-    .offset(dismissDragOffset)
-    .clipShape(
-      RoundedRectangle(
-        cornerRadius: interactiveDismissCornerRadius,
-        style: .continuous
-      )
-    )
-    .shadow(
-      color: .black.opacity(Double(interactiveDismissProgress) * 0.28),
-      radius: interactiveDismissProgress * 28,
-      y: interactiveDismissProgress * 12
-    )
-    .allowsHitTesting(false)
   }
 
   private var isDismissMotionActive: Bool {
@@ -454,10 +441,14 @@ struct PlayerScreen: View {
       gestureSurface(isLeft: true, proxy: proxy)
       Color.clear
         .contentShape(Rectangle())
-        .onTapGesture { toggleControls() }
-        .onLongPressGesture(minimumDuration: 0.48, maximumDistance: 24) {
-          toggleFavoriteFromLongPress()
-        }
+        .gesture(mediaTapGesture {
+          toggleActivePlayback(userInitiated: true)
+          scheduleControlsHide()
+        })
+        .simultaneousGesture(
+          LongPressGesture(minimumDuration: 0.48, maximumDistance: 24)
+            .onEnded { _ in toggleFavoriteFromLongPress() }
+        )
         .frame(width: proxy.size.width * 0.34)
       gestureSurface(isLeft: false, proxy: proxy)
     }
@@ -468,13 +459,14 @@ struct PlayerScreen: View {
   }
 
   private func videoPinchGesture(proxy: GeometryProxy) -> some Gesture {
-    MagnificationGesture()
+    MagnifyGesture(minimumScaleDelta: 0.005)
       .onChanged { value in
         guard appState.playerGesturesEnabled, !isLocked else { return }
         if !isPinchInteracting {
           isPinchInteracting = true
           dragIntent = .undecided
           pinchStartScale = max(videoScale, 1.0)
+          pinchStartOffset = videoOffset
           // Pinch always wins over the one-finger gesture family. A short
           // suppression tail prevents one finger from a just-finished pinch
           // being interpreted as brightness/volume or seek.
@@ -486,10 +478,18 @@ struct PlayerScreen: View {
         }
 
         singleFingerGestureSuppressedUntil = ProcessInfo.processInfo.systemUptime + 0.22
-        let rawScale = pinchStartScale * value
+        let rawScale = pinchStartScale * value.magnification
         let nextScale = rubberBandedVideoScale(rawScale)
+        let anchor = CGSize(
+          width: (value.startAnchor.x - 0.5) * proxy.size.width,
+          height: (value.startAnchor.y - 0.5) * proxy.size.height
+        )
+        let anchoredOffset = CGSize(
+          width: pinchStartOffset.width + anchor.width * (pinchStartScale - nextScale),
+          height: pinchStartOffset.height + anchor.height * (pinchStartScale - nextScale)
+        )
         videoScale = nextScale
-        videoOffset = clampedVideoOffset(videoOffset, scale: nextScale, viewport: proxy.size)
+        videoOffset = rubberBandedVideoOffset(anchoredOffset, scale: nextScale, viewport: proxy.size)
       }
       .onEnded { value in
         guard appState.playerGesturesEnabled, !isLocked else {
@@ -498,7 +498,7 @@ struct PlayerScreen: View {
         }
 
         singleFingerGestureSuppressedUntil = ProcessInfo.processInfo.systemUptime + 0.24
-        let rawScale = pinchStartScale * value
+        let rawScale = pinchStartScale * value.magnification
         let targetScale = min(max(rawScale, 1.0), 3.0)
         let targetOffset = clampedVideoOffset(videoOffset, scale: targetScale, viewport: proxy.size)
 
@@ -511,6 +511,7 @@ struct PlayerScreen: View {
         }
 
         pinchStartScale = targetScale
+        pinchStartOffset = targetScale <= 1.001 ? .zero : targetOffset
         isPinchInteracting = false
         scheduleControlsHide()
       }
@@ -584,23 +585,10 @@ struct PlayerScreen: View {
 
   @ViewBuilder
   private func playerChrome(proxy: GeometryProxy) -> some View {
-    let landscape = proxy.size.width > proxy.size.height
-
-    ZStack {
-      VStack(spacing: 0) {
-        topOverlay(proxy: proxy)
-        Spacer(minLength: 0)
-        bottomOverlay(proxy: proxy)
-      }
-
-      if let model, !isScrubbing, !activeIsScrubLoading {
-        if landscape {
-          landscapeCenterTransport(model: model)
-        } else {
-          portraitCenterTransport(model: model)
-            .offset(y: -8)
-        }
-      }
+    VStack(spacing: 0) {
+      topOverlay(proxy: proxy)
+      Spacer(minLength: 0)
+      bottomOverlay(proxy: proxy)
     }
   }
 
@@ -608,10 +596,22 @@ struct PlayerScreen: View {
     Color.clear
       .contentShape(Rectangle())
       .frame(maxWidth: .infinity)
-      .onTapGesture { toggleControls() }
-      .onTapGesture(count: 2) {
+      .gesture(mediaTapGesture {
         guard appState.playerGesturesEnabled else { return }
         seekBy(isLeft ? -Double(appState.doubleTapSeekSeconds) : Double(appState.doubleTapSeekSeconds))
+      })
+  }
+
+  private func mediaTapGesture(doubleTapAction: @escaping () -> Void) -> some Gesture {
+    TapGesture(count: 2)
+      .exclusively(before: TapGesture(count: 1))
+      .onEnded { value in
+        switch value {
+        case .first:
+          doubleTapAction()
+        case .second:
+          toggleControls()
+        }
       }
   }
 
@@ -939,89 +939,31 @@ struct PlayerScreen: View {
     let landscape = proxy.size.width > proxy.size.height
 
     return HStack(spacing: landscape ? 10 : 8) {
-      playerIconButton("xmark") {
+      playerIconButton("chevron.left") {
         pauseActivePlayer()
         dismiss()
       }
-
-      VStack(alignment: .leading, spacing: 2) {
-        Text(localMetadata?.displayTitle(fallback: currentItem.name) ?? currentItem.name)
-          .font(.subheadline.weight(.semibold))
-          .foregroundStyle(.white)
-          .lineLimit(1)
-
-        if playlist.count > 1 {
-          Text("第 \(max(currentIndex + 1, 1)) / \(playlist.count) 个")
-            .font(.caption2.monospacedDigit())
-            .foregroundStyle(.white.opacity(0.52))
-        }
-      }
-      .layoutPriority(1)
+      .accessibilityLabel("返回")
 
       Spacer(minLength: 6)
 
-      if !useVLC {
-        AirPlayRoutePickerButton { presented in
-          isRoutePickerPresented = presented
-          if presented {
-            keepControlsDuringInteraction()
-          } else {
-            scheduleControlsHide()
-          }
-        }
-        .frame(width: 38, height: 38)
-        .background(.ultraThinMaterial, in: Circle())
-        .background(.black.opacity(0.28), in: Circle())
-        .overlay { Circle().stroke(.white.opacity(0.10), lineWidth: 0.7) }
-        .clipShape(Circle())
-        .accessibilityLabel("AirPlay")
-      }
-
-      if !useVLC, systemPresentationController.isPictureInPictureSupported {
-        playerIconButton(
-          systemPresentationController.isPictureInPictureActive ? "pip.exit" : "pip.enter"
-        ) {
-          keepControlsDuringInteraction()
-          systemPresentationController.startPictureInPicture()
-          scheduleControlsHide()
-        }
-      }
-
-      playerIconButton("rectangle.landscape.rotate") {
-        PlayerOrientation.toggle()
-        keepControlsDuringInteraction()
-        scheduleControlsHide()
-      }
-      .accessibilityLabel("切换横屏或竖屏")
-
-      if landscape {
-        playerIconButton("lock.fill") {
-          showSettingsPanel = false
-          showSpeedPanel = false
-          showQueuePanel = false
-          isLocked = true
-          controlsVisible = false
-          controlsTask?.cancel()
-          showGestureHUD("控制已锁定", systemName: "lock.fill")
-        }
-      }
-
-      playerIconButton("ellipsis") {
+      playerIconButton("ellipsis.circle") {
         openSettingsPanel()
       }
+      .accessibilityLabel("播放设置")
     }
     .padding(.leading, max(proxy.safeAreaInsets.leading, landscape ? 18 : 12))
     .padding(.trailing, max(proxy.safeAreaInsets.trailing, landscape ? 18 : 12))
     .padding(
       .top,
       landscape
-        ? max(proxy.safeAreaInsets.top + 20, 30)
-        : max(proxy.safeAreaInsets.top + 22, 66)
+        ? max(proxy.safeAreaInsets.top + 10, 18)
+        : max(proxy.safeAreaInsets.top + 10, 26)
     )
     .padding(.bottom, landscape ? 20 : 12)
     .background(
       LinearGradient(
-        colors: [.black.opacity(landscape ? 0.44 : 0.58), .clear],
+        colors: [.black.opacity(landscape ? 0.36 : 0.46), .clear],
         startPoint: .top,
         endPoint: .bottom
       )
@@ -1498,9 +1440,8 @@ struct PlayerScreen: View {
       }
 
       HStack(spacing: 8) {
-        settingsActionButton("详情", systemName: "info.circle") {
-          closeSettingsPanel(scheduleHide: false)
-          showInfo = true
+        if !useVLC {
+          settingsAirPlayButton()
         }
         settingsActionButton(
           systemPresentationController.isPictureInPictureActive ? "退出小窗" : "小窗播放",
@@ -1509,6 +1450,22 @@ struct PlayerScreen: View {
         ) {
           closeSettingsPanel(scheduleHide: false)
           systemPresentationController.startPictureInPicture()
+        }
+      }
+
+      HStack(spacing: 8) {
+        settingsActionButton("详情", systemName: "info.circle") {
+          closeSettingsPanel(scheduleHide: false)
+          showInfo = true
+        }
+        settingsActionButton("锁定控制", systemName: "lock.fill") {
+          closeSettingsPanel(scheduleHide: false)
+          showSpeedPanel = false
+          showQueuePanel = false
+          isLocked = true
+          controlsVisible = false
+          controlsTask?.cancel()
+          showGestureHUD("控制已锁定", systemName: "lock.fill")
         }
       }
 
@@ -1601,6 +1558,21 @@ struct PlayerScreen: View {
     .disabled(!enabled)
   }
 
+  private func settingsAirPlayButton() -> some View {
+    AirPlayRoutePickerButton { presented in
+      isRoutePickerPresented = presented
+      if presented {
+        keepControlsDuringInteraction()
+      } else {
+        scheduleControlsHide()
+      }
+    }
+    .frame(maxWidth: .infinity)
+    .frame(height: 40)
+    .background(.white.opacity(0.075), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    .accessibilityLabel("AirPlay")
+  }
+
   private func bottomOverlay(proxy: GeometryProxy) -> some View {
     let landscape = proxy.size.width > proxy.size.height
 
@@ -1619,11 +1591,7 @@ struct PlayerScreen: View {
         if landscape {
           landscapeUtilityBar(model: model)
         } else {
-          // Portrait keeps only the timeline; the small spacer places it slightly lower
-          // without crowding the home indicator.
-          Color.clear
-            .frame(height: 18)
-            .allowsHitTesting(false)
+          portraitUtilityBar(model: model)
         }
       }
     }
@@ -1640,66 +1608,26 @@ struct PlayerScreen: View {
     )
   }
 
-  private func portraitCenterTransport(model: PlayerModel) -> some View {
-    Button {
-      toggleActivePlayback(userInitiated: true)
-      controlsVisible = true
-      scheduleControlsHide()
-    } label: {
-      Image(systemName: activeIsPlaying ? "pause.fill" : "play.fill")
-        .font(.system(size: 24, weight: .bold))
-        .contentTransition(.symbolEffect)
-        .foregroundStyle(.black)
-        .frame(width: 62, height: 62)
-        .background(.white, in: Circle())
-        .shadow(color: .black.opacity(0.30), radius: 14, y: 5)
-    }
-    .buttonStyle(PlayerPressScaleStyle(pressedScale: 0.92))
-    // `onLongPressGesture` fires as soon as the minimum duration is reached;
-    // it does not wait for the finger to lift. A small toggle gate below also
-    // prevents an overlapping player surface from firing the same press twice.
-    .onLongPressGesture(minimumDuration: 0.48, maximumDistance: 24) {
-      toggleFavoriteFromLongPress()
-    }
-  }
-
   private func portraitUtilityBar(model: PlayerModel) -> some View {
     HStack(spacing: 8) {
       utilityButton(title: formatRate(Double(playbackRate)), systemName: "speedometer") {
         openSpeedPanel()
       }
 
-      Spacer(minLength: 12)
+      Spacer(minLength: 8)
+
+      compactPlayPauseButton()
+
+      Spacer(minLength: 8)
 
       if playlist.count > 1 {
         utilityIconButton("rectangle.stack.badge.play") {
           openQueuePanel()
         }
         .accessibilityLabel("播放队列")
+      } else {
+        Color.clear.frame(width: 34, height: 34)
       }
-    }
-  }
-
-  private func landscapeCenterTransport(model: PlayerModel) -> some View {
-    Button {
-      toggleActivePlayback(userInitiated: true)
-      controlsVisible = true
-      scheduleControlsHide()
-    } label: {
-      Image(systemName: activeIsPlaying ? "pause.fill" : "play.fill")
-        .font(.system(size: 27, weight: .bold))
-        .contentTransition(.symbolEffect)
-        .foregroundStyle(.black)
-        .frame(width: 68, height: 68)
-        .background(.white, in: Circle())
-        .shadow(color: .black.opacity(0.34), radius: 16, y: 6)
-    }
-    .buttonStyle(PlayerPressScaleStyle(pressedScale: 0.92))
-    // `onLongPressGesture` fires as soon as the minimum duration is reached;
-    // it does not wait for the finger to lift. A small toggle gate below also
-    // prevents an overlapping player surface from firing the same press twice.
-    .onLongPressGesture(minimumDuration: 0.48, maximumDistance: 24) {
-      toggleFavoriteFromLongPress()
     }
   }
 
@@ -1730,15 +1658,39 @@ struct PlayerScreen: View {
         openSpeedPanel()
       }
 
-      Spacer(minLength: 12)
+      Spacer(minLength: 8)
+
+      compactPlayPauseButton()
+
+      Spacer(minLength: 8)
 
       if playlist.count > 1 {
         utilityIconButton("rectangle.stack.badge.play") {
           openQueuePanel()
         }
         .accessibilityLabel("播放队列")
+      } else {
+        Color.clear.frame(width: 34, height: 34)
       }
     }
+  }
+
+  private func compactPlayPauseButton() -> some View {
+    Button {
+      toggleActivePlayback(userInitiated: true)
+      controlsVisible = true
+      scheduleControlsHide()
+    } label: {
+      Image(systemName: activeIsPlaying ? "pause.fill" : "play.fill")
+        .font(.system(size: 16, weight: .bold))
+        .contentTransition(.symbolEffect)
+        .foregroundStyle(.black)
+        .frame(width: 38, height: 38)
+        .background(.white, in: Circle())
+        .shadow(color: .black.opacity(0.22), radius: 8, y: 3)
+    }
+    .buttonStyle(PlayerPressScaleStyle(pressedScale: 0.92))
+    .accessibilityLabel(activeIsPlaying ? "暂停" : "播放")
   }
 
   private func utilityButton(title: String, systemName: String, action: @escaping () -> Void) -> some View {
@@ -1786,21 +1738,22 @@ struct PlayerScreen: View {
         let bufferedProgress = CGFloat(buffered / duration)
         let playedX = width * playedProgress
         let bufferedX = width * bufferedProgress
+        let trackHeight: CGFloat = isScrubbing ? 5 : 3
 
         ZStack(alignment: .leading) {
           Capsule()
             .fill(.white.opacity(0.20))
-            .frame(height: 3)
+            .frame(height: trackHeight)
 
           if !useVLC {
             Capsule()
               .fill(.white.opacity(0.32))
-              .frame(width: bufferedX, height: 3)
+              .frame(width: bufferedX, height: trackHeight)
           }
 
           Capsule()
-            .fill(CinevaTheme.accent)
-            .frame(width: playedX, height: 3)
+            .fill(.white)
+            .frame(width: playedX, height: trackHeight)
 
           if appState.showChapterMarkers, activeDuration > 0 {
             ForEach(activeChapters) { chapter in
@@ -1819,6 +1772,7 @@ struct PlayerScreen: View {
             .offset(x: min(max(playedX - (isScrubbing ? 5 : 4), 0), max(width - (isScrubbing ? 10 : 8), 0)))
         }
         .frame(maxHeight: .infinity)
+        .animation(.spring(response: 0.22, dampingFraction: 0.88), value: isScrubbing)
         .contentShape(Rectangle())
         .overlay(alignment: .top) {
           if isScrubbing, appState.timelinePreviewEnabled, !useVLC {
@@ -1883,7 +1837,7 @@ struct PlayerScreen: View {
             }
         )
       }
-      .frame(height: 28)
+      .frame(height: 44)
 
       HStack {
         Text(formatTime(isScrubbing ? scrubValue : activeCurrentTime))
@@ -2580,6 +2534,7 @@ struct PlayerScreen: View {
     localMetadata = nil
     videoScale = 1.0
     pinchStartScale = 1.0
+    pinchStartOffset = .zero
     videoOffset = .zero
     panStartOffset = .zero
     dismissDragOffset = .zero
@@ -2775,6 +2730,71 @@ struct PlayerScreen: View {
 
 }
 
+/// Keeps high-frequency pinch, pan, and interactive-dismiss transforms on a
+/// dedicated rendering leaf. Player controls and panels remain sibling views,
+/// so direct manipulation does not force their expensive material hierarchies
+/// into the same animated render group.
+private struct PlayerMediaRenderingSurface<Media: View, Overlay: View>: View {
+  let viewport: CGSize
+  let videoScale: CGFloat
+  let videoOffset: CGSize
+  let dismissScale: CGFloat
+  let dismissOffset: CGSize
+  let dismissCornerRadius: CGFloat
+  let dismissProgress: CGFloat
+  let media: Media
+  let overlay: Overlay
+
+  init(
+    viewport: CGSize,
+    videoScale: CGFloat,
+    videoOffset: CGSize,
+    dismissScale: CGFloat,
+    dismissOffset: CGSize,
+    dismissCornerRadius: CGFloat,
+    dismissProgress: CGFloat,
+    @ViewBuilder media: () -> Media,
+    @ViewBuilder overlay: () -> Overlay
+  ) {
+    self.viewport = viewport
+    self.videoScale = videoScale
+    self.videoOffset = videoOffset
+    self.dismissScale = dismissScale
+    self.dismissOffset = dismissOffset
+    self.dismissCornerRadius = dismissCornerRadius
+    self.dismissProgress = dismissProgress
+    self.media = media()
+    self.overlay = overlay()
+  }
+
+  var body: some View {
+    ZStack {
+      media
+        .frame(width: viewport.width, height: viewport.height)
+        .scaleEffect(videoScale, anchor: .center)
+        .offset(videoOffset)
+        .frame(width: viewport.width, height: viewport.height)
+        .background(Color.black)
+        .clipped()
+        .ignoresSafeArea()
+
+      overlay
+    }
+    .frame(width: viewport.width, height: viewport.height)
+    .scaleEffect(dismissScale, anchor: .center)
+    .offset(dismissOffset)
+    .clipShape(
+      RoundedRectangle(cornerRadius: dismissCornerRadius, style: .continuous)
+    )
+    .shadow(
+      color: .black.opacity(Double(dismissProgress) * 0.22),
+      radius: dismissProgress * 22,
+      y: dismissProgress * 9
+    )
+    .allowsHitTesting(false)
+  }
+}
+
 private struct PlayerPlaybackFeedback: Equatable {
   let systemName: String
   let title: String
@@ -2933,6 +2953,7 @@ private struct PlayerInfoSheet: View {
         Section("手势") {
           LabeledContent("双击快进/快退", value: "\(appState.doubleTapSeekSeconds) 秒")
           LabeledContent("左右滑动", value: "快进 / 快退")
+          LabeledContent("画面中间双击", value: "播放 / 暂停")
           LabeledContent("画面中间长按", value: "收藏 / 取消收藏")
           LabeledContent("双指缩放", value: "放大 / 回弹")
           LabeledContent("放大后拖动", value: "自由移动画面")

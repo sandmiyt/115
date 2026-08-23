@@ -3,6 +3,7 @@ import SwiftUI
 struct FavoritesView: View {
   @Environment(AppState.self) private var appState
   @State private var selectedVideo: CloudItem?
+  @Namespace private var playerTransition
 
   var body: some View {
     Group {
@@ -16,7 +17,7 @@ struct FavoritesView: View {
         ScrollView {
           LazyVGrid(columns: columns, spacing: 14) {
             ForEach(appState.libraryStore.favorites) { item in
-              VideoCard(item: item) {
+              VideoCard(item: item, transitionNamespace: playerTransition) {
                 selectedVideo = item
               }
             }
@@ -30,7 +31,10 @@ struct FavoritesView: View {
       }
     }
     .navigationTitle("收藏")
-    .fullScreenCover(item: $selectedVideo) { PlayerScreen(item: $0) }
+    .fullScreenCover(item: $selectedVideo) { item in
+      PlayerScreen(item: item)
+        .cinevaPlayerZoomTransition(sourceID: item.id, in: playerTransition)
+    }
   }
 
   private var safeGridColumns: Int {

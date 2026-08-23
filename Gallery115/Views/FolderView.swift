@@ -66,6 +66,7 @@ struct FolderView: View {
   @State private var hasMore = true
   @State private var isRefreshing = false
   @State private var showMediaSetup = false
+  @Namespace private var playerTransition
 
   var body: some View {
     Group {
@@ -198,6 +199,7 @@ struct FolderView: View {
     }
     .fullScreenCover(item: $selectedVideo) { item in
       PlayerScreen(item: item, playlist: playlistItems)
+        .cinevaPlayerZoomTransition(sourceID: item.id, in: playerTransition)
     }
     .sheet(isPresented: $showMediaSetup) {
       SetupView()
@@ -220,6 +222,12 @@ struct FolderView: View {
         playlistItems = []
         errorMessage = nil
       }
+    }
+    .task(id: thumbnailPrefetchSignature, priority: .utility) {
+      guard appState.isConfigured, appState.isAppUnlocked, !thumbnailPrefetchSignature.isEmpty else {
+        return
+      }
+      await appState.thumbnailService.prefetch(displayItems, api: appState.api, limit: 12)
     }
   }
 
@@ -252,7 +260,7 @@ struct FolderView: View {
             } else if item.isPhoto {
               PhotoFileCard(item: item)
             } else {
-              VideoCard(item: item) {
+              VideoCard(item: item, transitionNamespace: playerTransition) {
                 selectedVideo = item
               }
             }
@@ -294,6 +302,7 @@ struct FolderView: View {
               selectedVideo = item
             } label: {
               VideoListRow(item: item)
+                .cinevaPlayerTransitionSource(id: item.id, in: playerTransition)
             }
             .buttonStyle(.plain)
             .contextMenu {
@@ -321,6 +330,14 @@ struct FolderView: View {
       .listStyle(.plain)
       .refreshable { await refreshCurrentFolder() }
     }
+  }
+
+  private var thumbnailPrefetchSignature: String {
+    displayItems.lazy
+      .filter(\.isVideo)
+      .prefix(12)
+      .map { "\($0.id):\($0.sha1)" }
+      .joined(separator: "|")
   }
 
   private var emptyFilterTitle: String {

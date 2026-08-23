@@ -311,6 +311,7 @@ private struct HomeView: View {
   @Environment(AppState.self) private var appState
   @State private var selectedVideo: CloudItem?
   @State private var didCheckConnection = false
+  @Namespace private var playerTransition
   let logoReveal: CGFloat
 
   var body: some View {
@@ -323,7 +324,7 @@ private struct HomeView: View {
             ScrollView(.horizontal) {
               LazyHStack(spacing: 11) {
                 ForEach(appState.libraryStore.recents.prefix(12)) { entry in
-                  ContinueWatchingCard(entry: entry) {
+                  ContinueWatchingCard(entry: entry, transitionNamespace: playerTransition) {
                     selectedVideo = entry.item
                   }
                 }
@@ -346,6 +347,7 @@ private struct HomeView: View {
     .navigationBarHidden(true)
     .fullScreenCover(item: $selectedVideo) { item in
       PlayerScreen(item: item)
+        .cinevaPlayerZoomTransition(sourceID: item.id, in: playerTransition)
     }
     .task(id: "\(appState.isConfigured)|\(appState.isAppUnlocked)") {
       guard appState.isAppUnlocked, !didCheckConnection, appState.isConfigured else { return }
@@ -442,6 +444,7 @@ private struct HomeView: View {
 
 private struct ContinueWatchingCard: View {
   let entry: PlaybackEntry
+  let transitionNamespace: Namespace.ID
   let action: () -> Void
 
   private let cardWidth: CGFloat = 210
@@ -455,6 +458,7 @@ private struct ContinueWatchingCard: View {
     Button(action: action) {
       VStack(alignment: .leading, spacing: 7) {
         HomeLandscapeArtwork(item: entry.item, width: cardWidth, progress: progress)
+          .cinevaPlayerTransitionSource(id: entry.item.id, in: transitionNamespace)
 
         Text(entry.item.name)
           .font(.subheadline.weight(.semibold))

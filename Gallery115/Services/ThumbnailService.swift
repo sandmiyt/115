@@ -4,14 +4,17 @@ import ImageIO
 import UIKit
 
 /// Generates missing video artwork through the mounted WebDAV stream, never through
-/// 115 Open playback APIs. Generation is strictly serialized and cached on disk so
-/// scrolling a large library cannot create a burst of remote video requests.
+/// 115 Open playback APIs. Generation uses a tiny bounded pool and is cached on disk
+/// so scrolling a large library cannot create a burst of remote video requests.
 actor ThumbnailService {
   private let fileManager = FileManager.default
   private let directory: URL
   private let memoryCache = NSCache<NSString, UIImage>()
-  private var generatorBusy = false
+  private var activeGenerators = 0
+  private let maximumConcurrentGenerators = 2
   private var generatorWaiters: [CheckedContinuation<Void, Never>] = []
+  private var inFlight: [String: Task<UIImage?, Never>] = [:]
+  private var failedUntil: [String: Date] = [:]
   private let maximumCacheBytes: Int64 = 1_073_741_824
   private var lastCacheTrimAt = Date.distantPast
 
@@ -23,7 +26,10 @@ actor ThumbnailService {
     try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
   }
 
-  func generatedThumbnail(for item: CloudItem, api: APIClient) async -> UIImage? {
+  /// Returns one unified artwork result for a card. Both signed 115 artwork and
+  /// locally generated frames pass through the same memory + disk cache so a
+  /// successful first display never has to depend on the network again.
+  func thumbnail(for item: CloudItem, api: APIClient) async -> UIImage? {
     guard item.isVideo else { return nil }
     let cacheKey = thumbnailCacheKey(for: item)
     if let cached = memoryCache.object(forKey: cacheKey as NSString) {
@@ -36,6 +42,60 @@ actor ThumbnailService {
       return cached
     }
     guard !Task.isCancelled else { return nil }
+
+    if let task = inFlight[cacheKey] {
+      return await task.value
+    }
+    if let retryDate = failedUntil[cacheKey], retryDate > Date() {
+      return nil
+    }
+
+    let task = Task { [weak self] in
+      guard let self else { return nil }
+      return await self.loadAndPersistThumbnail(for: item, api: api)
+    }
+    inFlight[cacheKey] = task
+    let image = await task.value
+    inFlight[cacheKey] = nil
+    if image == nil {
+      // Broken signed URLs or temporarily unavailable streams should not start
+      // another expensive request every time a recycled grid cell reappears.
+      failedUntil[cacheKey] = Date().addingTimeInterval(120)
+    } else {
+      failedUntil[cacheKey] = nil
+    }
+    return image
+  }
+
+  /// Compatibility entry point used by older call sites. Keeping it prevents
+  /// thumbnail UI work from changing any media-source behavior.
+  func generatedThumbnail(for item: CloudItem, api: APIClient) async -> UIImage? {
+    await thumbnail(for: item, api: api)
+  }
+
+  /// Warms a small, ordered window after a directory appears. Work is kept
+  /// sequential so it cannot flood 115/WebDAV or compete with active playback.
+  func prefetch(_ items: [CloudItem], api: APIClient, limit: Int = 12) async {
+    // Only warm lightweight server artwork here. Missing-artwork videos still
+    // generate on demand, preventing background AVAsset reads from competing
+    // with a movie the user just opened.
+    for item in items.lazy.filter({ $0.isVideo && $0.thumbnailURL != nil }).prefix(max(limit, 0)) {
+      guard !Task.isCancelled else { return }
+      _ = await thumbnail(for: item, api: api)
+    }
+  }
+
+  private func loadAndPersistThumbnail(for item: CloudItem, api: APIClient) async -> UIImage? {
+    let cacheKey = thumbnailCacheKey(for: item)
+    let fileURL = cachedFileURL(for: item)
+
+    if let url = item.thumbnailURL,
+      let remote = await remoteThumbnail(at: url)
+    {
+      guard !Task.isCancelled else { return nil }
+      storeGeneratedThumbnail(remote, for: item)
+      return remote
+    }
 
     if let metadata = await api.localMetadata(for: item),
       let posterData = metadata.posterData,
@@ -90,17 +150,33 @@ actor ThumbnailService {
     generator.requestedTimeToleranceBefore = CMTime(seconds: 1, preferredTimescale: 600)
     generator.requestedTimeToleranceAfter = CMTime(seconds: 1, preferredTimescale: 600)
 
-    guard let cgImage = try? generator.copyCGImage(
-      at: CMTime(seconds: targetSeconds, preferredTimescale: 600),
-      actualTime: nil
-    ) else {
+    let requestedTime = CMTime(seconds: targetSeconds, preferredTimescale: 600)
+    guard let generated = try? await generator.image(at: requestedTime) else {
       return nil
     }
 
     guard !Task.isCancelled else { return nil }
-    let image = UIImage(cgImage: cgImage)
+    let image = UIImage(cgImage: generated.image)
     storeGeneratedThumbnail(image, for: item)
     return image
+  }
+
+  private func remoteThumbnail(at url: URL) async -> UIImage? {
+    var request = URLRequest(url: url)
+    request.cachePolicy = .returnCacheDataElseLoad
+    request.timeoutInterval = 15
+
+    guard let (data, response) = try? await URLSession.shared.data(for: request),
+      !Task.isCancelled,
+      data.count <= 16_000_000
+    else { return nil }
+
+    if let http = response as? HTTPURLResponse,
+      !(200...299).contains(http.statusCode)
+    {
+      return nil
+    }
+    return downsampledImage(from: data, maximumPixelSize: 960)
   }
 
   func storeGeneratedThumbnail(_ image: UIImage, for item: CloudItem) {
@@ -125,6 +201,9 @@ actor ThumbnailService {
   }
 
   func clearCache() {
+    for task in inFlight.values { task.cancel() }
+    inFlight.removeAll()
+    failedUntil.removeAll()
     memoryCache.removeAllObjects()
     try? fileManager.removeItem(at: directory)
     try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -166,8 +245,8 @@ actor ThumbnailService {
   }
 
   private func acquireGenerator() async {
-    if !generatorBusy {
-      generatorBusy = true
+    if activeGenerators < maximumConcurrentGenerators {
+      activeGenerators += 1
       return
     }
     await withCheckedContinuation { continuation in
@@ -176,11 +255,11 @@ actor ThumbnailService {
   }
 
   private func releaseGenerator() {
-    if generatorWaiters.isEmpty {
-      generatorBusy = false
-    } else {
+    if !generatorWaiters.isEmpty {
       let next = generatorWaiters.removeFirst()
       next.resume()
+    } else {
+      activeGenerators = max(activeGenerators - 1, 0)
     }
   }
 

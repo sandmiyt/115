@@ -5,6 +5,7 @@ struct RecentView: View {
   @Environment(AppState.self) private var appState
   @State private var selectedVideo: CloudItem?
   @State private var showClearConfirmation = false
+  @Namespace private var playerTransition
 
   var body: some View {
     Group {
@@ -23,6 +24,7 @@ struct RecentView: View {
             } label: {
               HStack(spacing: 13) {
                 RecentThumbnail(entry: entry)
+                  .cinevaPlayerTransitionSource(id: entry.item.id, in: playerTransition)
 
                 VStack(alignment: .leading, spacing: 7) {
                   Text(entry.item.name)
@@ -75,7 +77,10 @@ struct RecentView: View {
         }
       }
     }
-    .fullScreenCover(item: $selectedVideo) { PlayerScreen(item: $0) }
+    .fullScreenCover(item: $selectedVideo) { item in
+      PlayerScreen(item: item)
+        .cinevaPlayerZoomTransition(sourceID: item.id, in: playerTransition)
+    }
     .confirmationDialog("清空全部播放记录？", isPresented: $showClearConfirmation, titleVisibility: .visible) {
       Button("清空播放记录", role: .destructive) {
         appState.libraryStore.clearRecents()

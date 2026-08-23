@@ -4,12 +4,14 @@ import UIKit
 struct VideoCard: View {
   @Environment(AppState.self) private var appState
   let item: CloudItem
+  var transitionNamespace: Namespace.ID? = nil
   let onOpen: () -> Void
 
   var body: some View {
     Button(action: onOpen) {
       VStack(alignment: .leading, spacing: 7) {
         MediaArtworkCard(item: item, progress: resumeProgress)
+          .cinevaPlayerTransitionSource(id: item.id, in: transitionNamespace)
           .overlay(alignment: .topTrailing) {
             if appState.libraryStore.isFavorite(item) {
               Image(systemName: "heart.fill")
@@ -128,8 +130,7 @@ struct VideoArtwork: View {
   @Environment(AppState.self) private var appState
   let item: CloudItem
 
-  @State private var generatedImage: UIImage?
-  @State private var serverThumbnailFailed = false
+  @State private var cachedImage: UIImage?
 
   var body: some View {
     GeometryReader { proxy in
@@ -137,34 +138,16 @@ struct VideoArtwork: View {
         artworkBackground
           .frame(width: proxy.size.width, height: proxy.size.height)
 
-        if let generatedImage {
-          artwork(Image(uiImage: generatedImage), in: proxy.size)
-        } else if let url = item.thumbnailURL, !serverThumbnailFailed {
-          AsyncImage(
-            url: url,
-            transaction: Transaction(animation: .easeInOut(duration: 0.16))
-          ) { phase in
-            switch phase {
-            case .success(let image):
-              artwork(image, in: proxy.size)
-            case .failure:
-              placeholder
-                .frame(width: proxy.size.width, height: proxy.size.height)
-                .onAppear { serverThumbnailFailed = true }
-            case .empty:
-              ZStack {
-                placeholder
-                ProgressView().controlSize(.small)
-              }
-              .frame(width: proxy.size.width, height: proxy.size.height)
-            @unknown default:
-              placeholder
-                .frame(width: proxy.size.width, height: proxy.size.height)
-            }
-          }
-          .frame(width: proxy.size.width, height: proxy.size.height)
+        if let cachedImage {
+          artwork(Image(uiImage: cachedImage), in: proxy.size)
+            .transition(.opacity)
         } else {
-          placeholder
+          ZStack {
+            placeholder
+            ProgressView()
+              .controlSize(.small)
+              .tint(.secondary)
+          }
             .frame(width: proxy.size.width, height: proxy.size.height)
         }
       }
@@ -172,16 +155,14 @@ struct VideoArtwork: View {
       .clipped()
     }
     .aspectRatio(16 / 9, contentMode: .fit)
-    .task(id: "\(item.id)|\(serverThumbnailFailed)") {
-      // One thumbnail task per card. Previously the no-server-thumbnail path
-      // could start the same expensive remote frame extraction twice.
-      if generatedImage == nil, item.thumbnailURL == nil || serverThumbnailFailed {
-        generatedImage = await appState.thumbnailService.generatedThumbnail(
-          for: item,
-          api: appState.api
-        )
-      }
+    .animation(.easeOut(duration: 0.16), value: cachedImage != nil)
+    .task(id: itemThumbnailIdentity) {
+      cachedImage = await appState.thumbnailService.thumbnail(for: item, api: appState.api)
     }
+  }
+
+  private var itemThumbnailIdentity: String {
+    "\(item.id)|\(item.sha1)|\(item.thumbnailURLString ?? "")"
   }
 
   @ViewBuilder
@@ -234,6 +215,28 @@ struct VideoArtwork: View {
         .foregroundStyle(.secondary.opacity(0.72))
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
+  }
+}
+
+extension View {
+  /// Opts a cover into the system zoom transition on iOS 18 while retaining
+  /// the existing full-screen presentation on iOS 17.
+  @ViewBuilder
+  func cinevaPlayerTransitionSource(id: String, in namespace: Namespace.ID?) -> some View {
+    if #available(iOS 18.0, *), let namespace {
+      matchedTransitionSource(id: id, in: namespace)
+    } else {
+      self
+    }
+  }
+
+  @ViewBuilder
+  func cinevaPlayerZoomTransition(sourceID: String, in namespace: Namespace.ID) -> some View {
+    if #available(iOS 18.0, *) {
+      navigationTransition(.zoom(sourceID: sourceID, in: namespace))
+    } else {
+      self
+    }
   }
 }
 
