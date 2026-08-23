@@ -47,6 +47,7 @@ struct PlayerScreen: View {
   @State private var favoriteHUDTask: Task<Void, Never>?
   @State private var controlsTask: Task<Void, Never>?
   @State private var scrubValue: Double = 0
+  @State private var scrubStartValue: Double = 0
   @State private var isScrubbing = false
   @State private var scrubWasPlaying = false
   @State private var isGestureInteracting = false
@@ -1601,23 +1602,22 @@ struct PlayerScreen: View {
             Spacer(minLength: 0)
             muteButton()
           }
-          .opacity(isScrubbing ? 0.12 : 1)
-          .scaleEffect(isScrubbing ? 0.88 : 1)
-          .blur(radius: isScrubbing ? 0.35 : 0)
+          .opacity(isScrubbing ? 0 : 1)
+          .scaleEffect(isScrubbing ? 0.92 : 1)
           .allowsHitTesting(!isScrubbing)
           .zIndex(1)
         }
         .frame(maxWidth: .infinity)
-        .padding(.horizontal, 8)
-        .padding(.vertical, isScrubbing ? 7 : 6)
+        .padding(.horizontal, 6)
+        .padding(.vertical, isScrubbing ? 4 : 3)
         .background {
-          RoundedRectangle(cornerRadius: isScrubbing ? 20 : 18, style: .continuous)
+          Capsule()
             .fill(.ultraThinMaterial)
             .overlay {
-              RoundedRectangle(cornerRadius: isScrubbing ? 20 : 18, style: .continuous)
+              Capsule()
                 .fill(
                   LinearGradient(
-                    colors: [.white.opacity(isScrubbing ? 0.12 : 0.08), .white.opacity(0.02)],
+                    colors: [.white.opacity(isScrubbing ? 0.11 : 0.075), .white.opacity(0.018)],
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
                   )
@@ -1625,15 +1625,15 @@ struct PlayerScreen: View {
             }
         }
         .overlay {
-          RoundedRectangle(cornerRadius: isScrubbing ? 20 : 18, style: .continuous)
-            .stroke(.white.opacity(isScrubbing ? 0.18 : 0.12), lineWidth: 0.7)
+          Capsule()
+            .stroke(.white.opacity(isScrubbing ? 0.17 : 0.11), lineWidth: 0.7)
         }
-        .shadow(color: .black.opacity(isScrubbing ? 0.27 : 0.20), radius: isScrubbing ? 15 : 10, y: 5)
+        .shadow(color: .black.opacity(isScrubbing ? 0.24 : 0.18), radius: isScrubbing ? 13 : 9, y: 4)
         .animation(.spring(response: 0.30, dampingFraction: 0.88, blendDuration: 0.06), value: isScrubbing)
       }
     }
-    .padding(.leading, max(proxy.safeAreaInsets.leading, landscape ? 24 : 16))
-    .padding(.trailing, max(proxy.safeAreaInsets.trailing, landscape ? 24 : 16))
+    .padding(.leading, max(proxy.safeAreaInsets.leading, landscape ? 28 : 20))
+    .padding(.trailing, max(proxy.safeAreaInsets.trailing, landscape ? 28 : 20))
     .padding(.top, landscape ? 30 : 24)
     .padding(.bottom, max(proxy.safeAreaInsets.bottom, landscape ? 10 : 14) + 4)
     .background(
@@ -1751,7 +1751,11 @@ struct PlayerScreen: View {
         .gesture(
           DragGesture(minimumDistance: 0)
             .onChanged { value in
+              let startValue: Double
               if !isScrubbing {
+                startValue = min(max(activeCurrentTime, 0), duration)
+                scrubStartValue = startValue
+                scrubValue = startValue
                 isScrubbing = true
                 controlsTask?.cancel()
                 if useVLC {
@@ -1759,9 +1763,11 @@ struct PlayerScreen: View {
                 } else {
                   scrubWasPlaying = model.beginInteractiveScrub()
                 }
+              } else {
+                startValue = scrubStartValue
               }
-              let x = min(max(value.location.x, 0), width)
-              scrubValue = Double(x / width) * duration
+              let delta = Double(value.translation.width / width) * duration
+              scrubValue = min(max(startValue + delta, 0), duration)
 
               // The timeline value follows the finger immediately, while the
               // decoder uses a coalesced chase seek so stale intermediate
@@ -1773,14 +1779,16 @@ struct PlayerScreen: View {
               }
             }
             .onEnded { value in
-              let x = min(max(value.location.x, 0), width)
-              scrubValue = Double(x / width) * duration
+              let startValue = isScrubbing ? scrubStartValue : min(max(activeCurrentTime, 0), duration)
+              let delta = Double(value.translation.width / width) * duration
+              scrubValue = min(max(startValue + delta, 0), duration)
               if useVLC {
                 vlcController.endInteractiveScrub(to: scrubValue, resumeAfter: scrubWasPlaying)
               } else {
                 model.endInteractiveScrub(to: scrubValue, resumeAfter: scrubWasPlaying)
               }
               scrubWasPlaying = false
+              scrubStartValue = scrubValue
               isScrubbing = false
               updateRemotePlaybackInfo()
               scheduleControlsHide()
