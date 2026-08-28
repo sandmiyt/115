@@ -151,6 +151,7 @@ actor WebDAVProvider: CloudProvider {
   }
 
   func localMetadata(for item: CloudItem) async -> LocalMediaMetadata? {
+    guard !Task.isCancelled else { return nil }
     guard !item.isDirectory, let configuration = store.configuration else { return nil }
     if let cached = metadataCache[item.id] { return cached }
     if metadataMisses.contains(item.id) { return nil }
@@ -167,11 +168,14 @@ actor WebDAVProvider: CloudProvider {
           logicalPath: parentPath
         )
       } catch {
-        metadataMisses.insert(item.id)
+        // Playback may cancel background artwork discovery. Cancellation does
+        // not mean the file has no metadata and must not poison the miss cache.
+        if !Task.isCancelled { metadataMisses.insert(item.id) }
         return nil
       }
     }
 
+    guard !Task.isCancelled else { return nil }
     let files = entries.filter { !$0.isDirectory }
     let stem = URL(fileURLWithPath: item.name).deletingPathExtension().lastPathComponent.lowercased()
     // Some WebDAV backends are case-sensitive and may legally contain both
@@ -192,16 +196,16 @@ actor WebDAVProvider: CloudProvider {
       "poster.jpg", "poster.jpeg", "poster.png", "folder.jpg", "cover.jpg",
     ]
     var parsed = ParsedNFO()
-    if let nfoItem = nfoCandidates.compactMap({ byName[$0] }).first,
+    if let nfoItem = nfoCandidates.compactMap({ byName[$0] }).first {
       let data = try? await fetchResourceData(
         configuration: configuration,
         logicalPath: nfoItem.id,
         maximumBytes: 1_500_000
       )
-    {
-      parsed = SimpleNFOParser.parse(data: data)
+      if let data { parsed = SimpleNFOParser.parse(data: data) }
     }
 
+    guard !Task.isCancelled else { return nil }
     var posterData: Data?
     if let poster = posterCandidates.compactMap({ byName[$0] }).first {
       posterData = try? await fetchResourceData(
@@ -232,6 +236,7 @@ actor WebDAVProvider: CloudProvider {
       fanartData: fanartData
     )
 
+    guard !Task.isCancelled else { return nil }
     guard metadata.hasUsefulMetadata else {
       metadataMisses.insert(item.id)
       return nil

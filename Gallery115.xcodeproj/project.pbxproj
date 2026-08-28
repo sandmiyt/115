@@ -6,6 +6,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		B20260828000000000000001 /* ArtworkDiskStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20260828000000000000002 /* ArtworkDiskStore.swift */; };
 		521FB18B426BCF1EA800706D /* AppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 40438E2D45CDB29E1083E055 /* AppState.swift */; };
 		AE9364A65643882550E6EA92 /* Gallery115App.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00548918D52A82A65A1D74A2 /* Gallery115App.swift */; };
 		14F617CAA9B6CBE16B57CB38 /* CloudItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22039DEAAAB704237C2148A6 /* CloudItem.swift */; };
@@ -34,6 +35,7 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		B20260828000000000000002 /* ArtworkDiskStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Services/ArtworkDiskStore.swift"; sourceTree = "<group>"; };
 		40438E2D45CDB29E1083E055 /* AppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "App/AppState.swift"; sourceTree = "<group>"; };
 		00548918D52A82A65A1D74A2 /* Gallery115App.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "App/Gallery115App.swift"; sourceTree = "<group>"; };
 		22039DEAAAB704237C2148A6 /* CloudItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Models/CloudItem.swift"; sourceTree = "<group>"; };
@@ -85,6 +87,7 @@
 			7FAC029ACA82DADF7F3FE1C6 /* KeychainStore.swift */,
 			35B71C291E69A3494481F537 /* LibraryStore.swift */,
 			C335BF2A720642A103C22D16 /* ThumbnailService.swift */,
+			B20260828000000000000002 /* ArtworkDiskStore.swift */,
 			6C1674B6178EFCF7442CCFAC /* FavoritesView.swift */,
 			16FF2636B8264B350D98E42F /* FolderView.swift */,
 			C7AE452D7715F8E5D162D967 /* PlayerScreen.swift */,
@@ -153,6 +156,7 @@
 			51E04D8379A6DB36BF561F9F /* KeychainStore.swift in Sources */,
 			01AB7E4EFF4F48F595C70FD1 /* LibraryStore.swift in Sources */,
 			49F57EAFDB507245C6E98661 /* ThumbnailService.swift in Sources */,
+			B20260828000000000000001 /* ArtworkDiskStore.swift in Sources */,
 			0FF282D1778307EF5220A906 /* FavoritesView.swift in Sources */,
 			D7B5E2345A7E1F25EBE101E3 /* FolderView.swift in Sources */,
 			4FEC00163E77BADBC2320F2A /* PlayerScreen.swift in Sources */,

@@ -1,5 +1,6 @@
 import AVFoundation
 import MediaPlayer
+import OSLog
 import SwiftUI
 import UIKit
 
@@ -75,6 +76,7 @@ struct PlayerScreen: View {
   @State private var sidecarChapters: [PlayerChapter] = []
   @State private var subtitleLoadTask: Task<Void, Never>?
   @State private var auxiliaryLoadTask: Task<Void, Never>?
+  @State private var thumbnailPlaybackOwner = UUID()
 
   init(item: CloudItem, playlist: [CloudItem] = []) {
     _currentItem = State(initialValue: item)
@@ -353,6 +355,9 @@ struct PlayerScreen: View {
 
 
   private func handlePlayerDisappear() {
+    let thumbnails = appState.thumbnailService
+    let owner = thumbnailPlaybackOwner
+    Task { await thumbnails.resumeNetwork(for: owner) }
     showSettingsPanel = false
     showSpeedPanel = false
     showQueuePanel = false
@@ -1931,6 +1936,13 @@ struct PlayerScreen: View {
 
   @MainActor
   private func prepareCurrentItem() async {
+    let startupBeganAt = ProcessInfo.processInfo.systemUptime
+    // Cached artwork stays available, but remote covers must yield the network
+    // before AVPlayer/VLC opens the existing, unchanged WebDAV source.
+    await appState.thumbnailService.suspendNetwork(for: thumbnailPlaybackOwner)
+    // Item changes cancel the old task, but the same screen still owns priority.
+    // Only handlePlayerDisappear releases this screen's token.
+    guard !Task.isCancelled else { return }
     controlsTask?.cancel()
     subtitleLoadTask?.cancel()
     auxiliaryLoadTask?.cancel()
@@ -1972,6 +1984,9 @@ struct PlayerScreen: View {
       return
     }
 
+    Logger(subsystem: "com.xiaocai.gallery115", category: "PlaybackStartup")
+      .info("Source handed to engine after \(ProcessInfo.processInfo.systemUptime - startupBeganAt, privacy: .public)s")
+
     activatePlaybackEngine(for: newModel)
     applyPlaybackRate(playbackRate, persist: false)
     applyAutomaticOrientation(for: newModel.videoDisplaySize)
@@ -1980,12 +1995,21 @@ struct PlayerScreen: View {
     controlsVisible = true
     scheduleControlsHide()
 
+    let initialPlaybackTime = activeCurrentTime
     auxiliaryLoadTask = Task { @MainActor in
-      // Give AVPlayer/VLC the network for a moment before sidecar discovery.
+      // 650ms was shorter than a cold WebDAV/115 open (often 10-20s), so
+      // sidecars competed with startup. Wait for actual media-time progress.
       if appState.fastStartEnabled {
-        try? await Task.sleep(nanoseconds: 650_000_000)
+        while abs(activeCurrentTime - initialPlaybackTime) <= 0.08 || activeIsBuffering || !activeIsPlaying {
+          do { try await Task.sleep(nanoseconds: 250_000_000) }
+          catch { return }
+          guard currentItem.id == expectedID, model === newModel else { return }
+          if newModel.errorMessage != nil { return }
+        }
       }
       guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else { return }
+      Logger(subsystem: "com.xiaocai.gallery115", category: "PlaybackStartup")
+        .info("Auxiliary loads released after \(ProcessInfo.processInfo.systemUptime - startupBeganAt, privacy: .public)s")
 
       async let subtitleTracksTask: [ExternalSubtitleTrack] =
         (try? await appState.api.externalSubtitleTracks(for: expectedItem)) ?? []

@@ -444,10 +444,17 @@ private struct CacheSettingsView: View {
   @Environment(AppState.self) private var appState
   @State private var statusMessage: String?
   @State private var showClearRecentsConfirmation = false
+  @State private var artworkBytes: Int64?
 
   var body: some View {
     Form {
       Section("缓存") {
+        if let artworkBytes {
+          LabeledContent("本地封面", value: ByteCountFormatter.string(fromByteCount: artworkBytes, countStyle: .file))
+        }
+        Text("已保存的封面长期保留，重启或链接过期不会重新下载。仅文件发生变化、手动清除或卸载 App 后需要重建；清除资料库缓存不会删除封面。")
+          .font(.footnote)
+          .foregroundStyle(.secondary)
         Button("清除资料库缓存") {
           Task {
             await appState.api.clearMountCache()
@@ -459,8 +466,9 @@ private struct CacheSettingsView: View {
 
         Button("清除封面缓存") {
           Task {
-            await appState.thumbnailService.clearCache()
-            await MainActor.run { statusMessage = "封面缓存已清除。" }
+            let cleared = await appState.thumbnailService.clearCache()
+            artworkBytes = await appState.thumbnailService.cacheUsageBytes()
+            statusMessage = cleared ? "封面缓存已清除。" : "部分封面未能清除，请稍后重试。"
           }
         }
 
@@ -477,6 +485,7 @@ private struct CacheSettingsView: View {
     }
     .navigationTitle("缓存")
     .navigationBarTitleDisplayMode(.inline)
+    .task { artworkBytes = await appState.thumbnailService.cacheUsageBytes() }
     .onChange(of: appState.isAppUnlocked) { _, unlocked in
       if !unlocked { showClearRecentsConfirmation = false }
     }

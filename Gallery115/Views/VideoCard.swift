@@ -131,6 +131,8 @@ struct VideoArtwork: View {
   let item: CloudItem
 
   @State private var cachedImage: UIImage?
+  @State private var loadedIdentity: String?
+  @State private var isLoading = false
 
   var body: some View {
     GeometryReader { proxy in
@@ -144,9 +146,11 @@ struct VideoArtwork: View {
         } else {
           ZStack {
             placeholder
-            ProgressView()
-              .controlSize(.small)
-              .tint(.secondary)
+            if isLoading {
+              ProgressView()
+                .controlSize(.small)
+                .tint(.secondary)
+            }
           }
             .frame(width: proxy.size.width, height: proxy.size.height)
         }
@@ -155,14 +159,35 @@ struct VideoArtwork: View {
       .clipped()
     }
     .aspectRatio(16 / 9, contentMode: .fit)
-    .animation(.easeOut(duration: 0.16), value: cachedImage != nil)
     .task(id: itemThumbnailIdentity) {
-      cachedImage = await appState.thumbnailService.thumbnail(for: item, api: appState.api)
+      let identity = itemThumbnailIdentity
+      if loadedIdentity == identity, cachedImage != nil { return }
+      if loadedIdentity != identity { cachedImage = nil }
+      isLoading = false
+      // Disk/memory hits should not flash a spinner or replay a fade-in.
+      let spinner = Task { @MainActor in
+        do { try await Task.sleep(nanoseconds: 180_000_000) }
+        catch { return }
+        guard !Task.isCancelled else { return }
+        isLoading = true
+      }
+      defer { spinner.cancel() }
+      let image = await withTaskCancellationHandler {
+        await appState.thumbnailService.thumbnail(for: item, api: appState.api)
+      } onCancel: {
+        spinner.cancel()
+      }
+      guard !Task.isCancelled else { return }
+      withAnimation(isLoading ? .easeOut(duration: 0.16) : nil) {
+        cachedImage = image
+        loadedIdentity = identity
+        isLoading = false
+      }
     }
   }
 
   private var itemThumbnailIdentity: String {
-    "\(item.id)|\(item.sha1)|\(item.thumbnailURLString ?? "")"
+    "\(item.id)|\(item.size)|\(item.modifiedAt.timeIntervalSince1970)"
   }
 
   @ViewBuilder

@@ -1,310 +1,342 @@
 import AVFoundation
 import Foundation
 import ImageIO
+import OSLog
 import UIKit
 
-/// Generates missing video artwork through the mounted WebDAV stream, never through
-/// 115 Open playback APIs. Generation uses a tiny bounded pool and is cached on disk
-/// so scrolling a large library cannot create a burst of remote video requests.
+/// Local-first artwork; only two network jobs may run, and playback has priority.
 actor ThumbnailService {
-  private let fileManager = FileManager.default
-  private let directory: URL
-  private let memoryCache = NSCache<NSString, UIImage>()
-  private var activeGenerators = 0
-  private let maximumConcurrentGenerators = 2
-  private var generatorWaiters: [CheckedContinuation<Void, Never>] = []
-  private var inFlight: [String: Task<UIImage?, Never>] = [:]
-  private var failedUntil: [String: Date] = [:]
-  private let maximumCacheBytes: Int64 = 1_073_741_824
-  private var lastCacheTrimAt = Date.distantPast
+  typealias Loader = @Sendable (CloudItem, APIClient) async -> UIImage?
+  private struct Work {
+    let id: UUID
+    let task: Task<UIImage?, Never>
+    var clients: Set<UUID>
+  }
+  private struct SlotWaiter {
+    let id: UUID
+    let continuation: CheckedContinuation<Bool, Never>
+  }
 
-  init() {
-    let base = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first!
-    directory = base.appending(path: "GeneratedThumbnails", directoryHint: .isDirectory)
+  private let disk: ArtworkDiskStore
+  private let namespace: @Sendable () -> String
+  private let loader: Loader?
+  private let memoryCache = NSCache<NSString, UIImage>()
+  private let logger = Logger(subsystem: "com.xiaocai.gallery115", category: "Artwork")
+  private var inFlight: [String: Work] = [:]
+  private var failedUntil: [String: Date] = [:]
+  private var activeSlots: Set<UUID> = []
+  private var slotWaiters: [SlotWaiter] = []
+  private var playbackOwners: Set<UUID> = []
+  private var cacheGeneration = UUID()
+
+  init(
+    disk: ArtworkDiskStore = ArtworkDiskStore(),
+    namespace: @escaping @Sendable () -> String = ThumbnailService.currentNamespace,
+    loader: Loader? = nil
+  ) {
+    self.disk = disk
+    self.namespace = namespace
+    self.loader = loader
     memoryCache.countLimit = 160
     memoryCache.totalCostLimit = 72 * 1_024 * 1_024
-    try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
   }
 
-  /// Returns one unified artwork result for a card. Both signed 115 artwork and
-  /// locally generated frames pass through the same memory + disk cache so a
-  /// successful first display never has to depend on the network again.
+  nonisolated static func currentNamespace() -> String {
+    guard let config = WebDAVCredentialStore.shared.configuration else { return "unconfigured" }
+    // Full endpoint includes scheme, port and base path. Never include passwords.
+    return [config.normalizedWebDAVURL?.absoluteString ?? config.serverURL,
+            config.username, config.normalizedRootPath].map { "\($0.utf8.count):\($0)" }.joined()
+  }
+
+  private func identity(for item: CloudItem) -> ArtworkIdentity {
+    ArtworkIdentity(namespace: namespace(), itemID: item.id, size: item.size,
+                    modifiedAt: item.modifiedAt, legacyKey: item.sha1.isEmpty ? item.id : item.sha1)
+  }
+
   func thumbnail(for item: CloudItem, api: APIClient) async -> UIImage? {
     guard item.isVideo else { return nil }
-    let cacheKey = thumbnailCacheKey(for: item)
-    if let cached = memoryCache.object(forKey: cacheKey as NSString) {
-      return cached
-    }
-    let fileURL = cachedFileURL(for: item)
-    if let cached = loadImage(at: fileURL) {
-      cacheInMemory(cached, key: cacheKey)
-      touch(fileURL)
-      return cached
-    }
-    guard !Task.isCancelled else { return nil }
+    let identity = identity(for: item)
+    let generation = cacheGeneration
+    while !Task.isCancelled, generation == cacheGeneration, identity.namespace == namespace() {
+      if let image = localImage(identity) { return image }
+      if let retry = failedUntil[identity.key], retry > Date() { return nil }
 
-    if let task = inFlight[cacheKey] {
-      return await task.value
-    }
-    if let retryDate = failedUntil[cacheKey], retryDate > Date() {
-      return nil
-    }
+      let clientID = UUID()
+      let work: Work
+      if var existing = inFlight[identity.key] {
+        existing.clients.insert(clientID)
+        inFlight[identity.key] = existing
+        work = existing
+      } else {
+        let workID = UUID()
+        let task = Task<UIImage?, Never> { [weak self] in
+          guard let self else { return nil }
+          return await self.load(item, identity: identity, api: api, generation: generation, workID: workID)
+        }
+        work = Work(id: workID, task: task, clients: [clientID])
+        inFlight[identity.key] = work
+      }
 
-    let task = Task<UIImage?, Never> { [weak self] in
-      guard let self else { return nil }
-      return await self.loadAndPersistThumbnail(for: item, api: api)
+      let result = await withTaskCancellationHandler {
+        await work.task.value
+      } onCancel: {
+        Task { await self.cancelClient(clientID, key: identity.key, workID: work.id) }
+      }
+      if inFlight[identity.key]?.id == work.id {
+        inFlight[identity.key] = nil
+        if result == nil, !work.task.isCancelled, generation == cacheGeneration {
+          failedUntil[identity.key] = Date().addingTimeInterval(120)
+        }
+      }
+      guard !Task.isCancelled, generation == cacheGeneration, identity.namespace == namespace() else { return nil }
+      // Playback cancellation isn't a failure. Interested cards retry behind
+      // the closed gate and resume when the player closes.
+      if work.task.isCancelled { continue }
+      return result
     }
-    inFlight[cacheKey] = task
-    let image = await task.value
-    inFlight[cacheKey] = nil
-    if image == nil {
-      // Broken signed URLs or temporarily unavailable streams should not start
-      // another expensive request every time a recycled grid cell reappears.
-      failedUntil[cacheKey] = Date().addingTimeInterval(120)
-    } else {
-      failedUntil[cacheKey] = nil
-    }
-    return image
+    return nil
   }
 
-  /// Compatibility entry point used by older call sites. Keeping it prevents
-  /// thumbnail UI work from changing any media-source behavior.
   func generatedThumbnail(for item: CloudItem, api: APIClient) async -> UIImage? {
     await thumbnail(for: item, api: api)
   }
 
-  /// Warms a small, ordered window after a directory appears. Work is kept
-  /// sequential so it cannot flood 115/WebDAV or compete with active playback.
   func prefetch(_ items: [CloudItem], api: APIClient, limit: Int = 12) async {
-    // Only warm lightweight server artwork here. Missing-artwork videos still
-    // generate on demand, preventing background AVAsset reads from competing
-    // with a movie the user just opened.
     for item in items.lazy.filter({ $0.isVideo && $0.thumbnailURL != nil }).prefix(max(limit, 0)) {
       guard !Task.isCancelled else { return }
       _ = await thumbnail(for: item, api: api)
     }
   }
 
-  private func loadAndPersistThumbnail(for item: CloudItem, api: APIClient) async -> UIImage? {
-    let cacheKey = thumbnailCacheKey(for: item)
-    let fileURL = cachedFileURL(for: item)
+  func suspendNetwork(for owner: UUID) {
+    guard playbackOwners.insert(owner).inserted else { return }
+    for work in inFlight.values { work.task.cancel() }
+    inFlight.removeAll()
+  }
 
-    if let url = item.thumbnailURL,
-      let remote = await remoteThumbnail(at: url)
-    {
-      guard !Task.isCancelled else { return nil }
-      storeGeneratedThumbnail(remote, for: item)
-      return remote
+  func resumeNetwork(for owner: UUID) {
+    playbackOwners.remove(owner)
+    drainWaiters()
+  }
+
+  @discardableResult
+  func storeGeneratedThumbnail(_ image: UIImage, for item: CloudItem) -> Bool {
+    persist(image, identity: identity(for: item))
+  }
+
+  func cacheUsageBytes() async -> Int64 {
+    let store = disk
+    return await Task.detached(priority: .utility) { store.usageBytes() }.value
+  }
+
+  @discardableResult
+  func clearCache() -> Bool {
+    cacheGeneration = UUID()
+    for work in inFlight.values { work.task.cancel() }
+    inFlight.removeAll()
+    failedUntil.removeAll()
+    memoryCache.removeAllObjects()
+    do {
+      try disk.clear()
+      return true
+    } catch {
+      logger.error("Unable to clear durable artwork: \(error.localizedDescription, privacy: .private)")
+      return false
     }
+  }
 
-    if let metadata = await api.localMetadata(for: item),
-      let posterData = metadata.posterData,
-      let poster = downsampledImage(from: posterData, maximumPixelSize: 960)
-    {
-      guard !Task.isCancelled else { return nil }
-      storeGeneratedThumbnail(poster, for: item)
-      return poster
-    }
-
-    // Disc images are handled by the VLC/original-disc path. Asking AVFoundation
-    // to probe a remote ISO/IMG just to synthesize a thumbnail can trigger large
-    // random reads and offers no useful fallback. Local poster artwork above still works.
-    if item.isDiscImage { return nil }
-
-    guard !Task.isCancelled else { return nil }
-    await acquireGenerator()
-    defer { releaseGenerator() }
-
-    if let cached = loadImage(at: fileURL) {
-      cacheInMemory(cached, key: cacheKey)
-      touch(fileURL)
-      return cached
-    }
-    guard !Task.isCancelled else { return nil }
-
-    guard let source = try? await api.videoSources(for: item).first else { return nil }
-    let asset: AVURLAsset
-    if source.headers.isEmpty {
-      asset = AVURLAsset(url: source.url)
-    } else {
-      asset = AVURLAsset(
-        url: source.url,
-        options: ["AVURLAssetHTTPHeaderFieldsKey": source.headers]
-      )
-    }
-
-    guard !Task.isCancelled else { return nil }
-    guard (try? await asset.load(.isPlayable)) == true else { return nil }
-    let loadedDuration = try? await asset.load(.duration)
-    let duration = loadedDuration?.seconds ?? 0
-    let targetSeconds: Double
-    if duration.isFinite, duration > 2 {
-      targetSeconds = min(max(duration * 0.12, 1.0), 8.0)
-    } else {
-      targetSeconds = 1.0
-    }
-
-    let generator = AVAssetImageGenerator(asset: asset)
-    generator.appliesPreferredTrackTransform = true
-    generator.maximumSize = CGSize(width: 960, height: 540)
-    generator.requestedTimeToleranceBefore = CMTime(seconds: 1, preferredTimescale: 600)
-    generator.requestedTimeToleranceAfter = CMTime(seconds: 1, preferredTimescale: 600)
-
-    let requestedTime = CMTime(seconds: targetSeconds, preferredTimescale: 600)
-    guard let generated = try? await generator.image(at: requestedTime) else {
+  private func localImage(_ identity: ArtworkIdentity) -> UIImage? {
+    if let image = memoryCache.object(forKey: identity.key as NSString) { return image }
+    do {
+      guard let data = try disk.read(identity) else { return nil }
+      guard let image = downsampledImage(from: data) else {
+        disk.remove(identity)
+        return nil
+      }
+      cacheInMemory(image, key: identity.key)
+      return image
+    } catch {
+      logger.error("Unable to read durable artwork: \(error.localizedDescription, privacy: .private)")
       return nil
     }
+  }
 
-    guard !Task.isCancelled else { return nil }
-    let image = UIImage(cgImage: generated.image)
-    storeGeneratedThumbnail(image, for: item)
+  private func persist(_ image: UIImage, identity: ArtworkIdentity) -> Bool {
+    cacheInMemory(image, key: identity.key)
+    guard let data = image.jpegData(compressionQuality: 0.80) else { return false }
+    do {
+      try disk.write(data, for: identity)
+      return true
+    } catch {
+      logger.error("Unable to persist artwork: \(error.localizedDescription, privacy: .private)")
+      return false
+    }
+  }
+
+  private func load(
+    _ item: CloudItem, identity: ArtworkIdentity, api: APIClient, generation: UUID, workID: UUID
+  ) async -> UIImage? {
+    guard await acquireSlot(workID) else { return nil }
+    defer { releaseSlot(workID) }
+    guard !Task.isCancelled, generation == cacheGeneration, identity.namespace == namespace() else { return nil }
+    if let image = localImage(identity) { return image }
+    let image: UIImage?
+    if let loader {
+      image = await loader(item, api)
+    } else {
+      image = await loadNetworkArtwork(for: item, api: api)
+    }
+    guard !Task.isCancelled, generation == cacheGeneration, identity.namespace == namespace(),
+      let image else { return nil }
+    failedUntil[identity.key] = nil
+    _ = persist(image, identity: identity)
     return image
+  }
+
+  private func loadNetworkArtwork(for item: CloudItem, api: APIClient) async -> UIImage? {
+    // The slot covers sidecar discovery too. Previously every visible card could
+    // issue PROPFIND requests before it reached the frame-generation semaphore.
+    if let url = item.thumbnailURL, let image = await remoteThumbnail(at: url) { return image }
+    guard !Task.isCancelled else { return nil }
+    if let metadata = await api.localMetadata(for: item), let data = metadata.posterData,
+      let image = downsampledImage(from: data) { return image }
+    guard !Task.isCancelled, !item.isDiscImage,
+      let source = try? await api.videoSources(for: item).first else { return nil }
+    guard !Task.isCancelled else { return nil }
+    return await Self.frameThumbnail(source: source)
+  }
+
+  nonisolated static func frameThumbnail(source: VideoSource) async -> UIImage? {
+    let probe = ThumbnailFrameProbe(source: source)
+    let timeout = Task {
+      do { try await Task.sleep(nanoseconds: 20_000_000_000) }
+      catch { return }
+      probe.cancel()
+    }
+    defer { timeout.cancel() }
+    return await withTaskCancellationHandler {
+      guard !Task.isCancelled else { return nil }
+      // No isPlayable/duration preflight or percentage seek: get a near-start
+      // frame without loading the tail index just to calculate the target time.
+      for seconds in [0.5, 0.0] {
+        guard !Task.isCancelled, !probe.isCancelled else { return nil }
+        let generated = try? await probe.generator.image(at: CMTime(seconds: seconds, preferredTimescale: 600))
+        if let generated {
+          guard !Task.isCancelled, !probe.isCancelled else { return nil }
+          return UIImage(cgImage: generated.image)
+        }
+      }
+      return nil
+    } onCancel: {
+      probe.cancel()
+    }
   }
 
   private func remoteThumbnail(at url: URL) async -> UIImage? {
     var request = URLRequest(url: url)
-    request.cachePolicy = .returnCacheDataElseLoad
-    request.timeoutInterval = 15
-
+    request.cachePolicy = .reloadIgnoringLocalCacheData
+    request.timeoutInterval = 12
     guard let (data, response) = try? await URLSession.shared.data(for: request),
-      !Task.isCancelled,
-      data.count <= 16_000_000
+      !Task.isCancelled, data.count <= 16_000_000,
+      let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode)
     else { return nil }
-
-    if let http = response as? HTTPURLResponse,
-      !(200...299).contains(http.statusCode)
-    {
-      return nil
-    }
-    return downsampledImage(from: data, maximumPixelSize: 960)
-  }
-
-  func storeGeneratedThumbnail(_ image: UIImage, for item: CloudItem) {
-    cacheInMemory(image, key: thumbnailCacheKey(for: item))
-    guard let data = image.jpegData(compressionQuality: 0.80) else { return }
-    let url = cachedFileURL(for: item)
-    try? data.write(to: url, options: .atomic)
-    touch(url)
-    trimCacheIfNeeded()
-  }
-
-  func cacheUsageBytes() -> Int64 {
-    guard let files = try? fileManager.contentsOfDirectory(
-      at: directory,
-      includingPropertiesForKeys: [.fileSizeKey],
-      options: [.skipsHiddenFiles]
-    ) else { return 0 }
-    return files.reduce(0) { partial, url in
-      let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-      return partial + Int64(size)
-    }
-  }
-
-  func clearCache() {
-    for task in inFlight.values { task.cancel() }
-    inFlight.removeAll()
-    failedUntil.removeAll()
-    memoryCache.removeAllObjects()
-    try? fileManager.removeItem(at: directory)
-    try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
-    URLCache.shared.removeAllCachedResponses()
-  }
-
-  private func cachedFileURL(for item: CloudItem) -> URL {
-    directory.appending(path: "\(stableHash(thumbnailCacheKey(for: item))).jpg")
-  }
-
-  private func thumbnailCacheKey(for item: CloudItem) -> String {
-    item.sha1.isEmpty ? item.id : item.sha1
-  }
-
-  private func loadImage(at url: URL) -> UIImage? {
-    guard let data = try? Data(contentsOf: url) else { return nil }
-    return downsampledImage(from: data, maximumPixelSize: 960)
+    return downsampledImage(from: data)
   }
 
   private func cacheInMemory(_ image: UIImage, key: String) {
-    let pixelWidth = max(Int(image.size.width * image.scale), 1)
-    let pixelHeight = max(Int(image.size.height * image.scale), 1)
-    let cost = min(pixelWidth * pixelHeight * 4, 16 * 1_024 * 1_024)
-    memoryCache.setObject(image, forKey: key as NSString, cost: cost)
+    let width = max(Int(image.size.width * image.scale), 1)
+    let height = max(Int(image.size.height * image.scale), 1)
+    memoryCache.setObject(image, forKey: key as NSString, cost: min(width * height * 4, 16 * 1_024 * 1_024))
   }
 
-  private func downsampledImage(from data: Data, maximumPixelSize: Int) -> UIImage? {
+  private func downsampledImage(from data: Data) -> UIImage? {
     guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
     let options: [CFString: Any] = [
       kCGImageSourceCreateThumbnailFromImageAlways: true,
       kCGImageSourceCreateThumbnailWithTransform: true,
-      kCGImageSourceThumbnailMaxPixelSize: maximumPixelSize,
+      kCGImageSourceThumbnailMaxPixelSize: 960,
       kCGImageSourceShouldCacheImmediately: true,
     ]
-    guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
-      return nil
-    }
+    guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
     return UIImage(cgImage: image)
   }
 
-  private func acquireGenerator() async {
-    if activeGenerators < maximumConcurrentGenerators {
-      activeGenerators += 1
-      return
-    }
-    await withCheckedContinuation { continuation in
-      generatorWaiters.append(continuation)
-    }
-  }
-
-  private func releaseGenerator() {
-    if !generatorWaiters.isEmpty {
-      let next = generatorWaiters.removeFirst()
-      next.resume()
+  private func cancelClient(_ client: UUID, key: String, workID: UUID) {
+    guard var work = inFlight[key], work.id == workID else { return }
+    work.clients.remove(client)
+    if work.clients.isEmpty {
+      work.task.cancel()
+      inFlight[key] = nil
     } else {
-      activeGenerators = max(activeGenerators - 1, 0)
+      inFlight[key] = work
     }
   }
 
-  private func touch(_ url: URL) {
-    try? fileManager.setAttributes([.modificationDate: Date()], ofItemAtPath: url.path)
-  }
-
-  private func trimCacheIfNeeded() {
-    // Directory enumeration gets increasingly expensive in large libraries.
-    // At most one trim pass per minute keeps insertion latency predictable while
-    // still enforcing the disk budget during sustained thumbnail generation.
-    let now = Date()
-    guard now.timeIntervalSince(lastCacheTrimAt) >= 60 else { return }
-    lastCacheTrimAt = now
-    guard let files = try? fileManager.contentsOfDirectory(
-      at: directory,
-      includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
-      options: [.skipsHiddenFiles]
-    ) else { return }
-
-    var entries: [(url: URL, size: Int64, date: Date)] = files.map { url in
-      let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
-      return (
-        url,
-        Int64(values?.fileSize ?? 0),
-        values?.contentModificationDate ?? .distantPast
-      )
+  private func acquireSlot(_ id: UUID) async -> Bool {
+    guard !Task.isCancelled else { return false }
+    if playbackOwners.isEmpty, activeSlots.count < 2 {
+      activeSlots.insert(id)
+      return true
     }
-    var total = entries.reduce(Int64(0)) { $0 + $1.size }
-    guard total > maximumCacheBytes else { return }
-
-    entries.sort { $0.date < $1.date }
-    let target = Int64(Double(maximumCacheBytes) * 0.82)
-    for entry in entries where total > target {
-      try? fileManager.removeItem(at: entry.url)
-      total -= entry.size
+    return await withTaskCancellationHandler {
+      await withCheckedContinuation { continuation in
+        if Task.isCancelled { continuation.resume(returning: false) }
+        else { slotWaiters.append(SlotWaiter(id: id, continuation: continuation)) }
+      }
+    } onCancel: {
+      Task { await self.cancelWaiter(id) }
     }
   }
 
-  private func stableHash(_ value: String) -> String {
-    var hash: UInt64 = 14695981039346656037
-    for byte in value.utf8 {
-      hash ^= UInt64(byte)
-      hash &*= 1099511628211
+  private func cancelWaiter(_ id: UUID) {
+    guard let index = slotWaiters.firstIndex(where: { $0.id == id }) else { return }
+    slotWaiters.remove(at: index).continuation.resume(returning: false)
+  }
+
+  private func releaseSlot(_ id: UUID) {
+    activeSlots.remove(id)
+    drainWaiters()
+  }
+
+  private func drainWaiters() {
+    while playbackOwners.isEmpty, activeSlots.count < 2, !slotWaiters.isEmpty {
+      let waiter = slotWaiters.removeFirst()
+      activeSlots.insert(waiter.id)
+      waiter.continuation.resume(returning: true)
     }
-    return String(hash, radix: 16)
+  }
+}
+
+/// Only the generation task accesses the generator; cancellation handlers call
+/// AVFoundation's cancellation APIs. The cancelled bit is protected by a lock.
+private final class ThumbnailFrameProbe: @unchecked Sendable {
+  let asset: AVURLAsset
+  let generator: AVAssetImageGenerator
+  private let lock = NSLock()
+  private var cancelled = false
+
+  var isCancelled: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return cancelled
+  }
+
+  init(source: VideoSource) {
+    var options: [String: Any] = [AVURLAssetPreferPreciseDurationAndTimingKey: false]
+    if !source.headers.isEmpty { options["AVURLAssetHTTPHeaderFieldsKey"] = source.headers }
+    asset = AVURLAsset(url: source.url, options: options)
+    generator = AVAssetImageGenerator(asset: asset)
+    generator.appliesPreferredTrackTransform = true
+    generator.maximumSize = CGSize(width: 960, height: 540)
+    generator.requestedTimeToleranceBefore = CMTime(seconds: 0.5, preferredTimescale: 600)
+    generator.requestedTimeToleranceAfter = CMTime(seconds: 1, preferredTimescale: 600)
+  }
+
+  func cancel() {
+    lock.lock()
+    cancelled = true
+    lock.unlock()
+    generator.cancelAllCGImageGeneration()
+    asset.cancelLoading()
   }
 }

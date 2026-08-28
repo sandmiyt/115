@@ -1,0 +1,10 @@
+# Local validation and generated build outputs (never runtime/user media).
+.validation-tools/
+.build/
+.swiftpm/
+build/
+Pods/
+Payload/
+*.ipa
+*.xcresult/
+__pycache__/
