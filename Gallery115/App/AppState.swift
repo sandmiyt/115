@@ -449,17 +449,19 @@ final class AppState {
 
     let context = LAContext()
     context.localizedCancelTitle = "取消"
+    context.localizedFallbackTitle = "输入密码"
+    let policy: LAPolicy = .deviceOwnerAuthentication
 
     var authError: NSError?
-    guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &authError) else {
-      biometricErrorMessage = authError?.localizedDescription ?? "此设备暂时无法使用生物识别。"
+    guard context.canEvaluatePolicy(policy, error: &authError) else {
+      biometricErrorMessage = authError?.localizedDescription ?? "此设备暂时无法验证身份。"
       isAppUnlocked = false
       return false
     }
 
     do {
       let success = try await context.evaluatePolicy(
-        .deviceOwnerAuthenticationWithBiometrics,
+        policy,
         localizedReason: reason
       )
       isAppUnlocked = success

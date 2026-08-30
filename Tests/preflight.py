@@ -129,6 +129,7 @@ unchanged = subprocess.run(["git", "diff", "--exit-code", "--", *protected], cwd
 check(unchanged, "Playback core, credentials and library business logic unchanged")
 provider = (ROOT / "Gallery115/Services/WebDAVProvider.swift").read_text(encoding="utf-8")
 api_client = (ROOT / "Gallery115/Services/APIClient.swift").read_text(encoding="utf-8")
+app_state = (ROOT / "Gallery115/App/AppState.swift").read_text(encoding="utf-8")
 original_provider = subprocess.check_output(["git", "show", "HEAD:Gallery115/Services/WebDAVProvider.swift"],
                                             cwd=ROOT).decode("utf-8")
 def playback_source(text):
@@ -145,6 +146,13 @@ check("sortOrder: CloudItemSortOrder = .updated" in api_client,
       "API pagination defaults to newest-first ordering")
 check("if !Task.isCancelled { metadataMisses.insert(item.id) }" in provider,
       "Cancelled artwork discovery cannot poison metadata miss cache")
+authentication = app_state.split("  private func authenticate(reason:", 1)[1].split("  private enum Keys", 1)[0]
+check("let policy: LAPolicy = .deviceOwnerAuthentication" in authentication
+      and "canEvaluatePolicy(policy" in authentication
+      and "evaluatePolicy(\n        policy" in authentication
+      and 'localizedFallbackTitle = "输入密码"' in authentication
+      and ".deviceOwnerAuthenticationWithBiometrics" not in authentication,
+      "App unlock allows the system device-passcode fallback after biometric failure")
 test_count = sum(len(re.findall(r"func test\w+\(", path.read_text(encoding="utf-8")))
                  for path in (ROOT / "Tests/CacheRegression").glob("*.swift"))
 print(f"iOS XCTest cases prepared: {test_count} (not executed by this script)")
