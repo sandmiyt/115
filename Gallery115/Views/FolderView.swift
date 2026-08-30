@@ -65,6 +65,7 @@ struct FolderView: View {
   @State private var nextOffset = 0
   @State private var hasMore = true
   @State private var isRefreshing = false
+  @State private var pagingRevision = 0
   @State private var showMediaSetup = false
   @Namespace private var playerTransition
 
@@ -99,7 +100,13 @@ struct FolderView: View {
     }
     .searchable(text: $query, prompt: "搜索当前目录")
     .onChange(of: query) { _, _ in rebuildDisplayItems() }
-    .onChange(of: sortMode) { _, _ in rebuildDisplayItems() }
+    .onChange(of: sortMode) { _, _ in
+      items = CloudItemCollectionPolicy.ordered(items, by: collectionSortOrder)
+      if let searchItems {
+        self.searchItems = CloudItemCollectionPolicy.ordered(searchItems, by: collectionSortOrder)
+      }
+      rebuildDisplayItems()
+    }
     .onChange(of: mediaFilter) { _, _ in rebuildDisplayItems() }
     .onChange(of: appState.libraryStore.favorites.map(\.id)) { _, _ in rebuildDisplayItems() }
     .task(id: query) { await updateSearchResults() }
@@ -445,30 +452,33 @@ struct FolderView: View {
       output = output.filter { !$0.isDirectory && appState.libraryStore.isFavorite($0) }
     }
 
-    output.sort { lhs, rhs in
-      if lhs.isDirectory != rhs.isDirectory { return lhs.isDirectory }
-      switch sortMode {
-      case .updated:
-        return lhs.modifiedAt > rhs.modifiedAt
-      case .name:
-        return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
-      case .size:
-        return lhs.size > rhs.size
-      }
-    }
     displayItems = output
 
     // Build the queue only when the underlying directory changes instead of
     // sorting the entire video list on every SwiftUI body invalidation.
     playlistItems = source
       .filter { !$0.isDirectory && $0.isVideo }
-      .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+      .sorted {
+        let comparison = $0.name.localizedStandardCompare($1.name)
+        return comparison == .orderedSame ? $0.id < $1.id : comparison == .orderedAscending
+      }
+  }
+
+  private var collectionSortOrder: CloudItemSortOrder {
+    switch sortMode {
+    case .updated: return .updated
+    case .name: return .name
+    case .size: return .size
+    }
   }
 
 
   @MainActor
   private func refreshCurrentFolder() async {
     guard appState.isConfigured, appState.isAppUnlocked, !isRefreshing else { return }
+    pagingRevision &+= 1
+    let revision = pagingRevision
+    isLoadingMore = false
     isRefreshing = true
     defer { isRefreshing = false }
 
@@ -496,8 +506,9 @@ struct FolderView: View {
         if !page.hasMore { break }
       } while true
 
-      var known = Set<String>()
-      items = refreshed.filter { known.insert($0.id).inserted }
+      guard revision == pagingRevision, !Task.isCancelled else { return }
+
+      items = CloudItemCollectionPolicy.ordered(refreshed, by: collectionSortOrder)
       searchItems = nil
       rebuildDisplayItems()
       nextOffset = offset
@@ -517,6 +528,7 @@ struct FolderView: View {
         await updateSearchResults()
       }
     } catch {
+      guard !Task.isCancelled else { return }
       appState.markMediaOffline()
       transientMessage = "刷新失败，已保留当前资料库。"
     }
@@ -524,6 +536,8 @@ struct FolderView: View {
 
   @MainActor
   private func loadFirstPage(forceRefresh: Bool) async {
+    pagingRevision &+= 1
+    let revision = pagingRevision
     isInitialLoading = items.isEmpty
     isLoadingMore = false
     defer { isInitialLoading = false }
@@ -535,7 +549,8 @@ struct FolderView: View {
         limit: pageSize,
         forceRefresh: forceRefresh
       )
-      items = page.items
+      guard revision == pagingRevision, !Task.isCancelled else { return }
+      items = CloudItemCollectionPolicy.ordered(page.items, by: collectionSortOrder)
       searchItems = nil
       rebuildDisplayItems()
       nextOffset = page.limit
@@ -546,7 +561,9 @@ struct FolderView: View {
         transientMessage = forceRefresh ? "媒体服务器暂时不可用，已继续使用本地资料库缓存。" : nil
         if !forceRefresh, !didScheduleBackgroundRefresh {
           didScheduleBackgroundRefresh = true
-          Task { await refreshFirstPageSilently() }
+          // Keep this refresh as a child of the screen task so leaving/changing
+          // folders cancels its network work and prevents late state mutation.
+          await refreshFirstPageSilently()
         }
       } else {
         appState.markMediaConnected()
@@ -554,6 +571,7 @@ struct FolderView: View {
         didScheduleBackgroundRefresh = true
       }
     } catch {
+      guard !Task.isCancelled else { return }
       appState.markMediaOffline()
       errorMessage = error.localizedDescription
     }
@@ -568,16 +586,26 @@ struct FolderView: View {
         limit: pageSize,
         forceRefresh: true
       )
-      items = page.items
+      guard !Task.isCancelled else { return }
+      items = CloudItemCollectionPolicy.mergingFirstPage(
+        page.items,
+        into: items,
+        by: collectionSortOrder
+      )
       rebuildDisplayItems()
-      nextOffset = page.limit
-      hasMore = page.hasMore
+      nextOffset = max(nextOffset, page.offset + page.limit)
+      if let total = page.total {
+        hasMore = nextOffset < total
+      } else {
+        hasMore = hasMore || page.hasMore
+      }
       if page.servedFromCache {
         appState.markMediaUsingCache()
       } else {
         appState.markMediaConnected()
       }
     } catch {
+      guard !Task.isCancelled else { return }
       // Keep the already rendered cache; a background refresh must never blank the directory.
       appState.markMediaUsingCache()
     }
@@ -602,9 +630,10 @@ struct FolderView: View {
     do {
       let all = try await appState.api.listFolder(id: folderID)
       guard !Task.isCancelled else { return }
-      searchItems = all
+      searchItems = CloudItemCollectionPolicy.ordered(all, by: collectionSortOrder)
       rebuildDisplayItems()
     } catch {
+      guard !Task.isCancelled else { return }
       // Search the loaded page rather than failing the whole screen.
       searchItems = items
       rebuildDisplayItems()
@@ -614,34 +643,43 @@ struct FolderView: View {
   @MainActor
   private func loadNextPage() async {
     guard hasMore, !isLoadingMore else { return }
+    let requestedOffset = nextOffset
+    let revision = pagingRevision
     isLoadingMore = true
     defer { isLoadingMore = false }
 
     do {
       let page = try await appState.api.listFolderPage(
         id: folderID,
-        offset: nextOffset,
+        offset: requestedOffset,
         limit: pageSize,
         forceRefresh: false
       )
-      var known = Set(items.map(\.id))
-      let additions = page.items.filter { known.insert($0.id).inserted }
-      items.append(contentsOf: additions)
+      guard revision == pagingRevision, requestedOffset == nextOffset, !Task.isCancelled else { return }
+      items = CloudItemCollectionPolicy.appendingPage(
+        page.items,
+        to: items,
+        by: collectionSortOrder
+      )
       rebuildDisplayItems()
-      nextOffset += page.limit
+      nextOffset = requestedOffset + page.limit
       hasMore = page.hasMore
       if page.servedFromCache {
         appState.markMediaUsingCache()
-        transientMessage = "已从本地资料库缓存继续加载。"
+        // Cached pagination is an expected fast path. Showing a safe-area banner
+        // here changes the viewport height while the user is scrolling and can
+        // itself look like a backwards jump.
       } else {
         appState.markMediaConnected()
       }
     } catch let error as CloudProviderError {
+      guard !Task.isCancelled else { return }
       // Keep the mounted directory visible. The user can continue browsing what has
       // already been indexed instead of losing the whole screen to a temporary 405.
       appState.markMediaOffline()
       transientMessage = error.localizedDescription
     } catch {
+      guard !Task.isCancelled else { return }
       appState.markMediaOffline()
       transientMessage = "网络暂时不可用，已保留当前资料库。"
     }

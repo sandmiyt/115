@@ -132,6 +132,7 @@ struct VideoArtwork: View {
 
   @State private var cachedImage: UIImage?
   @State private var loadedIdentity: String?
+  @State private var activeRequestIdentity: String?
   @State private var isLoading = false
 
   var body: some View {
@@ -162,6 +163,7 @@ struct VideoArtwork: View {
     .task(id: itemThumbnailIdentity) {
       let identity = itemThumbnailIdentity
       if loadedIdentity == identity, cachedImage != nil { return }
+      activeRequestIdentity = identity
       if loadedIdentity != identity { cachedImage = nil }
       isLoading = false
       // Disk/memory hits should not flash a spinner or replay a fade-in.
@@ -171,7 +173,12 @@ struct VideoArtwork: View {
         guard !Task.isCancelled else { return }
         isLoading = true
       }
-      defer { spinner.cancel() }
+      defer {
+        spinner.cancel()
+        if activeRequestIdentity == identity {
+          isLoading = false
+        }
+      }
       let image = await withTaskCancellationHandler {
         await appState.thumbnailService.thumbnail(for: item, api: appState.api)
       } onCancel: {

@@ -53,3 +53,79 @@ struct CloudItem: Codable, Hashable, Identifiable {
     "jpg", "jpeg", "png", "heic", "heif", "webp", "gif", "tif", "tiff", "bmp", "avif",
   ]
 }
+
+enum CloudItemSortOrder: String, CaseIterable {
+  case updated
+  case name
+  case size
+}
+
+/// Keeps a paged media collection stable while more rows arrive.
+///
+/// Sorting the whole collection after every page can insert new cells above the
+/// visible viewport. Lazy grids then restore their anchor against a different
+/// layout, which feels like the library has jumped backwards. Initial/manual
+/// snapshots are fully ordered; incremental pages are ordered internally and
+/// appended without moving cells the user is already looking at.
+enum CloudItemCollectionPolicy {
+  static func ordered(_ items: [CloudItem], by order: CloudItemSortOrder) -> [CloudItem] {
+    var seen = Set<String>()
+    return items
+      .filter { seen.insert($0.id).inserted }
+      .sorted { comesBefore($0, $1, by: order) }
+  }
+
+  static func appendingPage(
+    _ page: [CloudItem],
+    to current: [CloudItem],
+    by order: CloudItemSortOrder
+  ) -> [CloudItem] {
+    var seen = Set(current.map(\.id))
+    let additions = ordered(page.filter { seen.insert($0.id).inserted }, by: order)
+    return current + additions
+  }
+
+  /// A silent first-page refresh is only a partial snapshot. Update matching
+  /// models in place and append new IDs, but never delete or reorder cells that
+  /// may currently be anchoring the scroll view. A manual refresh still replaces
+  /// the complete collection and therefore remains authoritative for deletions.
+  static func mergingFirstPage(
+    _ refreshed: [CloudItem],
+    into current: [CloudItem],
+    by order: CloudItemSortOrder
+  ) -> [CloudItem] {
+    let latestByID = Dictionary(refreshed.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
+    var seen = Set<String>()
+    var merged = current.compactMap { item -> CloudItem? in
+      guard seen.insert(item.id).inserted else { return nil }
+      return latestByID[item.id] ?? item
+    }
+    let additions = ordered(refreshed.filter { seen.insert($0.id).inserted }, by: order)
+    merged.append(contentsOf: additions)
+    return merged
+  }
+
+  private static func comesBefore(
+    _ lhs: CloudItem,
+    _ rhs: CloudItem,
+    by order: CloudItemSortOrder
+  ) -> Bool {
+    if lhs.isDirectory != rhs.isDirectory { return lhs.isDirectory }
+
+    switch order {
+    case .updated:
+      if lhs.modifiedAt != rhs.modifiedAt { return lhs.modifiedAt > rhs.modifiedAt }
+    case .name:
+      let comparison = lhs.name.localizedStandardCompare(rhs.name)
+      if comparison != .orderedSame { return comparison == .orderedAscending }
+    case .size:
+      if lhs.size != rhs.size { return lhs.size > rhs.size }
+    }
+
+    // A total tie-breaker prevents equal dates/sizes from being reshuffled by
+    // Swift's non-stable sort whenever unrelated view state changes.
+    let nameComparison = lhs.name.localizedStandardCompare(rhs.name)
+    if nameComparison != .orderedSame { return nameComparison == .orderedAscending }
+    return lhs.id < rhs.id
+  }
+}

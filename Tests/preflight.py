@@ -23,6 +23,8 @@ sources = [
     "Gallery115/Views/SettingsView.swift", "Package.swift", "Tests/CacheSupport.swift",
     "Tests/CacheRegression/ArtworkCacheTests.swift",
     "Tests/CacheRegression/FrameExtractionTests.swift",
+    "Tests/CacheRegression/FolderCollectionPolicyTests.swift",
+    "Gallery115/Models/CloudItem.swift", "Gallery115/Views/FolderView.swift",
     "Gallery115/Services/WebDAVProvider.swift",
 ]
 for name in sources:
@@ -43,6 +45,8 @@ disk = (ROOT / sources[0]).read_text(encoding="utf-8")
 service = (ROOT / sources[1]).read_text(encoding="utf-8")
 card = (ROOT / sources[2]).read_text(encoding="utf-8")
 player = (ROOT / sources[3]).read_text(encoding="utf-8")
+folder = (ROOT / "Gallery115/Views/FolderView.swift").read_text(encoding="utf-8")
+cloud_item = (ROOT / "Gallery115/Models/CloudItem.swift").read_text(encoding="utf-8")
 project = (ROOT / "Gallery115.xcodeproj/project.pbxproj").read_text(encoding="utf-8")
 check(".applicationSupportDirectory" in disk and "isExcludedFromBackup = true" in disk,
       "Persistent, backup-excluded artwork directory")
@@ -53,6 +57,24 @@ key = disk.split("var key: String {", 1)[1].split("static func digest", 1)[0]
 check(all(field in key for field in ["namespace", "itemID", "size", "modifiedAt"])
       and "legacyKey" not in key, "Stable mount/file identity, no ETag")
 check("item.sha1" not in card and "thumbnailURLString" not in card, "Card task identity excludes rotating URLs/ETags")
+check("activeRequestIdentity == identity" in card,
+      "Cancelled recycled artwork cells clear only their own loading state")
+check("CloudItemCollectionPolicy.appendingPage" in folder
+      and "requestedOffset == nextOffset" in folder,
+      "Pagination appends stably and rejects stale page responses")
+check("CloudItemCollectionPolicy.mergingFirstPage" in folder
+      and "nextOffset = max(nextOffset" in folder,
+      "Silent refresh preserves loaded viewport rows and paging progress")
+check("await refreshFirstPageSilently()" in folder
+      and "Task { await refreshFirstPageSilently() }" not in folder,
+      "Silent refresh is cancelled with its folder screen task")
+check(folder.count("guard !Task.isCancelled else { return }") >= 7,
+      "Cancelled folder/search requests cannot publish stale or offline state")
+check("Cached pagination is an expected fast path" in folder
+      and 'transientMessage = "已从本地资料库缓存继续加载。"' not in folder,
+      "Cache hits do not resize the viewport with a status banner")
+check("return lhs.id < rhs.id" in cloud_item,
+      "Equal sort values use a deterministic cell identity tie-breaker")
 check("load(.duration)" not in service and "load(.isPlayable)" not in service,
       "No thumbnail duration/playability preflight")
 check("generator.cancelAllCGImageGeneration()" in service and "asset.cancelLoading()" in service,
