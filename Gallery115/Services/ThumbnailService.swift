@@ -4,7 +4,7 @@ import ImageIO
 import OSLog
 import UIKit
 
-/// Local-first artwork; only two network jobs may run, and playback has priority.
+/// Local-first artwork; a small bounded pool fills visible rows while playback has priority.
 actor ThumbnailService {
   typealias Loader = @Sendable (CloudItem, APIClient) async -> UIImage?
   private struct Work {
@@ -28,6 +28,7 @@ actor ThumbnailService {
   private var slotWaiters: [SlotWaiter] = []
   private var playbackOwners: Set<UUID> = []
   private var cacheGeneration = UUID()
+  private let maximumNetworkJobs = 3
 
   init(
     disk: ArtworkDiskStore = ArtworkDiskStore(),
@@ -102,9 +103,18 @@ actor ThumbnailService {
   }
 
   func prefetch(_ items: [CloudItem], api: APIClient, limit: Int = 12) async {
-    for item in items.lazy.filter({ $0.isVideo && $0.thumbnailURL != nil }).prefix(max(limit, 0)) {
-      guard !Task.isCancelled else { return }
-      _ = await thumbnail(for: item, api: api)
+    // WebDAV items normally have no ready-made thumbnail URL. They still need
+    // proactive sidecar/frame generation instead of waiting for each card to
+    // appear. The shared slot gate below keeps this bounded and playback-safe.
+    let targets = Array(items.lazy.filter(\.isVideo).prefix(max(limit, 0)))
+    await withTaskGroup(of: Void.self) { group in
+      for item in targets {
+        group.addTask { [weak self] in
+          guard let self, !Task.isCancelled else { return }
+          _ = await self.thumbnail(for: item, api: api)
+        }
+      }
+      await group.waitForAll()
     }
   }
 
@@ -274,7 +284,7 @@ actor ThumbnailService {
 
   private func acquireSlot(_ id: UUID) async -> Bool {
     guard !Task.isCancelled else { return false }
-    if playbackOwners.isEmpty, activeSlots.count < 2 {
+    if playbackOwners.isEmpty, activeSlots.count < maximumNetworkJobs {
       activeSlots.insert(id)
       return true
     }
@@ -299,7 +309,7 @@ actor ThumbnailService {
   }
 
   private func drainWaiters() {
-    while playbackOwners.isEmpty, activeSlots.count < 2, !slotWaiters.isEmpty {
+    while playbackOwners.isEmpty, activeSlots.count < maximumNetworkJobs, !slotWaiters.isEmpty {
       let waiter = slotWaiters.removeFirst()
       activeSlots.insert(waiter.id)
       waiter.continuation.resume(returning: true)

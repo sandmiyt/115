@@ -151,7 +151,7 @@ final class ArtworkCacheTests: XCTestCase {
     let peak = await probe.peakActive
     let calls = await probe.calls
     XCTAssertEqual(calls, 12)
-    XCTAssertLessThanOrEqual(peak, 2)
+    XCTAssertLessThanOrEqual(peak, 3)
   }
 
   func testCancellingOneConsumerDoesNotCancelSharedRequest() async throws {

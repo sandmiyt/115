@@ -511,7 +511,7 @@ struct PlayerScreen: View {
 
         singleFingerGestureSuppressedUntil = ProcessInfo.processInfo.systemUptime + 0.24
         let rawScale = pinchStartScale * value.magnification
-        let targetScale = min(max(rawScale, 1.0), 3.0)
+        let targetScale = min(max(rawScale, 1.0), 5.0)
         let targetOffset = clampedVideoOffset(videoOffset, scale: targetScale, viewport: proxy.size)
 
         // iOS Photos-style rubber band: the picture may compress below its
@@ -537,9 +537,9 @@ struct PlayerScreen: View {
       let overshoot = min(1.0 - rawScale, 0.64)
       return max(0.78, 1.0 - overshoot * 0.34)
     }
-    if rawScale > 3.0 {
-      let overshoot = min(rawScale - 3.0, 1.5)
-      return min(3.24, 3.0 + overshoot * 0.16)
+    if rawScale > 5.0 {
+      let overshoot = min(rawScale - 5.0, 2.0)
+      return min(5.36, 5.0 + overshoot * 0.18)
     }
     return rawScale
   }
@@ -1202,38 +1202,32 @@ struct PlayerScreen: View {
 
   private func settingsPanel(proxy: GeometryProxy) -> some View {
     let landscape = proxy.size.width > proxy.size.height
-    let panelWidth = landscape ? min(340.0, proxy.size.width * 0.42) : max(proxy.size.width - 24, 280)
-    let panelHeight = landscape ? min(proxy.size.height * 0.82, 470) : min(proxy.size.height * 0.64, 560)
+    let panelWidth = landscape ? min(330.0, proxy.size.width * 0.40) : max(proxy.size.width - 32, 280)
+    let panelHeight = landscape ? min(proxy.size.height * 0.80, 450) : min(proxy.size.height * 0.68, 540)
 
     return VStack(spacing: 0) {
       HStack(spacing: 10) {
-        VStack(alignment: .leading, spacing: 2) {
-          Text("播放设置")
-            .font(.headline.weight(.semibold))
-            .foregroundStyle(.white)
-          Text(currentItem.name)
-            .font(.caption)
-            .foregroundStyle(.white.opacity(0.54))
-            .lineLimit(1)
-        }
+        Text("播放设置")
+          .font(.headline.weight(.semibold))
+          .foregroundStyle(.white)
         Spacer()
         Button { closeSettingsPanel() } label: {
           Image(systemName: "xmark")
             .font(.system(size: 13, weight: .bold))
             .foregroundStyle(.white.opacity(0.86))
-            .frame(width: 32, height: 32)
-            .background(.white.opacity(0.08), in: Circle())
+            .frame(width: 30, height: 30)
+            .background(.white.opacity(0.07), in: Circle())
         }
         .buttonStyle(.plain)
       }
-      .padding(.horizontal, 18)
-      .padding(.top, 16)
-      .padding(.bottom, 12)
+      .padding(.horizontal, 16)
+      .padding(.top, 14)
+      .padding(.bottom, 10)
 
       Divider().overlay(.white.opacity(0.08))
 
       ScrollView(showsIndicators: false) {
-        VStack(alignment: .leading, spacing: 18) {
+        VStack(alignment: .leading, spacing: 14) {
           if let model {
             settingsSpeedSection(model: model)
 
@@ -1252,22 +1246,22 @@ struct PlayerScreen: View {
           settingsPictureSection()
           settingsOtherSection()
         }
-        .padding(18)
+        .padding(14)
       }
     }
     .frame(width: panelWidth, height: panelHeight)
-    .background(.black.opacity(0.88))
+    .background(.black.opacity(0.82))
     .background(.ultraThinMaterial)
-    .clipShape(RoundedRectangle(cornerRadius: landscape ? 20 : 24, style: .continuous))
+    .clipShape(RoundedRectangle(cornerRadius: landscape ? 20 : 22, style: .continuous))
     .overlay {
-      RoundedRectangle(cornerRadius: landscape ? 20 : 24, style: .continuous)
-        .stroke(.white.opacity(0.10), lineWidth: 0.8)
+      RoundedRectangle(cornerRadius: landscape ? 20 : 22, style: .continuous)
+        .stroke(.white.opacity(0.09), lineWidth: 0.7)
     }
-    .shadow(color: .black.opacity(0.35), radius: 26, y: 10)
+    .shadow(color: .black.opacity(0.32), radius: 24, y: 9)
   }
 
   private func settingsSpeedSection(model: PlayerModel) -> some View {
-    VStack(alignment: .leading, spacing: 10) {
+    VStack(alignment: .leading, spacing: 8) {
       settingsSectionTitle("播放速度")
       LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 3), spacing: 8) {
         ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { rate in
@@ -1281,10 +1275,11 @@ struct PlayerScreen: View {
         }
       }
     }
+    .settingsSectionCard()
   }
 
   private func settingsQualitySection(model: PlayerModel) -> some View {
-    VStack(alignment: .leading, spacing: 10) {
+    VStack(alignment: .leading, spacing: 8) {
       settingsSectionTitle("清晰度")
       VStack(spacing: 6) {
         ForEach(model.sources) { source in
@@ -1306,10 +1301,11 @@ struct PlayerScreen: View {
         }
       }
     }
+    .settingsSectionCard()
   }
 
   private func settingsAudioSection(model: PlayerModel) -> some View {
-    VStack(alignment: .leading, spacing: 10) {
+    VStack(alignment: .leading, spacing: 8) {
       settingsSectionTitle("音轨")
       if model.audioOptions.isEmpty {
         settingsUnavailableRow("当前视频没有可切换音轨", systemName: "waveform")
@@ -1330,10 +1326,11 @@ struct PlayerScreen: View {
         }
       }
     }
+    .settingsSectionCard()
   }
 
   private func settingsSubtitleSection(model: PlayerModel) -> some View {
-    VStack(alignment: .leading, spacing: 10) {
+    VStack(alignment: .leading, spacing: 8) {
       settingsSectionTitle("字幕")
       settingsRow(
         title: "关闭字幕",
@@ -1377,10 +1374,11 @@ struct PlayerScreen: View {
         settingsUnavailableRow("当前视频没有发现字幕", systemName: "captions.bubble")
       }
     }
+    .settingsSectionCard()
   }
 
   private func settingsChapterSection() -> some View {
-    VStack(alignment: .leading, spacing: 10) {
+    VStack(alignment: .leading, spacing: 8) {
       settingsSectionTitle("章节")
       VStack(spacing: 6) {
         ForEach(activeChapters) { chapter in
@@ -1397,10 +1395,11 @@ struct PlayerScreen: View {
         }
       }
     }
+    .settingsSectionCard()
   }
 
   private func settingsPictureSection() -> some View {
-    VStack(alignment: .leading, spacing: 10) {
+    VStack(alignment: .leading, spacing: 8) {
       settingsSectionTitle("画面")
       HStack(spacing: 8) {
         settingsActionButton(
@@ -1416,10 +1415,11 @@ struct PlayerScreen: View {
         }
       }
     }
+    .settingsSectionCard()
   }
 
   private func settingsOtherSection() -> some View {
-    VStack(alignment: .leading, spacing: 10) {
+    VStack(alignment: .leading, spacing: 8) {
       settingsSectionTitle("更多")
 
       if previousItem != nil || nextItem != nil {
@@ -1477,12 +1477,13 @@ struct PlayerScreen: View {
       }
 
     }
+    .settingsSectionCard()
   }
 
   private func settingsSectionTitle(_ title: String) -> some View {
     Text(title)
-      .font(.caption.weight(.semibold))
-      .foregroundStyle(.white.opacity(0.56))
+      .font(.caption2.weight(.semibold))
+      .foregroundStyle(.white.opacity(0.52))
   }
 
   private func settingsChip(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
@@ -1491,11 +1492,11 @@ struct PlayerScreen: View {
         .font(.caption.weight(.semibold))
         .foregroundStyle(.white)
         .frame(maxWidth: .infinity)
-        .frame(height: 36)
-        .background(selected ? .white.opacity(0.18) : .white.opacity(0.07), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .frame(height: 34)
+        .background(selected ? .white.opacity(0.17) : .white.opacity(0.055), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
         .overlay {
           if selected {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
               .stroke(.white.opacity(0.22), lineWidth: 0.8)
           }
         }
@@ -1525,8 +1526,8 @@ struct PlayerScreen: View {
       }
       .foregroundStyle(.white.opacity(selected ? 1 : 0.86))
       .padding(.horizontal, 12)
-      .frame(height: 42)
-      .background(selected ? .white.opacity(0.12) : .white.opacity(0.055), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+      .frame(height: 39)
+      .background(selected ? .white.opacity(0.11) : .clear, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
     .buttonStyle(.plain)
   }
@@ -1540,8 +1541,7 @@ struct PlayerScreen: View {
     .font(.subheadline)
     .foregroundStyle(.white.opacity(0.42))
     .padding(.horizontal, 12)
-    .frame(height: 42)
-    .background(.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    .frame(height: 39)
   }
 
   private func settingsActionButton(
@@ -1558,8 +1558,8 @@ struct PlayerScreen: View {
       .font(.caption.weight(.semibold))
       .foregroundStyle(enabled ? .white : .white.opacity(0.28))
       .frame(maxWidth: .infinity)
-      .frame(height: 40)
-      .background(.white.opacity(enabled ? 0.075 : 0.035), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+      .frame(height: 38)
+      .background(.white.opacity(enabled ? 0.06 : 0.025), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
     .buttonStyle(.plain)
     .disabled(!enabled)
@@ -1575,8 +1575,8 @@ struct PlayerScreen: View {
       }
     }
     .frame(maxWidth: .infinity)
-    .frame(height: 40)
-    .background(.white.opacity(0.075), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    .frame(height: 38)
+    .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     .accessibilityLabel("AirPlay")
   }
 
@@ -1612,9 +1612,9 @@ struct PlayerScreen: View {
           .allowsHitTesting(!isScrubbing)
           .zIndex(1)
         }
-        .frame(maxWidth: .infinity)
+        .frame(maxWidth: landscape ? 620 : 390)
         .padding(.horizontal, 6)
-        .padding(.vertical, isScrubbing ? 4 : 3)
+        .padding(.vertical, isScrubbing ? 4 : 2)
         .background {
           Capsule()
             .fill(.ultraThinMaterial)
@@ -1660,7 +1660,7 @@ struct PlayerScreen: View {
         .font(.system(size: 17, weight: .semibold))
         .contentTransition(.symbolEffect)
         .foregroundStyle(.white)
-        .frame(width: 42, height: 44)
+        .frame(width: 40, height: 40)
         .contentShape(Rectangle())
     }
     .buttonStyle(PlayerPressScaleStyle(pressedScale: 0.92))
@@ -1683,7 +1683,7 @@ struct PlayerScreen: View {
         .font(.system(size: 16, weight: .semibold))
         .contentTransition(.symbolEffect)
         .foregroundStyle(.white)
-        .frame(width: 42, height: 44)
+        .frame(width: 40, height: 40)
         .contentShape(Rectangle())
     }
     .buttonStyle(PlayerPressScaleStyle(pressedScale: 0.92))
@@ -1692,8 +1692,9 @@ struct PlayerScreen: View {
 
   private func timeline(model: PlayerModel) -> some View {
     let remaining = max(activeDuration - scrubValue, 0)
+    let scrubTrackInset: CGFloat = 2
 
-    return VStack(spacing: isScrubbing ? 1 : 0) {
+    return VStack(spacing: isScrubbing ? 3 : 0) {
       if isScrubbing {
         HStack(spacing: 8) {
           Text(formatTime(scrubValue))
@@ -1705,6 +1706,7 @@ struct PlayerScreen: View {
         .lineLimit(1)
         .contentTransition(.numericText())
         .transition(.opacity.combined(with: .move(edge: .bottom)))
+        .padding(.horizontal, scrubTrackInset)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("当前位置 \(formatTime(scrubValue))，剩余 \(formatTime(remaining))")
       }
@@ -1716,7 +1718,7 @@ struct PlayerScreen: View {
         let buffered = min(max(activeBufferedUntil, 0), duration)
         let playedProgress = CGFloat(current / duration)
         let bufferedProgress = CGFloat(buffered / duration)
-        let trackInset: CGFloat = isScrubbing ? 0 : 44
+        let trackInset: CGFloat = isScrubbing ? scrubTrackInset : 42
         let trackWidth = max(width - trackInset * 2, 1)
         let playedX = trackWidth * playedProgress
         let bufferedX = trackWidth * bufferedProgress
@@ -1750,7 +1752,7 @@ struct PlayerScreen: View {
             }
           }
         }
-        .frame(maxHeight: .infinity, alignment: isScrubbing ? .top : .center)
+        .frame(width: width, height: proxy.size.height, alignment: .leading)
         .animation(.spring(response: 0.22, dampingFraction: 0.88), value: isScrubbing)
         .contentShape(Rectangle())
         .gesture(
@@ -1800,7 +1802,7 @@ struct PlayerScreen: View {
             }
         )
       }
-      .frame(height: isScrubbing ? 32 : 44)
+      .frame(height: isScrubbing ? 20 : 40)
     }
     .animation(.spring(response: 0.30, dampingFraction: 0.88, blendDuration: 0.06), value: isScrubbing)
   }
@@ -2708,6 +2710,18 @@ struct PlayerScreen: View {
       : String(format: "%02d:%02d", minutes, secs)
   }
 
+}
+
+private extension View {
+  func settingsSectionCard() -> some View {
+    padding(10)
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .background(.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+      .overlay {
+        RoundedRectangle(cornerRadius: 14, style: .continuous)
+          .stroke(.white.opacity(0.055), lineWidth: 0.6)
+      }
+  }
 }
 
 /// Keeps high-frequency pinch, pan, and interactive-dismiss transforms on a

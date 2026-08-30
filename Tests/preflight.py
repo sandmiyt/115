@@ -98,13 +98,27 @@ check("load(.duration)" not in service and "load(.isPlayable)" not in service,
       "No thumbnail duration/playability preflight")
 check("generator.cancelAllCGImageGeneration()" in service and "asset.cancelLoading()" in service,
       "Cancellation stops AVFoundation reads")
-check("activeSlots.count < 2" in service and "playbackOwners.isEmpty" in service,
+check("maximumNetworkJobs = 3" in service
+      and "activeSlots.count < maximumNetworkJobs" in service
+      and "playbackOwners.isEmpty" in service,
       "Whole network pipeline is bounded and playback-gated")
+check("filter(\\.isVideo)" in service and "withTaskGroup(of: Void.self)" in service,
+      "WebDAV videos participate in concurrent visible-row prefetch")
 check("generation == cacheGeneration" in service and "cacheGeneration = UUID()" in service,
       "Clear invalidates in-flight results")
 check("suspendNetwork(for: thumbnailPlaybackOwner)" in player and "resumeNetwork(for: owner)" in player,
       "Player lifecycle acquires/releases thumbnail priority")
 check("abs(activeCurrentTime - initialPlaybackTime)" in player, "Auxiliary loads wait for playback progress")
+check("let targetScale = min(max(rawScale, 1.0), 5.0)" in player
+      and "if rawScale > 5.0" in player,
+      "Video pinch rests at up to five-times zoom with rubber-band overshoot")
+check(".frame(width: width, height: proxy.size.height, alignment: .leading)" in player
+      and ".padding(.horizontal, scrubTrackInset)" in player
+      and "let trackInset: CGFloat = isScrubbing ? scrubTrackInset : 42" in player,
+      "Scrub times and timeline share one centered coordinate space")
+check(player.count(".settingsSectionCard()") == 7
+      and "VStack(alignment: .leading, spacing: 14)" in player,
+      "Playback settings use compact grouped sections")
 check(project.count("B20260828000000000000001") == 2 and project.count("B20260828000000000000002") == 3,
       "New cache source is referenced by the shipping Xcode target")
 protected = ["Gallery115/Player/PlayerModel.swift", "Gallery115/Player/VLCPlayerView.swift",
@@ -125,6 +139,8 @@ check("orderedItemCache" in provider and '"|sort|" + sortOrder.rawValue' in prov
       "WebDAV globally sorts once per cached directory/order before paging")
 check("<d:creationdate/>" in provider and 'case "creationdate"' in provider,
       "WebDAV requests and parses the standard creation/upload date")
+check("directoryFileIndexCache" in provider and "index.reserveCapacity(entries.count)" in provider,
+      "Sidecar lookup indexes each WebDAV directory once")
 check("sortOrder: CloudItemSortOrder = .updated" in api_client,
       "API pagination defaults to newest-first ordering")
 check("if !Task.isCancelled { metadataMisses.insert(item.id) }" in provider,

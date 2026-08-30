@@ -15,6 +15,7 @@ actor WebDAVProvider: CloudProvider {
   private var memoryCache: [String: [CloudItem]] = [:]
   private var orderedItemCache: [String: [CloudItem]] = [:]
   private var rawDirectoryCache: [String: [CloudItem]] = [:]
+  private var directoryFileIndexCache: [String: [String: CloudItem]] = [:]
   private var metadataCache: [String: LocalMediaMetadata] = [:]
   private var metadataMisses: Set<String> = []
   private var lastRequestAt: Date = .distantPast
@@ -103,6 +104,7 @@ actor WebDAVProvider: CloudProvider {
             logicalPath: path
           )
           rawDirectoryCache.removeValue(forKey: configuration.cacheNamespace + "|raw|" + path)
+          directoryFileIndexCache.removeValue(forKey: configuration.cacheNamespace + "|raw|" + path)
           memoryCache.removeValue(forKey: cacheKey)
           orderedItemCache = orderedItemCache.filter { !$0.key.hasPrefix(cacheKey + "|sort|") }
           metadataCache.removeAll()
@@ -203,18 +205,25 @@ actor WebDAVProvider: CloudProvider {
     }
 
     guard !Task.isCancelled else { return nil }
-    let files = entries.filter { !$0.isDirectory }
     let stem = URL(fileURLWithPath: item.name).deletingPathExtension().lastPathComponent.lowercased()
     // Some WebDAV backends are case-sensitive and may legally contain both
     // Poster.jpg and poster.jpg. Dictionary(uniqueKeysWithValues:) would trap
     // at runtime after lowercasing those names, so keep the first matching file
     // instead of allowing a duplicate-key crash while loading metadata.
-    var byName: [String: CloudItem] = [:]
-    for file in files {
-      let key = file.name.lowercased()
-      if byName[key] == nil {
-        byName[key] = file
+    let byName: [String: CloudItem]
+    if let cached = directoryFileIndexCache[rawKey] {
+      byName = cached
+    } else {
+      var index: [String: CloudItem] = [:]
+      index.reserveCapacity(entries.count)
+      for file in entries where !file.isDirectory {
+        let key = file.name.lowercased()
+        if index[key] == nil {
+          index[key] = file
+        }
       }
+      directoryFileIndexCache[rawKey] = index
+      byName = index
     }
 
     let nfoCandidates = ["\(stem).nfo", "movie.nfo", "tvshow.nfo"]
@@ -354,6 +363,7 @@ actor WebDAVProvider: CloudProvider {
     memoryCache.removeAll()
     orderedItemCache.removeAll()
     rawDirectoryCache.removeAll()
+    directoryFileIndexCache.removeAll()
     metadataCache.removeAll()
     metadataMisses.removeAll()
     try? FileManager.default.removeItem(at: cacheDirectory)

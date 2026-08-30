@@ -1,6 +1,6 @@
 import Foundation
 
-struct CloudItem: Codable, Hashable, Identifiable {
+struct CloudItem: Codable, Hashable, Identifiable, Sendable {
   let id: String
   let parentID: String
   let name: String
