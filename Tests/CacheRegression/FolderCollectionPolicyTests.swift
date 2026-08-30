@@ -40,11 +40,41 @@ final class FolderCollectionPolicyTests: XCTestCase {
     )
   }
 
+  func testNewestAndOldestDateOrders() {
+    let values = [item("middle", date: 200), item("old", date: 100), item("new", date: 300)]
+
+    XCTAssertEqual(CloudItemCollectionPolicy.ordered(values, by: .updated).map(\.id),
+                   ["new", "middle", "old"])
+    XCTAssertEqual(CloudItemCollectionPolicy.ordered(values, by: .oldest).map(\.id),
+                   ["old", "middle", "new"])
+  }
+
+  func testCreationDateTakesPriorityOverOriginalFileModificationDate() {
+    let uploadedNow = item("uploaded-now", date: 10, createdDate: 500)
+    let oldUpload = item("old-upload", date: 1_000, createdDate: 100)
+
+    XCTAssertEqual(
+      CloudItemCollectionPolicy.ordered([oldUpload, uploadedNow], by: .updated).map(\.id),
+      ["uploaded-now", "old-upload"]
+    )
+  }
+
+  func testLargestAndSmallestSizeOrders() {
+    let values = [item("middle", size: 200), item("small", size: 100), item("large", size: 300)]
+
+    XCTAssertEqual(CloudItemCollectionPolicy.ordered(values, by: .size).map(\.id),
+                   ["large", "middle", "small"])
+    XCTAssertEqual(CloudItemCollectionPolicy.ordered(values, by: .sizeAscending).map(\.id),
+                   ["small", "middle", "large"])
+  }
+
   private func item(
     _ id: String,
     name: String? = nil,
     sha1: String = "etag",
-    date: Double = 100
+    size: Int64 = 1_024,
+    date: Double = 100,
+    createdDate: Double? = nil
   ) -> CloudItem {
     CloudItem(
       id: id,
@@ -53,12 +83,13 @@ final class FolderCollectionPolicyTests: XCTestCase {
       isDirectory: false,
       pickCode: id,
       sha1: sha1,
-      size: 1_024,
+      size: size,
       fileExtension: "mp4",
       isVideo: true,
       duration: 0,
       thumbnailURLString: nil,
-      modifiedAt: Date(timeIntervalSince1970: date)
+      modifiedAt: Date(timeIntervalSince1970: date),
+      createdAt: createdDate.map(Date.init(timeIntervalSince1970:))
     )
   }
 }

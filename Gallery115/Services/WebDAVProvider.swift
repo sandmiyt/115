@@ -13,6 +13,7 @@ actor WebDAVProvider: CloudProvider {
   private let store = WebDAVCredentialStore.shared
   private let session: URLSession
   private var memoryCache: [String: [CloudItem]] = [:]
+  private var orderedItemCache: [String: [CloudItem]] = [:]
   private var rawDirectoryCache: [String: [CloudItem]] = [:]
   private var metadataCache: [String: LocalMediaMetadata] = [:]
   private var metadataMisses: Set<String> = []
@@ -56,6 +57,22 @@ actor WebDAVProvider: CloudProvider {
     limit: Int,
     forceRefresh: Bool
   ) async throws -> CloudFolderPage {
+    try await listFolderPage(
+      id: id,
+      offset: offset,
+      limit: limit,
+      forceRefresh: forceRefresh,
+      sortOrder: .updated
+    )
+  }
+
+  func listFolderPage(
+    id: String,
+    offset: Int,
+    limit: Int,
+    forceRefresh: Bool,
+    sortOrder: CloudItemSortOrder
+  ) async throws -> CloudFolderPage {
     guard let configuration = store.configuration else {
       throw CloudProviderError.authenticationRequired("尚未连接 OpenList / AList 媒体源。")
     }
@@ -87,6 +104,7 @@ actor WebDAVProvider: CloudProvider {
           )
           rawDirectoryCache.removeValue(forKey: configuration.cacheNamespace + "|raw|" + path)
           memoryCache.removeValue(forKey: cacheKey)
+          orderedItemCache = orderedItemCache.filter { !$0.key.hasPrefix(cacheKey + "|sort|") }
           metadataCache.removeAll()
           metadataMisses.removeAll()
         }
@@ -108,16 +126,25 @@ actor WebDAVProvider: CloudProvider {
       }
     }
 
-    let start = min(max(offset, 0), allItems.count)
-    let end = min(start + safeLimit, allItems.count)
-    let pageItems = Array(allItems[start..<end])
+    let orderedCacheKey = cacheKey + "|sort|" + sortOrder.rawValue
+    let orderedItems: [CloudItem]
+    if let cached = orderedItemCache[orderedCacheKey], cached.count == allItems.count {
+      orderedItems = cached
+    } else {
+      orderedItems = CloudItemCollectionPolicy.ordered(allItems, by: sortOrder)
+      orderedItemCache[orderedCacheKey] = orderedItems
+    }
+
+    let start = min(max(offset, 0), orderedItems.count)
+    let end = min(start + safeLimit, orderedItems.count)
+    let pageItems = Array(orderedItems[start..<end])
 
     return CloudFolderPage(
       items: pageItems,
       offset: start,
       limit: safeLimit,
-      total: allItems.count,
-      hasMore: end < allItems.count,
+      total: orderedItems.count,
+      hasMore: end < orderedItems.count,
       servedFromCache: servedFromCache
     )
   }
@@ -325,6 +352,7 @@ actor WebDAVProvider: CloudProvider {
 
   func clearMountCache() async {
     memoryCache.removeAll()
+    orderedItemCache.removeAll()
     rawDirectoryCache.removeAll()
     metadataCache.removeAll()
     metadataMisses.removeAll()
@@ -676,6 +704,7 @@ actor WebDAVProvider: CloudProvider {
         <d:displayname/>
         <d:resourcetype/>
         <d:getcontentlength/>
+        <d:creationdate/>
         <d:getlastmodified/>
         <d:getetag/>
         <d:getcontenttype/>
@@ -755,6 +784,7 @@ private final class WebDAVMultiStatusParser: NSObject, XMLParserDelegate {
     var href = ""
     var displayName = ""
     var contentLength: Int64 = 0
+    var creationDate = ""
     var lastModified = ""
     var etag = ""
     var contentType = ""
@@ -813,6 +843,7 @@ private final class WebDAVMultiStatusParser: NSObject, XMLParserDelegate {
     case "href": currentEntry?.href = value
     case "displayname": currentEntry?.displayName = value
     case "getcontentlength": currentEntry?.contentLength = Int64(value) ?? 0
+    case "creationdate": currentEntry?.creationDate = value
     case "getlastmodified": currentEntry?.lastModified = value
     case "getetag": currentEntry?.etag = value.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
     case "getcontenttype": currentEntry?.contentType = value
@@ -855,7 +886,8 @@ private final class WebDAVMultiStatusParser: NSObject, XMLParserDelegate {
       isVideo: isVideo,
       duration: 0,
       thumbnailURLString: nil,
-      modifiedAt: Self.parseHTTPDate(entry.lastModified) ?? .distantPast
+      modifiedAt: Self.parseHTTPDate(entry.lastModified) ?? .distantPast,
+      createdAt: Self.parseCreationDate(entry.creationDate)
     )
   }
 
@@ -899,12 +931,23 @@ private final class WebDAVMultiStatusParser: NSObject, XMLParserDelegate {
 
   private static func parseHTTPDate(_ value: String) -> Date? {
     guard !value.isEmpty else { return nil }
+    return httpDateFormatter.date(from: value)
+  }
+
+  private static func parseCreationDate(_ value: String) -> Date? {
+    guard !value.isEmpty else { return nil }
+    return creationDateFormatter.date(from: value)
+  }
+
+  private static let creationDateFormatter = ISO8601DateFormatter()
+
+  private static let httpDateFormatter: DateFormatter = {
     let formatter = DateFormatter()
     formatter.locale = Locale(identifier: "en_US_POSIX")
     formatter.timeZone = TimeZone(secondsFromGMT: 0)
     formatter.dateFormat = "EEE',' dd MMM yyyy HH':'mm':'ss z"
-    return formatter.date(from: value)
-  }
+    return formatter
+  }()
 
   private static let videoExtensions: Set<String> = [
     "mp4", "m4v", "mov", "mkv", "avi", "flv", "rmvb", "wmv",

@@ -23,13 +23,15 @@ actor APIClient {
     id: String,
     offset: Int,
     limit: Int = 56,
-    forceRefresh: Bool = false
+    forceRefresh: Bool = false,
+    sortOrder: CloudItemSortOrder = .updated
   ) async throws -> CloudFolderPage {
     try await provider.listFolderPage(
       id: id,
       offset: offset,
       limit: limit,
-      forceRefresh: forceRefresh
+      forceRefresh: forceRefresh,
+      sortOrder: sortOrder
     )
   }
 

@@ -4,15 +4,29 @@ import UIKit
 struct FolderView: View {
   enum SortMode: String, CaseIterable, Identifiable {
     case updated
-    case name
+    case oldest
     case size
+    case sizeAscending
+    case name
 
     var id: String { rawValue }
     var title: String {
       switch self {
-      case .updated: return "最近更新"
-      case .name: return "名称"
-      case .size: return "大小"
+      case .updated: return "日期：最新在前"
+      case .oldest: return "日期：最旧在前"
+      case .name: return "名称：A–Z"
+      case .size: return "大小：最大在前"
+      case .sizeAscending: return "大小：最小在前"
+      }
+    }
+
+    var systemImage: String {
+      switch self {
+      case .updated: return "calendar.badge.clock"
+      case .oldest: return "calendar"
+      case .name: return "textformat.abc"
+      case .size: return "arrow.down.circle"
+      case .sizeAscending: return "arrow.up.circle"
       }
     }
   }
@@ -100,35 +114,37 @@ struct FolderView: View {
     }
     .searchable(text: $query, prompt: "搜索当前目录")
     .onChange(of: query) { _, _ in rebuildDisplayItems() }
-    .onChange(of: sortMode) { _, _ in
-      items = CloudItemCollectionPolicy.ordered(items, by: collectionSortOrder)
-      if let searchItems {
-        self.searchItems = CloudItemCollectionPolicy.ordered(searchItems, by: collectionSortOrder)
-      }
-      rebuildDisplayItems()
-    }
     .onChange(of: mediaFilter) { _, _ in rebuildDisplayItems() }
     .onChange(of: appState.libraryStore.favorites.map(\.id)) { _, _ in rebuildDisplayItems() }
-    .task(id: query) { await updateSearchResults() }
+    .task(id: "\(query)|\(sortMode.rawValue)") { await updateSearchResults() }
     .toolbar {
       ToolbarItemGroup(placement: .topBarTrailing) {
         Menu {
-          Picker("筛选", selection: $mediaFilter) {
-            ForEach(MediaFilter.allCases) { filter in
-              Label(filter.title, systemImage: filter.systemImage)
-                .tag(filter)
+          Menu {
+            Picker("筛选", selection: $mediaFilter) {
+              ForEach(MediaFilter.allCases) { filter in
+                Label(filter.title, systemImage: filter.systemImage)
+                  .tag(filter)
+              }
             }
+          } label: {
+            Label("筛选", systemImage: "line.3.horizontal.decrease")
           }
-        } label: {
-          Image(systemName: mediaFilter == .all ? "line.3.horizontal.decrease.circle" : "line.3.horizontal.decrease.circle.fill")
-        }
-        .accessibilityLabel("筛选资料库")
-        .accessibilityValue(mediaFilter.title)
 
-        // Refresh keeps its established position and behavior. The menu behind
-        // a long press still contains the existing view/sort controls.
-        Menu {
-          Section("视图") {
+          Menu {
+            Picker("排序", selection: $sortMode) {
+              ForEach(SortMode.allCases) { mode in
+                Label(mode.title, systemImage: mode.systemImage)
+                  .tag(mode)
+              }
+            }
+          } label: {
+            Label("排序", systemImage: "arrow.up.arrow.down")
+          }
+
+          Divider()
+
+          Menu {
             Button {
               appState.browserLayout = .grid
             } label: {
@@ -147,18 +163,9 @@ struct FolderView: View {
                 Text("列表")
               }
             }
-          }
 
-          Section("排序") {
-            Picker("排序", selection: $sortMode) {
-              ForEach(SortMode.allCases) { mode in
-                Text(mode.title).tag(mode)
-              }
-            }
-          }
-
-          if appState.browserLayout == .grid {
-            Section("封面墙") {
+            if appState.browserLayout == .grid {
+              Divider()
               ForEach([2, 3, 4], id: \.self) { count in
                 Button {
                   setGridColumnsSafely(count)
@@ -171,7 +178,22 @@ struct FolderView: View {
                 }
               }
             }
+          } label: {
+            Label("显示", systemImage: appState.browserLayout == .grid ? "square.grid.2x2" : "list.bullet")
           }
+        } label: {
+          Image(
+            systemName: mediaFilter == .all && sortMode == .updated
+              ? "line.3.horizontal.decrease.circle"
+              : "line.3.horizontal.decrease.circle.fill"
+          )
+        }
+        .accessibilityLabel("筛选与排序")
+        .accessibilityValue("\(mediaFilter.title)，\(sortMode.title)")
+
+        Button {
+          guard !isRefreshing else { return }
+          Task { await refreshCurrentFolder() }
         } label: {
           if isRefreshing {
             ProgressView()
@@ -179,13 +201,10 @@ struct FolderView: View {
           } else {
             Image(systemName: "arrow.clockwise")
           }
-        } primaryAction: {
-          guard !isRefreshing else { return }
-          Task { await refreshCurrentFolder() }
         }
         .disabled(isRefreshing)
         .accessibilityLabel(isRefreshing ? "正在刷新资料库" : "刷新资料库")
-        .accessibilityHint("轻点立即刷新；长按可调整视图和排序")
+        .accessibilityHint("重新读取新增或删除的媒体")
       }
     }
     .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -216,7 +235,7 @@ struct FolderView: View {
         showMediaSetup = false
       }
     }
-    .task(id: "\(folderID)|\(appState.isConfigured)|\(appState.isAppUnlocked)") {
+    .task(id: "\(folderID)|\(appState.isConfigured)|\(appState.isAppUnlocked)|\(sortMode.rawValue)") {
       guard appState.isAppUnlocked else { return }
       if appState.isConfigured {
         await loadFirstPage(forceRefresh: false)
@@ -467,8 +486,10 @@ struct FolderView: View {
   private var collectionSortOrder: CloudItemSortOrder {
     switch sortMode {
     case .updated: return .updated
+    case .oldest: return .oldest
     case .name: return .name
     case .size: return .size
+    case .sizeAscending: return .sizeAscending
     }
   }
 
@@ -498,7 +519,8 @@ struct FolderView: View {
           id: folderID,
           offset: offset,
           limit: pageSize,
-          forceRefresh: offset == 0
+          forceRefresh: offset == 0,
+          sortOrder: collectionSortOrder
         )
         lastPage = page
         refreshed.append(contentsOf: page.items)
@@ -547,7 +569,8 @@ struct FolderView: View {
         id: folderID,
         offset: 0,
         limit: pageSize,
-        forceRefresh: forceRefresh
+        forceRefresh: forceRefresh,
+        sortOrder: collectionSortOrder
       )
       guard revision == pagingRevision, !Task.isCancelled else { return }
       items = CloudItemCollectionPolicy.ordered(page.items, by: collectionSortOrder)
@@ -584,7 +607,8 @@ struct FolderView: View {
         id: folderID,
         offset: 0,
         limit: pageSize,
-        forceRefresh: true
+        forceRefresh: true,
+        sortOrder: collectionSortOrder
       )
       guard !Task.isCancelled else { return }
       items = CloudItemCollectionPolicy.mergingFirstPage(
@@ -653,7 +677,8 @@ struct FolderView: View {
         id: folderID,
         offset: requestedOffset,
         limit: pageSize,
-        forceRefresh: false
+        forceRefresh: false,
+        sortOrder: collectionSortOrder
       )
       guard revision == pagingRevision, requestedOffset == nextOffset, !Task.isCancelled else { return }
       items = CloudItemCollectionPolicy.appendingPage(

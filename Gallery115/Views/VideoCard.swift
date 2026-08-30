@@ -164,13 +164,14 @@ struct VideoArtwork: View {
       let identity = itemThumbnailIdentity
       if loadedIdentity == identity, cachedImage != nil { return }
       activeRequestIdentity = identity
-      if loadedIdentity != identity { cachedImage = nil }
       isLoading = false
-      // Disk/memory hits should not flash a spinner or replay a fade-in.
+      // Keep already-rendered artwork visible during a directory refresh. A
+      // changed/revalidated thumbnail replaces it only after the new image is
+      // ready, so existing cards never fall back to placeholders together.
       let spinner = Task { @MainActor in
         do { try await Task.sleep(nanoseconds: 180_000_000) }
         catch { return }
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled, cachedImage == nil else { return }
         isLoading = true
       }
       defer {
@@ -185,7 +186,9 @@ struct VideoArtwork: View {
         spinner.cancel()
       }
       guard !Task.isCancelled else { return }
-      withAnimation(isLoading ? .easeOut(duration: 0.16) : nil) {
+      guard let image else { return }
+      let shouldFadeIn = cachedImage == nil && isLoading
+      withAnimation(shouldFadeIn ? .easeOut(duration: 0.16) : nil) {
         cachedImage = image
         loadedIdentity = identity
         isLoading = false
@@ -194,7 +197,11 @@ struct VideoArtwork: View {
   }
 
   private var itemThumbnailIdentity: String {
-    "\(item.id)|\(item.size)|\(item.modifiedAt.timeIntervalSince1970)"
+    // WebDAV/OpenList may normalize modification timestamps during a forced
+    // directory refresh even when the underlying file is unchanged. ID + size
+    // keeps the visible card stable; the durable cache still includes mtime and
+    // therefore continues to invalidate replaced files across launches.
+    "\(item.id)|\(item.size)"
   }
 
   @ViewBuilder

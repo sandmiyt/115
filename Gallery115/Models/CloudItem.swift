@@ -13,6 +13,42 @@ struct CloudItem: Codable, Hashable, Identifiable {
   let duration: Double
   let thumbnailURLString: String?
   let modifiedAt: Date
+  let createdAt: Date?
+
+  init(
+    id: String,
+    parentID: String,
+    name: String,
+    isDirectory: Bool,
+    pickCode: String,
+    sha1: String,
+    size: Int64,
+    fileExtension: String,
+    isVideo: Bool,
+    duration: Double,
+    thumbnailURLString: String?,
+    modifiedAt: Date,
+    createdAt: Date? = nil
+  ) {
+    self.id = id
+    self.parentID = parentID
+    self.name = name
+    self.isDirectory = isDirectory
+    self.pickCode = pickCode
+    self.sha1 = sha1
+    self.size = size
+    self.fileExtension = fileExtension
+    self.isVideo = isVideo
+    self.duration = duration
+    self.thumbnailURLString = thumbnailURLString
+    self.modifiedAt = modifiedAt
+    self.createdAt = createdAt
+  }
+
+  /// WebDAV creation time is the closest standard signal for when an item was
+  /// added to OpenList. Older servers omit it, so modification time remains the
+  /// compatible fallback.
+  var librarySortDate: Date { createdAt ?? modifiedAt }
 
   var thumbnailURL: URL? {
     guard let thumbnailURLString, !thumbnailURLString.isEmpty else { return nil }
@@ -54,10 +90,12 @@ struct CloudItem: Codable, Hashable, Identifiable {
   ]
 }
 
-enum CloudItemSortOrder: String, CaseIterable {
+enum CloudItemSortOrder: String, CaseIterable, Sendable {
   case updated
+  case oldest
   case name
   case size
+  case sizeAscending
 }
 
 /// Keeps a paged media collection stable while more rows arrive.
@@ -114,12 +152,16 @@ enum CloudItemCollectionPolicy {
 
     switch order {
     case .updated:
-      if lhs.modifiedAt != rhs.modifiedAt { return lhs.modifiedAt > rhs.modifiedAt }
+      if lhs.librarySortDate != rhs.librarySortDate { return lhs.librarySortDate > rhs.librarySortDate }
+    case .oldest:
+      if lhs.librarySortDate != rhs.librarySortDate { return lhs.librarySortDate < rhs.librarySortDate }
     case .name:
       let comparison = lhs.name.localizedStandardCompare(rhs.name)
       if comparison != .orderedSame { return comparison == .orderedAscending }
     case .size:
       if lhs.size != rhs.size { return lhs.size > rhs.size }
+    case .sizeAscending:
+      if lhs.size != rhs.size { return lhs.size < rhs.size }
     }
 
     // A total tie-breaker prevents equal dates/sizes from being reshuffled by
