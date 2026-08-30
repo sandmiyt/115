@@ -59,11 +59,30 @@ actor Cloud115Provider: CloudProvider {
     limit: Int,
     forceRefresh: Bool
   ) async throws -> CloudFolderPage {
+    try await listFolderPage(
+      id: id,
+      offset: offset,
+      limit: limit,
+      forceRefresh: forceRefresh,
+      sortOrder: .updated
+    )
+  }
+
+  func listFolderPage(
+    id: String,
+    offset: Int,
+    limit: Int,
+    forceRefresh: Bool,
+    sortOrder: CloudItemSortOrder
+  ) async throws -> CloudFolderPage {
     let safeOffset = max(offset, 0)
     let safeLimit = min(max(limit, 1), 56)
+    let remoteSort = remoteSortParameters(for: sortOrder)
 
     if !forceRefresh,
-      let cached = mountCache.page(folderID: id, offset: safeOffset, limit: safeLimit),
+      let cached = mountCache.page(
+        folderID: id, offset: safeOffset, limit: safeLimit, sortKey: sortOrder.rawValue
+      ),
       Date().timeIntervalSince(cached.savedAt) < 300
     {
       return cached.folderPage(servedFromCache: true)
@@ -77,8 +96,8 @@ actor Cloud115Provider: CloudProvider {
           "cid": id,
           "limit": String(safeLimit),
           "offset": String(safeOffset),
-          "asc": "0",
-          "o": "user_utime",
+          "asc": remoteSort.asc,
+          "o": remoteSort.field,
           "custom_order": "0",
           "stdir": "1",
           "star": "0",
@@ -100,7 +119,8 @@ actor Cloud115Provider: CloudProvider {
         folderID: id,
         offset: safeOffset,
         limit: safeLimit,
-        items: parsed.items.filter { $0.isDirectory || $0.isVideo },
+        sortKey: sortOrder.rawValue,
+        items: parsed.items.filter { $0.isDirectory || $0.isVideo || $0.isPhoto },
         total: total,
         hasMore: hasMore,
         savedAt: Date()
@@ -110,10 +130,24 @@ actor Cloud115Provider: CloudProvider {
     } catch {
       // A mounted source should remain browsable during temporary 115/WAF failures.
       // Prefer stale data over replacing a working library with an error screen.
-      if let cached = mountCache.page(folderID: id, offset: safeOffset, limit: safeLimit) {
+      if let cached = mountCache.page(
+        folderID: id, offset: safeOffset, limit: safeLimit, sortKey: sortOrder.rawValue
+      ) {
         return cached.folderPage(servedFromCache: true)
       }
       throw error
+    }
+  }
+
+  private func remoteSortParameters(
+    for order: CloudItemSortOrder
+  ) -> (field: String, asc: String) {
+    switch order {
+    case .updated: return ("user_utime", "0")
+    case .oldest: return ("user_utime", "1")
+    case .name: return ("file_name", "1")
+    case .size: return ("file_size", "0")
+    case .sizeAscending: return ("file_size", "1")
     }
   }
 
@@ -143,9 +177,10 @@ actor Cloud115Provider: CloudProvider {
       transcodeError = error
     }
 
-    if let original = try? await originalSource(pickCode: item.pickCode) {
+    do {
+      let original = try await originalSource(pickCode: item.pickCode)
       sources.append(original)
-    }
+    } catch {}
 
     let unique = Dictionary(grouping: sources, by: \.id).compactMap { $0.value.first }
     let sorted = unique.sorted { lhs, rhs in
@@ -499,7 +534,8 @@ actor Cloud115Provider: CloudProvider {
 
     let isDirectory = fc == "0"
     let isVideo = isVideoFlag == 1 || Self.videoExtensions.contains(fileExtension.lowercased())
-    guard isDirectory || isVideo else { return nil }
+    let isPhoto = Self.photoExtensions.contains(fileExtension.lowercased())
+    guard isDirectory || isVideo || isPhoto else { return nil }
     guard !fid.isEmpty || !pickCode.isEmpty else { return nil }
 
     let thumbnail = [videoImage, thumb, fco].first(where: { !$0.isEmpty })
@@ -549,6 +585,10 @@ actor Cloud115Provider: CloudProvider {
   private static let videoExtensions: Set<String> = [
     "mp4", "mkv", "mov", "m4v", "avi", "flv", "rmvb", "wmv", "m2ts", "mts", "ts", "webm",
   ]
+
+  private static let photoExtensions: Set<String> = [
+    "jpg", "jpeg", "png", "heic", "heif", "webp", "gif", "tif", "tiff", "bmp", "avif",
+  ]
 }
 
 private struct Cloud115Status {
@@ -567,6 +607,7 @@ private struct CachedCloud115Page: Codable {
   let folderID: String
   let offset: Int
   let limit: Int
+  let sortKey: String
   let items: [CloudItem]
   let total: Int?
   let hasMore: Bool
@@ -595,10 +636,10 @@ private final class Cloud115MountCache: @unchecked Sendable {
     try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
   }
 
-  func page(folderID: String, offset: Int, limit: Int) -> CachedCloud115Page? {
+  func page(folderID: String, offset: Int, limit: Int, sortKey: String) -> CachedCloud115Page? {
     lock.lock()
     defer { lock.unlock() }
-    let url = fileURL(folderID: folderID, offset: offset, limit: limit)
+    let url = fileURL(folderID: folderID, offset: offset, limit: limit, sortKey: sortKey)
     guard let data = try? Data(contentsOf: url) else { return nil }
     return try? JSONDecoder().decode(CachedCloud115Page.self, from: data)
   }
@@ -608,7 +649,12 @@ private final class Cloud115MountCache: @unchecked Sendable {
     defer { lock.unlock() }
     guard let data = try? JSONEncoder().encode(page) else { return }
     try? data.write(
-      to: fileURL(folderID: page.folderID, offset: page.offset, limit: page.limit),
+      to: fileURL(
+        folderID: page.folderID,
+        offset: page.offset,
+        limit: page.limit,
+        sortKey: page.sortKey
+      ),
       options: .atomic
     )
   }
@@ -620,11 +666,11 @@ private final class Cloud115MountCache: @unchecked Sendable {
     try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
   }
 
-  private func fileURL(folderID: String, offset: Int, limit: Int) -> URL {
+  private func fileURL(folderID: String, offset: Int, limit: Int, sortKey: String) -> URL {
     let safeID = folderID.unicodeScalars.map { scalar in
       CharacterSet.alphanumerics.contains(scalar) ? String(scalar) : "_"
     }.joined()
-    return directory.appending(path: "page-\(safeID)-\(offset)-\(limit).json")
+    return directory.appending(path: "page-\(safeID)-\(sortKey)-\(offset)-\(limit).json")
   }
 }
 

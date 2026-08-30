@@ -8,7 +8,7 @@ import secrets
 import sqlite3
 import time
 from contextlib import contextmanager
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import httpx
 from cryptography.fernet import Fernet
@@ -21,21 +21,34 @@ app = APP
 CLIENT_ID = os.environ.get("CINEVA_115_CLIENT_ID", "").strip()
 CLIENT_SECRET = os.environ.get("CINEVA_115_CLIENT_SECRET", "").strip()
 PUBLIC_BASE_URL = os.environ.get("CINEVA_115_PUBLIC_BASE_URL", "").strip().rstrip("/")
+APP_CALLBACK_URL = os.environ.get(
+    "CINEVA_115_APP_CALLBACK_URL", "cineva115://oauth/115"
+).strip()
 SIGNING_SECRET = os.environ.get("CINEVA_AUTH_SIGNING_SECRET", "").encode("utf-8")
 DB_PATH = os.environ.get("CINEVA_AUTH_DB", "/data/cineva-auth.sqlite3")
 REFRESH_CACHE_TTL = 24 * 60 * 60
 STATE_TTL = 10 * 60
+AUTH_SESSION_TTL = 5 * 60
 REFRESH_URL = "https://qrcodeapi.115.com/open/refreshToken"
 AUTHORIZE_URL = "https://qrcodeapi.115.com/open/authorize"
 TOKEN_URL = "https://qrcodeapi.115.com/open/authCodeToToken"
 _refresh_lock = asyncio.Lock()
+_session_lock = asyncio.Lock()
 
 
 def _require_config() -> None:
-    if not CLIENT_ID or not CLIENT_SECRET or not PUBLIC_BASE_URL or len(SIGNING_SECRET) < 24:
+    if (
+        not CLIENT_ID
+        or not CLIENT_SECRET
+        or not PUBLIC_BASE_URL
+        or len(SIGNING_SECRET) < 24
+    ):
         raise HTTPException(status_code=503, detail="Cineva 115 authorization service is not configured")
     if not PUBLIC_BASE_URL.lower().startswith("https://"):
         raise HTTPException(status_code=503, detail="CINEVA_115_PUBLIC_BASE_URL must use HTTPS")
+    callback = urlparse(APP_CALLBACK_URL)
+    if callback.scheme.lower() != "cineva115":
+        raise HTTPException(status_code=503, detail="CINEVA_115_APP_CALLBACK_URL must use cineva115://")
 
 
 def _fernet() -> Fernet:
@@ -53,6 +66,10 @@ def _db():
         conn.execute(
             "CREATE TABLE IF NOT EXISTS refresh_cache ("
             "old_hash TEXT PRIMARY KEY, encrypted_response BLOB NOT NULL, created_at INTEGER NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS authorization_sessions ("
+            "ticket_hash TEXT PRIMARY KEY, encrypted_response BLOB NOT NULL, created_at INTEGER NOT NULL)"
         )
         yield conn
         conn.commit()
@@ -86,6 +103,39 @@ def _cache_put(old_hash: str, payload: dict) -> None:
             "INSERT OR REPLACE INTO refresh_cache(old_hash, encrypted_response, created_at) VALUES(?,?,?)",
             (old_hash, encrypted, int(time.time())),
         )
+
+
+def _authorization_session_put(payload: dict) -> str:
+    ticket = secrets.token_urlsafe(32)
+    encrypted = _fernet().encrypt(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    with _db() as conn:
+        conn.execute(
+            "INSERT INTO authorization_sessions(ticket_hash, encrypted_response, created_at) "
+            "VALUES(?,?,?)",
+            (_token_hash(ticket), encrypted, int(time.time())),
+        )
+    return ticket
+
+
+def _authorization_session_take(ticket: str):
+    cutoff = int(time.time()) - AUTH_SESSION_TTL
+    ticket_hash = _token_hash(ticket)
+    with _db() as conn:
+        conn.execute("DELETE FROM authorization_sessions WHERE created_at < ?", (cutoff,))
+        row = conn.execute(
+            "SELECT encrypted_response FROM authorization_sessions WHERE ticket_hash = ?",
+            (ticket_hash,),
+        ).fetchone()
+        if row:
+            conn.execute(
+                "DELETE FROM authorization_sessions WHERE ticket_hash = ?", (ticket_hash,)
+            )
+    if not row:
+        return None
+    try:
+        return json.loads(_fernet().decrypt(row[0]).decode("utf-8"))
+    except Exception:
+        return None
 
 
 def _make_state() -> str:
@@ -169,9 +219,23 @@ async def authorization_callback(code: str = Query(""), state: str = Query("")):
     except Exception as exc:
         raise HTTPException(status_code=502, detail="Invalid response from 115") from exc
     token_payload = _extract_token_payload(obj)
-    raw = json.dumps(token_payload, separators=(",", ":")).encode("utf-8")
-    fragment = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-    return RedirectResponse(PUBLIC_BASE_URL + "/115cloud/complete#" + fragment, status_code=302)
+    ticket = _authorization_session_put(token_payload)
+    separator = "&" if "?" in APP_CALLBACK_URL else "?"
+    callback_url = APP_CALLBACK_URL + separator + urlencode({"ticket": ticket})
+    return RedirectResponse(callback_url, status_code=302)
+
+
+@app.post("/115cloud/session")
+async def exchange_authorization_ticket(ticket: str = Form(...)):
+    _require_config()
+    normalized = ticket.strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="ticket is required")
+    async with _session_lock:
+        payload = _authorization_session_take(normalized)
+    if payload is None:
+        raise HTTPException(status_code=401, detail="Authorization ticket is invalid or expired")
+    return JSONResponse({"state": True, "data": payload}, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/115cloud/complete")

@@ -43,6 +43,11 @@ actor ThumbnailService {
   }
 
   nonisolated static func currentNamespace() -> String {
+    if MediaSourceSelectionStore.shared.resolvedSource == .cloud115 {
+      // One 115 account can be active at a time and its credentials never enter
+      // the cache key. Disconnecting an account clears the in-memory generation.
+      return "115-open-api-v1"
+    }
     guard let config = WebDAVCredentialStore.shared.configuration else { return "unconfigured" }
     // Full endpoint includes scheme, port and base path. Never include passwords.
     return [config.normalizedWebDAVURL?.absoluteString ?? config.serverURL,
@@ -153,6 +158,19 @@ actor ThumbnailService {
       logger.error("Unable to clear durable artwork: \(error.localizedDescription, privacy: .private)")
       return false
     }
+  }
+
+  /// Cancel work tied to the previous provider while retaining durable artwork.
+  /// A provider-specific namespace prevents the next source from reading it.
+  func resetForSourceChange() {
+    cacheGeneration = UUID()
+    for work in inFlight.values { work.task.cancel() }
+    inFlight.removeAll()
+    failedUntil.removeAll()
+    memoryCache.removeAllObjects()
+    for waiter in slotWaiters { waiter.continuation.resume(returning: false) }
+    slotWaiters.removeAll()
+    activeSlots.removeAll()
   }
 
   private func localImage(_ identity: ArtworkIdentity) -> UIImage? {

@@ -262,7 +262,7 @@ struct FolderView: View {
     ContentUnavailableView {
       Label("尚未连接媒体源", systemImage: "externaldrive.badge.plus")
     } description: {
-      Text("先进入 Cineva，再连接你自己的 OpenList / AList。连接成功后，这里会显示你的 115 媒体库。")
+      Text("可使用 115 官方授权直接连接，也可以继续使用自己的 OpenList / AList。")
     } actions: {
       Button("连接媒体源") {
         showMediaSetup = true

@@ -8,3 +8,5 @@ Payload/
 *.ipa
 *.xcresult/
 __pycache__/
+cineva-auth-server/.env
+cineva-auth-server/*.sqlite3

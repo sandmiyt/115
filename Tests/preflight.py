@@ -26,6 +26,9 @@ sources = [
     "Tests/CacheRegression/FolderCollectionPolicyTests.swift",
     "Gallery115/Models/CloudItem.swift", "Gallery115/Views/FolderView.swift",
     "Gallery115/Services/APIClient.swift",
+    "Gallery115/Services/Cloud115AuthManager.swift",
+    "Gallery115/Services/Cloud115Provider.swift",
+    "Gallery115/Views/SetupView.swift",
     "Gallery115/Services/WebDAVProvider.swift",
 ]
 for name in sources:
@@ -123,10 +126,19 @@ check(project.count("B20260828000000000000001") == 2 and project.count("B2026082
       "New cache source is referenced by the shipping Xcode target")
 protected = ["Gallery115/Player/PlayerModel.swift", "Gallery115/Player/VLCPlayerView.swift",
              "Gallery115/Player/SystemPlayerView.swift",
-             "Gallery115/Services/KeychainStore.swift", "Gallery115/Services/LibraryStore.swift"]
+             "Gallery115/Services/LibraryStore.swift"]
 unchanged = subprocess.run(["git", "diff", "--exit-code", "--", *protected], cwd=ROOT,
                            capture_output=True).returncode == 0
-check(unchanged, "Playback core, credentials and library business logic unchanged")
+keychain = (ROOT / "Gallery115/Services/KeychainStore.swift").read_text(encoding="utf-8")
+original_keychain = subprocess.check_output(
+    ["git", "show", "HEAD:Gallery115/Services/KeychainStore.swift"], cwd=ROOT
+).decode("utf-8")
+def token_storage(text):
+    start = text.index("struct Cloud115Session")
+    end = text.index("\n\nenum MediaSourceKind")
+    return text[start:end]
+check(unchanged and token_storage(keychain) == token_storage(original_keychain),
+      "Playback core, token storage and library business logic unchanged")
 provider = (ROOT / "Gallery115/Services/WebDAVProvider.swift").read_text(encoding="utf-8")
 api_client = (ROOT / "Gallery115/Services/APIClient.swift").read_text(encoding="utf-8")
 app_state = (ROOT / "Gallery115/App/AppState.swift").read_text(encoding="utf-8")
@@ -144,6 +156,26 @@ check("directoryFileIndexCache" in provider and "index.reserveCapacity(entries.c
       "Sidecar lookup indexes each WebDAV directory once")
 check("sortOrder: CloudItemSortOrder = .updated" in api_client,
       "API pagination defaults to newest-first ordering")
+cloud_auth = (ROOT / "Gallery115/Services/Cloud115AuthManager.swift").read_text(encoding="utf-8")
+cloud_provider = (ROOT / "Gallery115/Services/Cloud115Provider.swift").read_text(encoding="utf-8")
+auth_server = (ROOT / "cineva-auth-server/main.py").read_text(encoding="utf-8")
+info_plist = (ROOT / "Gallery115/Info.plist").read_text(encoding="utf-8")
+check("case .webDAV:" in api_client and "case .cloud115:" in api_client
+      and "Cloud115Provider.shared" in api_client,
+      "API facade routes both WebDAV and official 115 sources")
+check("ASWebAuthenticationSession" in cloud_auth and 'callbackURLScheme: "cineva115"' in cloud_auth
+      and '"ticket": ticket' in cloud_auth,
+      "115 login uses the system authorization sheet and a one-time ticket")
+check('@app.post("/115cloud/session")' in auth_server
+      and "_authorization_session_take" in auth_server
+      and "DELETE FROM authorization_sessions WHERE ticket_hash" in auth_server,
+      "Authorization broker consumes login tickets once")
+check("cineva115" in info_plist and "CFBundleURLSchemes" in info_plist,
+      "115 authorization callback scheme is registered")
+check('case .updated: return ("user_utime", "0")' in cloud_provider
+      and 'case .size: return ("file_size", "0")' in cloud_provider
+      and "sortKey: sortOrder.rawValue" in cloud_provider,
+      "115 pagination sorting and cache identity stay aligned")
 check("if !Task.isCancelled { metadataMisses.insert(item.id) }" in provider,
       "Cancelled artwork discovery cannot poison metadata miss cache")
 authentication = app_state.split("  private func authenticate(reason:", 1)[1].split("  private enum Keys", 1)[0]

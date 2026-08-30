@@ -129,7 +129,7 @@ private struct MediaSourceSettingsView: View {
           Button {
             showMediaSetup = true
           } label: {
-            Label("连接 OpenList / AList", systemImage: "externaldrive.badge.plus")
+            Label("添加媒体源", systemImage: "externaldrive.badge.plus")
           }
         }
 
@@ -157,13 +157,34 @@ private struct MediaSourceSettingsView: View {
       }
       Button("取消", role: .cancel) {}
     } message: {
-      Text("只会移除 Cineva 保存的 WebDAV 登录信息，不会删除 OpenList 中挂载的任何文件。")
+      Text(disconnectMessage)
     }
   }
 
   @ViewBuilder
   private var connectionSummary: some View {
-    if let configuration = WebDAVCredentialStore.shared.configuration {
+    if appState.isConfigured, appState.mediaSourceKind == .cloud115 {
+      HStack(spacing: 11) {
+        Image(systemName: "checkmark.circle.fill")
+          .font(.title3)
+          .foregroundStyle(.green)
+
+        VStack(alignment: .leading, spacing: 3) {
+          Text("115 网盘已连接")
+            .font(.subheadline.weight(.semibold))
+          Text("通过 115 官方开放平台读取媒体")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+      }
+
+      LabeledContent("读取方式", value: "115 Open API")
+      Text("登录令牌保存在本机钥匙串，设置页不会显示任何凭据。")
+        .font(.caption)
+        .foregroundStyle(.secondary)
+    } else if appState.isConfigured,
+      let configuration = WebDAVCredentialStore.shared.configuration
+    {
       HStack(spacing: 11) {
         Image(systemName: "checkmark.circle.fill")
           .font(.title3)
@@ -196,6 +217,15 @@ private struct MediaSourceSettingsView: View {
     }
   }
 
+  private var disconnectMessage: String {
+    switch appState.mediaSourceKind {
+    case .cloud115:
+      return "只会移除 Cineva 保存在本机钥匙串中的 115 授权，不会删除网盘里的任何文件。"
+    case .webDAV:
+      return "只会移除 Cineva 保存的 WebDAV 登录信息，不会删除 OpenList 中挂载的任何文件。"
+    }
+  }
+
   private func checkConnection() {
     guard !isCheckingConnection else { return }
     isCheckingConnection = true
@@ -204,7 +234,7 @@ private struct MediaSourceSettingsView: View {
       do {
         try await appState.api.validateCredentials()
         await MainActor.run {
-          statusMessage = "OpenList / AList 连接正常。"
+          statusMessage = "\(appState.mediaSourceKind.title)连接正常。"
           appState.markMediaConnected()
           isCheckingConnection = false
         }
@@ -508,13 +538,13 @@ private struct AboutSettingsView: View {
           CinevaLogoMark(size: 42)
           VStack(alignment: .leading, spacing: 2) {
             Text("Cineva").font(.headline)
-            Text("OpenList / AList 私人影音播放器")
+            Text("115 网盘与 OpenList 私人影音播放器")
               .font(.caption)
               .foregroundStyle(.secondary)
           }
         }
-        LabeledContent("版本", value: "2.2.0")
-        LabeledContent("挂载协议", value: "WebDAV")
+        LabeledContent("版本", value: "2.2.2")
+        LabeledContent("媒体协议", value: "115 Open API + WebDAV")
         LabeledContent("播放内核", value: "AVPlayer + VLC")
       }
     }

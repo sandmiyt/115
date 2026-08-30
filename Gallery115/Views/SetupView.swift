@@ -8,8 +8,10 @@ struct SetupView: View {
   @State private var username = ""
   @State private var password = ""
   @State private var rootPath = "/115"
+  @State private var selectedSource: MediaSourceKind = .cloud115
   @State private var isConnecting = false
   @State private var errorMessage: String?
+  @State private var authorizationCoordinator: Cloud115AuthorizationCoordinator?
 
   var body: some View {
     NavigationStack {
@@ -28,7 +30,15 @@ struct SetupView: View {
             }
           }
 
-          webDAVSetup
+          sourcePicker
+
+          Group {
+            switch selectedSource {
+            case .cloud115: cloud115Setup
+            case .webDAV: webDAVSetup
+            }
+          }
+          .transition(.opacity.combined(with: .scale(scale: 0.98)))
 
           Spacer(minLength: 22)
         }
@@ -44,6 +54,10 @@ struct SetupView: View {
       }
       .onAppear {
         loadStoredConfiguration()
+        selectedSource = appState.isConfigured ? appState.mediaSourceKind : .cloud115
+      }
+      .onDisappear {
+        authorizationCoordinator?.cancel()
       }
       .alert(
         "连接失败",
@@ -57,6 +71,76 @@ struct SetupView: View {
         Text(errorMessage ?? "未知错误")
       }
     }
+  }
+
+  private var sourcePicker: some View {
+    Picker("媒体源", selection: $selectedSource) {
+      Label("115 网盘", systemImage: "externaldrive.badge.icloud")
+        .tag(MediaSourceKind.cloud115)
+      Label("OpenList", systemImage: "server.rack")
+        .tag(MediaSourceKind.webDAV)
+    }
+    .pickerStyle(.segmented)
+    .disabled(isConnecting)
+    .animation(.easeOut(duration: 0.22), value: selectedSource)
+  }
+
+  private var cloud115Setup: some View {
+    VStack(spacing: 16) {
+      VStack(spacing: 13) {
+        Image(systemName: "externaldrive.badge.icloud")
+          .font(.system(size: 34, weight: .medium))
+          .foregroundStyle(CinevaTheme.brandGradient)
+          .frame(width: 66, height: 66)
+          .background(
+            Color(uiColor: .secondarySystemBackground),
+            in: RoundedRectangle(cornerRadius: 20, style: .continuous)
+          )
+
+        VStack(spacing: 6) {
+          Text("直接连接 115 网盘")
+            .font(.title3.weight(.semibold))
+          Text("使用 115 官方授权登录，无需填写密码，也不依赖 OpenList 中转。")
+            .font(.subheadline)
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.center)
+        }
+      }
+      .padding(.top, 8)
+
+      Button(action: connectCloud115) {
+        HStack(spacing: 9) {
+          if isConnecting {
+            ProgressView().tint(.white)
+          } else {
+            Image(systemName: "person.crop.circle.badge.checkmark")
+            Text("授权连接 115 网盘").fontWeight(.semibold)
+          }
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 56)
+        .foregroundStyle(.white)
+        .background(
+          CinevaTheme.brandGradient,
+          in: RoundedRectangle(cornerRadius: 18, style: .continuous)
+        )
+      }
+      .buttonStyle(.plain)
+      .disabled(isConnecting)
+
+      VStack(spacing: 5) {
+        Label("登录在 iOS 系统安全授权页中完成", systemImage: "checkmark.shield.fill")
+        Text("Cineva 不会读取或保存你的 115 密码；授权令牌保存在本机钥匙串。")
+      }
+      .font(.footnote)
+      .foregroundStyle(.secondary)
+      .multilineTextAlignment(.center)
+    }
+    .padding(18)
+    .background(
+      Color(uiColor: .secondarySystemGroupedBackground),
+      in: RoundedRectangle(cornerRadius: 24, style: .continuous)
+    )
   }
 
   private var webDAVSetup: some View {
@@ -183,6 +267,34 @@ struct SetupView: View {
         }
       } catch {
         await MainActor.run {
+          errorMessage = error.localizedDescription
+          isConnecting = false
+        }
+      }
+    }
+  }
+
+  private func connectCloud115() {
+    guard !isConnecting else { return }
+    isConnecting = true
+    errorMessage = nil
+    let coordinator = Cloud115AuthorizationCoordinator()
+    authorizationCoordinator = coordinator
+
+    Task {
+      do {
+        try await coordinator.authorize()
+        try await appState.api.validateCloud115Credentials()
+        await MainActor.run {
+          appState.finishConfiguration(source: .cloud115, rootFolderID: "0")
+          appState.markMediaConnected()
+          authorizationCoordinator = nil
+          isConnecting = false
+          dismiss()
+        }
+      } catch {
+        await MainActor.run {
+          authorizationCoordinator = nil
           errorMessage = error.localizedDescription
           isConnecting = false
         }

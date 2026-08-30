@@ -274,12 +274,18 @@ final class AppState {
       ?? .highestTranscode
     colorSchemePreference =
       ColorSchemePreference(rawValue: defaults.string(forKey: Keys.colorScheme) ?? "") ?? .system
-    MediaSourceSelectionStore.shared.activeSource = .webDAV
-    mediaSourceKind = .webDAV
-    isConfigured = WebDAVCredentialStore.shared.isConfigured
-    rootFolderID = WebDAVCredentialStore.shared.configuration?.normalizedRootPath
-      ?? defaults.string(forKey: Keys.rootFolderID)
-      ?? "/115"
+    let sourceStore = MediaSourceSelectionStore.shared
+    let source = sourceStore.resolvedSource
+    mediaSourceKind = source
+    isConfigured = sourceStore.isConfigured(source)
+    switch source {
+    case .cloud115:
+      rootFolderID = "0"
+    case .webDAV:
+      rootFolderID = WebDAVCredentialStore.shared.configuration?.normalizedRootPath
+        ?? defaults.string(forKey: Keys.rootFolderID)
+        ?? "/115"
+    }
     faceIDEnabled = defaults.bool(forKey: Keys.faceIDEnabled)
     playerGesturesEnabled = defaults.object(forKey: Keys.playerGesturesEnabled) as? Bool ?? true
     autoPlayNextEpisode = defaults.object(forKey: Keys.autoPlayNextEpisode) as? Bool ?? true
@@ -303,16 +309,22 @@ final class AppState {
   }
 
   func finishConfiguration(source: MediaSourceKind, rootFolderID: String) {
-    // Cineva currently uses OpenList/AList WebDAV as its user-facing media source.
-    // Keep the source parameter for source compatibility with older call sites,
-    // but never switch the running app back to 115 OAuth.
-    MediaSourceSelectionStore.shared.activeSource = .webDAV
-    mediaSourceKind = .webDAV
+    MediaSourceSelectionStore.shared.activeSource = source
+    mediaSourceKind = source
     let trimmed = rootFolderID.trimmingCharacters(in: .whitespacesAndNewlines)
-    self.rootFolderID = trimmed.isEmpty ? "/115" : (trimmed.hasPrefix("/") ? trimmed : "/" + trimmed)
-    isConfigured = WebDAVCredentialStore.shared.isConfigured
+    switch source {
+    case .cloud115:
+      self.rootFolderID = trimmed.isEmpty ? "0" : trimmed
+    case .webDAV:
+      self.rootFolderID = trimmed.isEmpty ? "/115" : (trimmed.hasPrefix("/") ? trimmed : "/" + trimmed)
+    }
+    isConfigured = MediaSourceSelectionStore.shared.isConfigured(source)
     isAppUnlocked = true
     mediaConnectionState = .unknown
+    Task {
+      await api.clearAllMountCaches()
+      await thumbnailService.resetForSourceChange()
+    }
   }
 
   func finishConfiguration(rootFolderID: String) {
@@ -323,10 +335,35 @@ final class AppState {
   }
 
   func signOut() {
-    WebDAVCredentialStore.shared.clear()
+    let disconnectedSource = mediaSourceKind
+    switch disconnectedSource {
+    case .webDAV:
+      WebDAVCredentialStore.shared.clear()
+    case .cloud115:
+      Cloud115SessionStore.shared.clear()
+    }
     libraryStore.clearSensitiveSessionData()
-    Task { await api.clearMountCache() }
-    isConfigured = false
+    let sourceStore = MediaSourceSelectionStore.shared
+    let fallback: MediaSourceKind? = {
+      switch disconnectedSource {
+      case .cloud115: return sourceStore.isConfigured(.webDAV) ? .webDAV : nil
+      case .webDAV: return sourceStore.isConfigured(.cloud115) ? .cloud115 : nil
+      }
+    }()
+    if let fallback {
+      sourceStore.activeSource = fallback
+      mediaSourceKind = fallback
+      rootFolderID = fallback == .cloud115
+        ? "0"
+        : (WebDAVCredentialStore.shared.configuration?.normalizedRootPath ?? "/115")
+      isConfigured = true
+    } else {
+      isConfigured = false
+    }
+    Task {
+      await api.clearAllMountCaches()
+      await thumbnailService.resetForSourceChange()
+    }
     isAppUnlocked = true
     requiresAuthenticationAfterBackground = false
     mediaConnectionState = .unknown

@@ -4,6 +4,19 @@
 <dict>
     <key>Cineva115AuthorizationURL</key>
     <string></string>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>CFBundleURLName</key>
+            <string>com.xiaocai.gallery115.oauth</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>cineva115</string>
+            </array>
+        </dict>
+    </array>
     <key>UILaunchScreen</key>
     <dict>
         <key>UIImageName</key>

@@ -232,12 +232,13 @@ final class MediaSourceSelectionStore: @unchecked Sendable {
   private init() {}
 
   var activeSource: MediaSourceKind {
-    get { .webDAV }
-    set {
-      // Keep the persisted key for downgrade compatibility, but Cineva now
-      // deliberately uses OpenList/AList WebDAV as the active media source.
-      UserDefaults.standard.set(MediaSourceKind.webDAV.rawValue, forKey: key)
+    get {
+      guard let rawValue = UserDefaults.standard.string(forKey: key),
+        let source = MediaSourceKind(rawValue: rawValue)
+      else { return .cloud115 }
+      return source
     }
+    set { UserDefaults.standard.set(newValue.rawValue, forKey: key) }
   }
 
   func isConfigured(_ source: MediaSourceKind) -> Bool {
@@ -247,7 +248,15 @@ final class MediaSourceSelectionStore: @unchecked Sendable {
     }
   }
 
-  var resolvedSource: MediaSourceKind { .webDAV }
+  /// Keep the user's last choice when it is still available. If those
+  /// credentials were removed, fall back to the other configured source.
+  var resolvedSource: MediaSourceKind {
+    let selected = activeSource
+    if isConfigured(selected) { return selected }
+    if isConfigured(.cloud115) { return .cloud115 }
+    if isConfigured(.webDAV) { return .webDAV }
+    return selected
+  }
 }
 
 struct WebDAVMountConfiguration: Codable, Equatable, Sendable {
