@@ -192,3 +192,23 @@ enum OpenListArtworkHints {
     return result
   }
 }
+
+/// Discrete resting densities with a dead zone for accidental two-finger movement.
+enum MediaGridZoomPolicy {
+  static let levels = [1, 2, 3, 4, 6]
+
+  static func normalized(_ columns: Int) -> Int {
+    levels.min(by: { abs($0 - min(max(columns, 1), 6)) < abs($1 - min(max(columns, 1), 6)) }) ?? 3
+  }
+
+  static func targetColumns(from columns: Int, magnification: Double) -> Int {
+    let current = normalized(columns)
+    guard magnification.isFinite, magnification > 0,
+      magnification < 0.88 || magnification > 1.12 else { return current }
+    let target = Double(current) / min(max(magnification, 0.1), 10)
+    let nearest = levels.min(by: { abs(Double($0) - target) < abs(Double($1) - target) }) ?? current
+    if nearest != current { return nearest }
+    let index = levels.firstIndex(of: current) ?? 2
+    return levels[min(max(index + (magnification > 1 ? -1 : 1), 0), levels.count - 1)]
+  }
+}

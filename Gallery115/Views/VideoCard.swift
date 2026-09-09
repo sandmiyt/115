@@ -3,6 +3,8 @@ import UIKit
 
 struct VideoCard: View {
   @Environment(AppState.self) private var appState
+  @Environment(\.artworkRefreshRevision) private var parentArtworkRevision
+  @State private var retryRevision = 0
   let item: CloudItem
   var transitionNamespace: Namespace.ID? = nil
   var compact = false
@@ -34,10 +36,14 @@ struct VideoCard: View {
       }
       .contentShape(Rectangle())
     }
+    .environment(\.artworkRefreshRevision, parentArtworkRevision &+ retryRevision)
     .buttonStyle(MediaCardButtonStyle())
     .accessibilityLabel(item.name)
     .accessibilityHint(item.isPhoto ? "查看照片预览" : "播放视频")
     .contextMenu {
+      Button { retryRevision &+= 1 } label: {
+        Label("重试缩略图", systemImage: "arrow.clockwise")
+      }
       Button {
         appState.libraryStore.toggleFavorite(item)
         let feedback = UIImpactFeedbackGenerator(style: .medium)
@@ -210,18 +216,23 @@ struct VideoArtwork: View {
           isLoading = false
         }
       }
+      let service = appState.thumbnailService
+      let api = appState.api
+      let requestedItem = item
       let image = await withTaskCancellationHandler {
-        var result: UIImage?
-        for attempt in 0..<3 {
-          if attempt > 0 {
-            do { try await Task.sleep(nanoseconds: 6_000_000_000) }
-            catch { return nil as UIImage? }
+        await ThumbnailService.boundedArtwork(seconds: 45) {
+          var result: UIImage?
+          for attempt in 0..<3 {
+            if attempt > 0 {
+              do { try await Task.sleep(nanoseconds: 6_000_000_000) }
+              catch { return nil as UIImage? }
+            }
+            guard !Task.isCancelled else { return nil as UIImage? }
+            result = await service.thumbnail(for: requestedItem, api: api)
+            if result != nil { break }
           }
-          guard !Task.isCancelled else { return nil as UIImage? }
-          result = await appState.thumbnailService.thumbnail(for: item, api: appState.api)
-          if result != nil { break }
+          return result
         }
-        return result
       } onCancel: {
         spinner.cancel()
       }
@@ -398,6 +409,65 @@ struct PhotoPreviewScreen: View {
           loading = false
         }
       }
+    }
+  }
+}
+
+/// Keep media identities alive while pinching; reflow only once the gesture ends.
+struct PinchMediaGrid<Cell: View, Footer: View>: View {
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
+  let items: [CloudItem]
+  @Binding var columnCount: Int
+  let compact: Bool
+  private let cell: (CloudItem) -> Cell
+  private let footer: () -> Footer
+  @GestureState private var pinchScale: CGFloat = 1
+  @GestureState private var pinchAnchor: UnitPoint = .center
+
+  init(items: [CloudItem], columnCount: Binding<Int>, compact: Bool,
+       @ViewBuilder cell: @escaping (CloudItem) -> Cell,
+       @ViewBuilder footer: @escaping () -> Footer) {
+    self.items = items
+    self._columnCount = columnCount
+    self.compact = compact
+    self.cell = cell
+    self.footer = footer
+  }
+
+  private var safeColumns: Int { MediaGridZoomPolicy.normalized(columnCount) }
+
+  var body: some View {
+    LazyVGrid(columns: Array(repeating: GridItem(.flexible(minimum: 0),
+      spacing: compact ? 2 : 9, alignment: .top), count: safeColumns), spacing: compact ? 2 : 11) {
+      Section {
+        ForEach(items) { item in cell(item) }
+      } footer: {
+        footer()
+      }
+    }
+    .scrollTargetLayout()
+    .padding(.horizontal, compact ? 2 : 10)
+    .scaleEffect(pinchScale, anchor: pinchAnchor)
+    .simultaneousGesture(
+      MagnifyGesture(minimumScaleDelta: 0.02)
+        .updating($pinchScale) { value, state, _ in
+          state = min(max(value.magnification, 0.72), 1.6)
+        }
+        .updating($pinchAnchor) { value, state, _ in state = value.startAnchor }
+        .onEnded { value in
+          let target = MediaGridZoomPolicy.targetColumns(from: safeColumns,
+                                                         magnification: Double(value.magnification))
+          withAnimation(reduceMotion ? nil : .smooth(duration: 0.24)) {
+            columnCount = target
+          }
+        }
+    )
+    .sensoryFeedback(.selection, trigger: safeColumns)
+    .accessibilityAction(named: Text("放大缩略图")) {
+      columnCount = MediaGridZoomPolicy.targetColumns(from: safeColumns, magnification: 1.2)
+    }
+    .accessibilityAction(named: Text("缩小缩略图")) {
+      columnCount = MediaGridZoomPolicy.targetColumns(from: safeColumns, magnification: 0.8)
     }
   }
 }

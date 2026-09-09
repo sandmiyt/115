@@ -3,6 +3,17 @@ import XCTest
 @testable import CinevaCacheValidation
 
 final class FolderCollectionPolicyTests: XCTestCase {
+  func testMediaZoomDirectionAndBounds() {
+    XCTAssertEqual(MediaGridZoomPolicy.targetColumns(from: 3, magnification: 1.2), 2)
+    XCTAssertEqual(MediaGridZoomPolicy.targetColumns(from: 3, magnification: 0.8), 4)
+    XCTAssertEqual(MediaGridZoomPolicy.targetColumns(from: 3, magnification: 1.05), 3)
+    XCTAssertEqual(MediaGridZoomPolicy.targetColumns(from: 1, magnification: 2), 1)
+    XCTAssertEqual(MediaGridZoomPolicy.targetColumns(from: 6, magnification: 0.1), 6)
+    XCTAssertEqual(MediaGridZoomPolicy.targetColumns(from: 3, magnification: .nan), 3)
+    XCTAssertEqual(MediaGridZoomPolicy.normalized(Int.min), 1)
+    XCTAssertEqual(MediaGridZoomPolicy.normalized(Int.max), 6)
+  }
+
   func testOpenListThumbnailHintsRejectNonImageLocationsAndDirectories() throws {
     let data = try JSONSerialization.data(withJSONObject: ["code": 200, "data": ["content": [
       ["name": "movie.mp4", "is_dir": false, "thumb": "https://cdn.example.com/cover.jpg?sign=one"],

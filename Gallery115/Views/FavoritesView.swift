@@ -5,6 +5,8 @@ struct FavoritesView: View {
   @State private var selectedVideo: CloudItem?
   @State private var selectedPhoto: CloudItem?
   @AppStorage("gallery115.compactGrid") private var compactGrid = true
+  @AppStorage("gallery115.mediaGridColumns") private var mediaGridColumns = 3
+  @State private var scrollPosition: String?
   @Namespace private var playerTransition
 
   var body: some View {
@@ -17,17 +19,18 @@ struct FavoritesView: View {
         )
       } else {
         ScrollView {
-          LazyVGrid(columns: columns, spacing: compactGrid ? 2 : 14) {
-            ForEach(appState.libraryStore.favorites) { item in
-              VideoCard(item: item, transitionNamespace: playerTransition, compact: compactGrid) {
-                if item.isPhoto { selectedPhoto = item }
-                else { selectedVideo = item }
-              }
+          PinchMediaGrid(items: appState.libraryStore.favorites, columnCount: $mediaGridColumns,
+                         compact: compactGrid) { item in
+            VideoCard(item: item, transitionNamespace: playerTransition, compact: compactGrid) {
+              if item.isPhoto { selectedPhoto = item }
+              else { selectedVideo = item }
             }
+          } footer: {
+            Text("\(appState.libraryStore.favorites.count) 个项目")
+              .font(.caption).foregroundStyle(.secondary).padding(.vertical, 20)
           }
-          .id("favorites-grid-\(safeGridColumns)")
-          .padding(compactGrid ? 2 : 14)
         }
+        .scrollPosition(id: $scrollPosition, anchor: .top)
       }
     }
     .navigationTitle("收藏")
@@ -41,14 +44,4 @@ struct FavoritesView: View {
     }
   }
 
-  private var safeGridColumns: Int {
-    min(max(appState.gridColumns, 2), 4)
-  }
-
-  private var columns: [GridItem] {
-    Array(
-      repeating: GridItem(.flexible(minimum: 0), spacing: compactGrid ? 2 : 10, alignment: .top),
-      count: safeGridColumns
-    )
-  }
 }

@@ -71,6 +71,8 @@ struct FolderView: View {
   @State private var query = ""
   @State private var searchItems: [CloudItem]?
   @State private var displayItems: [CloudItem] = []
+  @State private var displayedFolders: [CloudItem] = []
+  @State private var displayedMedia: [CloudItem] = []
   @State private var playlistItems: [CloudItem] = []
   @State private var didScheduleBackgroundRefresh = false
   @State private var sortMode: SortMode = .updated
@@ -83,6 +85,7 @@ struct FolderView: View {
   @State private var pagingRevision = 0
   @State private var showMediaSetup = false
   @AppStorage("gallery115.compactGrid") private var compactGrid = true
+  @AppStorage("gallery115.mediaGridColumns") private var mediaGridColumns = 3
   @State private var gridScrollPosition: String?
   @State private var artworkRefreshRevision = 0
   @State private var isSearching = false
@@ -181,14 +184,20 @@ struct FolderView: View {
 
             if appState.browserLayout == .grid {
               Divider()
+              Picker("媒体缩略图大小", selection: $mediaGridColumns) {
+                ForEach(MediaGridZoomPolicy.levels, id: \.self) { count in
+                  Text("\(count) 列").tag(count)
+                }
+              }
+              Divider()
               ForEach([2, 3, 4], id: \.self) { count in
                 Button {
                   setGridColumnsSafely(count)
                 } label: {
                   if safeGridColumns == count {
-                    Label("\(count) 列", systemImage: "checkmark")
+                    Label("文件夹 \(count) 列", systemImage: "checkmark")
                   } else {
-                    Text("\(count) 列")
+                    Text("文件夹 \(count) 列")
                   }
                 }
               }
@@ -276,6 +285,8 @@ struct FolderView: View {
         items = []
         searchItems = nil
         displayItems = []
+        displayedFolders = []
+        displayedMedia = []
         playlistItems = []
         errorMessage = nil
       }
@@ -307,33 +318,26 @@ struct FolderView: View {
     switch appState.browserLayout {
     case .grid:
       ScrollView {
-        LazyVGrid(columns: columns, spacing: compactGrid ? 2 : 11) {
-          Section {
-            ForEach(displayItems) { item in
-              if item.isDirectory {
-                NavigationLink(value: item) {
-                  FolderCard(item: item, compact: compactGrid)
-                }
-                .buttonStyle(FolderCardButtonStyle())
-              } else if item.isPhoto {
-                VideoCard(item: item, transitionNamespace: playerTransition, compact: compactGrid) {
-                  selectedPhoto = item
-                }
-              } else {
-                VideoCard(item: item, transitionNamespace: playerTransition, compact: compactGrid) {
-                  selectedVideo = item
-                }
+        LazyVStack(spacing: 14) {
+          if !displayedFolders.isEmpty {
+            LazyVGrid(columns: columns, spacing: 11) {
+              ForEach(displayedFolders) { item in
+                NavigationLink(value: item) { FolderCard(item: item) }
+                  .buttonStyle(FolderCardButtonStyle())
               }
+            }
+            .padding(.horizontal, 10)
+            .padding(.top, 10)
+          }
+          PinchMediaGrid(items: displayedMedia, columnCount: $mediaGridColumns, compact: compactGrid) { item in
+            VideoCard(item: item, transitionNamespace: playerTransition, compact: compactGrid) {
+              if item.isPhoto { selectedPhoto = item }
+              else { selectedVideo = item }
             }
           } footer: {
             paginationFooter.padding(.vertical, 20)
           }
         }
-        .id("grid-\(folderID)-\(safeGridColumns)")
-        .scrollTargetLayout()
-        .padding(.horizontal, compactGrid ? 2 : 10)
-        .padding(.top, compactGrid ? 2 : 10)
-
       }
       .scrollPosition(id: $gridScrollPosition, anchor: .top)
       .scrollDismissesKeyboard(.interactively)
@@ -484,7 +488,7 @@ struct FolderView: View {
 
   private var columns: [GridItem] {
     Array(
-      repeating: GridItem(.flexible(minimum: 0), spacing: compactGrid ? 2 : 9, alignment: .top),
+      repeating: GridItem(.flexible(minimum: 0), spacing: 9, alignment: .top),
       count: safeGridColumns
     )
   }
@@ -511,6 +515,8 @@ struct FolderView: View {
     }
 
     displayItems = output
+    displayedFolders = output.filter(\.isDirectory)
+    displayedMedia = output.filter { !$0.isDirectory }
   }
 
   private func rebuildPlaylistItems() {
@@ -788,41 +794,29 @@ private struct FolderCardButtonStyle: ButtonStyle {
 
 private struct FolderCard: View {
   let item: CloudItem
-  var compact = false
 
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
       ZStack(alignment: .bottomLeading) {
         LinearGradient(
           colors: [CinevaTheme.accentWarm.opacity(0.30), CinevaTheme.accent.opacity(0.10)],
-          startPoint: .topLeading,
-          endPoint: .bottomTrailing
-        )
+          startPoint: .topLeading, endPoint: .bottomTrailing)
         Image(systemName: "folder.fill")
           .font(.system(size: 38, weight: .semibold))
           .foregroundStyle(CinevaTheme.accent)
           .padding(14)
       }
-      .aspectRatio(compact ? 1 : 16 / 9, contentMode: .fit)
-      .clipShape(RoundedRectangle(cornerRadius: compact ? 3 : 12, style: .continuous))
-      .overlay(alignment: .topLeading) {
-        if compact {
-          Text(item.name).font(.caption.weight(.semibold)).lineLimit(2)
-            .foregroundStyle(.primary).padding(8)
-        }
-      }
+      .aspectRatio(16 / 9, contentMode: .fit)
+      .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
 
-      if !compact {
-        Text(item.name)
-          .font(.subheadline.weight(.semibold))
-          .foregroundStyle(.primary)
-          .lineLimit(2)
-          .multilineTextAlignment(.leading)
-
-        Text("文件夹")
-          .font(.caption2)
-          .foregroundStyle(.secondary)
-      }
+      Text(item.name)
+        .font(.subheadline.weight(.semibold))
+        .foregroundStyle(.primary)
+        .lineLimit(2)
+        .multilineTextAlignment(.leading)
+      Text("文件夹")
+        .font(.caption2)
+        .foregroundStyle(.secondary)
     }
     .contentShape(Rectangle())
   }

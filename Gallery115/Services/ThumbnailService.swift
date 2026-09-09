@@ -34,6 +34,14 @@ actor ThumbnailService {
   private var playbackOwners: Set<UUID> = []
   private var cacheGeneration = UUID()
   private let maximumNetworkJobs = 3
+  private let maximumFrameJobs = 2
+  private let imageSession: URLSession = {
+    let configuration = URLSessionConfiguration.default
+    configuration.timeoutIntervalForRequest = 8
+    configuration.timeoutIntervalForResource = 12
+    configuration.httpMaximumConnectionsPerHost = 3
+    return URLSession(configuration: configuration)
+  }()
 
   init(
     disk: ArtworkDiskStore = ArtworkDiskStore(),
@@ -101,7 +109,7 @@ actor ThumbnailService {
       }
       if inFlight[identity.key]?.id == work.id {
         inFlight[identity.key] = nil
-        if result == nil, !work.task.isCancelled, generation == cacheGeneration {
+        if result == nil, !isPrefetch, !work.task.isCancelled, generation == cacheGeneration {
           failedUntil[identity.key] = Date().addingTimeInterval(5)
         }
       }
@@ -129,7 +137,7 @@ actor ThumbnailService {
   }
 
   func suspendNetwork(for owner: UUID) {
-    guard playbackOwners.insert(owner).inserted else { return }
+    guard !Task.isCancelled, playbackOwners.insert(owner).inserted else { return }
     for work in inFlight.values { work.task.cancel() }
     inFlight.removeAll()
   }
@@ -219,25 +227,24 @@ actor ThumbnailService {
     defer { if holdsNetworkSlot { releaseSlot(workID) } }
     guard !Task.isCancelled, generation == cacheGeneration, identity.namespace == namespace() else { return nil }
     if let image = localImage(identity) { return image }
-    var image: UIImage?
-    if let loader {
-      image = await loader(item, api)
-    } else {
-      image = await loadNetworkArtwork(for: item, api: api)
+    var image = await Self.boundedArtwork(seconds: 18) { [self] in
+      if let loader { return await loader(item, api) }
+      return await loadNetworkArtwork(for: item, api: api)
     }
-    // Slow video reads have their own single slot. They must never block a
-    // ready JPEG/poster for another visible cell behind a 20-second frame probe.
+    // Independent frame lanes cannot hold up ready image downloads.
     releaseSlot(workID)
     holdsNetworkSlot = false
-    if image == nil, item.isVideo, !item.isDiscImage, (loader == nil || frameLoader != nil) {
+    if image == nil, item.isVideo, !item.isDiscImage,
+       !(inFlight[identity.key]?.isPrefetch ?? isPrefetch), (loader == nil || frameLoader != nil) {
       guard !Task.isCancelled, generation == cacheGeneration,
-        await acquireSlot(workID, isPrefetch: inFlight[identity.key]?.isPrefetch ?? isPrefetch, isFrame: true) else { return nil }
+        await acquireSlot(workID, isPrefetch: false, isFrame: true) else { return nil }
       defer { releaseSlot(workID, isFrame: true) }
       guard !Task.isCancelled, generation == cacheGeneration else { return nil }
-      if let frameLoader {
-        image = await frameLoader(item, api)
-      } else if let source = try? await api.thumbnailSource(for: item), !Task.isCancelled {
-        image = await Self.frameThumbnail(source: source)
+      let frameLoader = self.frameLoader
+      image = await Self.boundedArtwork(seconds: 15) {
+        if let frameLoader { return await frameLoader(item, api) }
+        guard let source = try? await api.thumbnailSource(for: item), !Task.isCancelled else { return nil }
+        return await Self.frameThumbnail(source: source)
       }
     }
     guard !Task.isCancelled, generation == cacheGeneration, identity.namespace == namespace(),
@@ -262,6 +269,28 @@ actor ThumbnailService {
     if let data = await api.posterData(for: item),
       let image = downsampledImage(from: data) { return image }
     return nil
+  }
+
+  /// Unlike a task-group race, this does not await an uncooperative loser.
+  nonisolated static func boundedArtwork(
+    seconds: Double, operation: @escaping @Sendable () async -> UIImage?
+  ) async -> UIImage? {
+    let completion = ArtworkCompletion()
+    return await withTaskCancellationHandler {
+      await withCheckedContinuation { continuation in
+        completion.install(continuation)
+        let worker = Task {
+          guard !Task.isCancelled else { completion.finish(nil); return }
+          completion.finish(await operation())
+        }
+        let timeout = Task {
+          do { try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000)) }
+          catch { return }
+          completion.finish(nil)
+        }
+        completion.attach([worker, timeout])
+      }
+    } onCancel: { completion.finish(nil) }
   }
 
   nonisolated static func frameThumbnail(source: VideoSource) async -> UIImage? {
@@ -293,9 +322,9 @@ actor ThumbnailService {
   private func remoteThumbnail(at url: URL, headers: [String: String] = [:]) async -> UIImage? {
     var request = URLRequest(url: url)
     request.cachePolicy = .useProtocolCachePolicy
-    request.timeoutInterval = 12
+    request.timeoutInterval = 8
     for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
-    guard let (data, response) = try? await URLSession.shared.data(for: request),
+    guard let (data, response) = try? await imageSession.data(for: request),
       !Task.isCancelled, data.count <= 16_000_000,
       let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode)
     else { return nil }
@@ -354,7 +383,7 @@ actor ThumbnailService {
   }
 
   private func canAcquireSlot(isFrame: Bool) -> Bool {
-    playbackOwners.isEmpty && (isFrame ? activeFrameSlots.isEmpty : activeSlots.count < maximumNetworkJobs)
+    playbackOwners.isEmpty && (isFrame ? activeFrameSlots.count < maximumFrameJobs : activeSlots.count < maximumNetworkJobs)
   }
 
   private func releaseSlot(_ id: UUID, isFrame: Bool = false) {
@@ -406,5 +435,48 @@ private final class ThumbnailFrameProbe: @unchecked Sendable {
     lock.unlock()
     generator.cancelAllCGImageGeneration()
     asset.cancelLoading()
+  }
+}
+
+/// Exactly-once completion, including cancellation before continuation installation.
+private final class ArtworkCompletion: @unchecked Sendable {
+  private let lock = NSLock()
+  private var finished = false
+  private var result: UIImage?
+  private var continuation: CheckedContinuation<UIImage?, Never>?
+  private var tasks: [Task<Void, Never>] = []
+
+  func install(_ continuation: CheckedContinuation<UIImage?, Never>) {
+    lock.lock()
+    if finished {
+      let result = result
+      lock.unlock()
+      continuation.resume(returning: result)
+    } else {
+      self.continuation = continuation
+      lock.unlock()
+    }
+  }
+
+  func attach(_ tasks: [Task<Void, Never>]) {
+    lock.lock()
+    let shouldCancel = finished
+    if !shouldCancel { self.tasks = tasks }
+    lock.unlock()
+    if shouldCancel { tasks.forEach { $0.cancel() } }
+  }
+
+  func finish(_ image: UIImage?) {
+    lock.lock()
+    guard !finished else { lock.unlock(); return }
+    finished = true
+    result = image
+    let continuation = continuation
+    self.continuation = nil
+    let tasks = tasks
+    self.tasks = []
+    lock.unlock()
+    continuation?.resume(returning: image)
+    tasks.forEach { $0.cancel() }
   }
 }

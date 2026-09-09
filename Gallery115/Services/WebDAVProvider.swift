@@ -18,6 +18,14 @@ actor WebDAVProvider: CloudProvider {
   private var directoryFileIndexCache: [String: [String: CloudItem]] = [:]
   private var metadataCache: [String: LocalMediaMetadata] = [:]
   private var metadataMisses: Set<String> = []
+  private var thumbnailHintTasks: [String: Task<Bool, Never>] = [:]
+  private var thumbnailHintRetry: [String: Date] = [:]
+  private let artworkHintSession: URLSession = {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.timeoutIntervalForRequest = 5
+    configuration.timeoutIntervalForResource = 8
+    return URLSession(configuration: configuration)
+  }()
   private var serverThumbnailHints: [String: [String: URL]] = [:]
   private let posterCache = NSCache<NSString, NSData>()
   private var lastRequestAt: Date = .distantPast
@@ -286,11 +294,25 @@ actor WebDAVProvider: CloudProvider {
     return metadata
   }
 
-  /// Optional server artwork from the last successful OpenList refresh.
-  func serverThumbnailURL(for item: CloudItem) -> URL? {
-    guard let configuration = store.configuration else { return nil }
+  /// Read-only OpenList hints are shared by all cards in the same directory.
+  func serverThumbnailURL(for item: CloudItem) async -> URL? {
+    guard !Task.isCancelled, let configuration = store.configuration else { return nil }
     let key = configuration.cacheNamespace + "|thumb|" + normalizeLogicalPath(item.parentID)
-    return serverThumbnailHints[key]?[item.name]
+    if let hints = serverThumbnailHints[key] { return hints[item.name] }
+    if let task = thumbnailHintTasks[key] {
+      _ = await task.value
+      return Task.isCancelled ? nil : serverThumbnailHints[key]?[item.name]
+    }
+    if let retry = thumbnailHintRetry[key], retry > Date() { return nil }
+    thumbnailHintRetry[key] = Date().addingTimeInterval(30)
+    let task = Task { [self] in
+      await refreshOpenListDirectoryCache(configuration: configuration,
+                                          logicalPath: item.parentID, refresh: false)
+    }
+    thumbnailHintTasks[key] = task
+    _ = await task.value
+    thumbnailHintTasks[key] = nil
+    return Task.isCancelled ? nil : serverThumbnailHints[key]?[item.name]
   }
 
   /// Artwork discovery must not wait for NFO parsing or cache transient failures.
@@ -417,6 +439,9 @@ actor WebDAVProvider: CloudProvider {
 
   func clearMountCache() async {
     memoryCache.removeAll()
+    for task in thumbnailHintTasks.values { task.cancel() }
+    thumbnailHintTasks.removeAll()
+    thumbnailHintRetry.removeAll()
     serverThumbnailHints.removeAll()
     orderedItemCache.removeAll()
     rawDirectoryCache.removeAll()
@@ -441,7 +466,8 @@ actor WebDAVProvider: CloudProvider {
   /// forced WebDAV refresh continues as a safe fallback.
   private func refreshOpenListDirectoryCache(
     configuration: WebDAVMountConfiguration,
-    logicalPath: String
+    logicalPath: String,
+    refresh: Bool = true
   ) async -> Bool {
     guard !configuration.username.isEmpty,
       let baseURL = openListBaseURL(configuration: configuration)
@@ -449,6 +475,7 @@ actor WebDAVProvider: CloudProvider {
 
     let hintKey = configuration.cacheNamespace + "|thumb|" + normalizeLogicalPath(logicalPath)
     serverThumbnailHints[hintKey] = nil
+    let requestSession = refresh ? session : artworkHintSession
     do {
       let loginURL = baseURL
         .appending(path: "api")
@@ -467,7 +494,7 @@ actor WebDAVProvider: CloudProvider {
       ])
 
       guard !Task.isCancelled else { return false }
-      let (loginData, loginResponse) = try await session.data(for: loginRequest)
+      let (loginData, loginResponse) = try await requestSession.data(for: loginRequest)
       guard let loginHTTP = loginResponse as? HTTPURLResponse,
         (200...299).contains(loginHTTP.statusCode),
         let loginJSON = try JSONSerialization.jsonObject(with: loginData) as? [String: Any],
@@ -495,10 +522,10 @@ actor WebDAVProvider: CloudProvider {
         "password": "",
         "page": 1,
         "per_page": 10_000,
-        "refresh": true,
+        "refresh": refresh,
       ])
 
-      let (listData, listResponse) = try await session.data(for: listRequest)
+      let (listData, listResponse) = try await requestSession.data(for: listRequest)
       guard let listHTTP = listResponse as? HTTPURLResponse,
         (200...299).contains(listHTTP.statusCode),
         let listJSON = try JSONSerialization.jsonObject(with: listData) as? [String: Any],

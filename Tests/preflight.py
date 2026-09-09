@@ -165,8 +165,13 @@ def without_prepare(text):
 check(without_prepare(player_model) == without_prepare(old_player_model)
       and "try Task.checkCancellation()" in player_model,
       "Player change is confined to guarding cancelled preparation; engine logic unchanged")
-check("activeFrameSlots.isEmpty" in service and "holdsNetworkSlot = false" in service,
-      "Slow frame extraction uses a separate single slot from image downloads")
+check("boundedArtwork(seconds: 18)" in service and "boundedArtwork(seconds: 15)" in service
+      and "boundedArtwork(seconds: 45)" in card,
+      "Artwork stages and visible-cell waiting have completion deadlines")
+check("MagnifyGesture(minimumScaleDelta:" in card and "MediaGridZoomPolicy" in card,
+      "Media grids support pinch density changes with stable item identity")
+check("activeFrameSlots.count < maximumFrameJobs" in service and "holdsNetworkSlot = false" in service,
+      "Slow frame extraction uses a separate bounded pool from image downloads")
 check("!hasMore && !isSearching" not in folder and "paginationFooter" in folder,
       "Filtered empty pages retain pagination and searches own their empty state")
 check('compact ? 1 : 16 / 9' in card and 'gallery115.compactGrid' in folder,

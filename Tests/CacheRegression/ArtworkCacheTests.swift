@@ -4,6 +4,38 @@ import XCTest
 @testable import CinevaCacheValidation
 
 final class ArtworkCacheTests: XCTestCase {
+  func testDeadlineReturnsWithoutWaitingForUncooperativeLoader() async {
+    let held = HeldLoader(image: image())
+    let returned = expectation(description: "deadline returns while loader is held")
+    let task = Task {
+      let result = await ThumbnailService.boundedArtwork(seconds: 0.1) { await held.load() }
+      XCTAssertNil(result)
+      returned.fulfill()
+    }
+    await fulfillment(of: [returned], timeout: 2)
+    await held.finish()
+    await task.value
+  }
+
+  func testCancellationReturnsWithoutWaitingForUncooperativeLoader() async {
+    let held = HeldLoader(image: image())
+    let returned = expectation(description: "cancellation returns while loader is held")
+    let task = Task {
+      let result = await ThumbnailService.boundedArtwork(seconds: 30) { await held.load() }
+      XCTAssertNil(result)
+      returned.fulfill()
+    }
+    for _ in 0..<100 {
+      let started = await held.started
+      if started { break }
+      try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+    task.cancel()
+    await fulfillment(of: [returned], timeout: 2)
+    await held.finish()
+    await task.value
+  }
+
   private var root: URL!
   private var disk: ArtworkDiskStore!
 
@@ -313,7 +345,7 @@ final class ArtworkCacheTests: XCTestCase {
       let video = item("slow-\(index)")
       return Task { await cache.thumbnail(for: video, api: APIClient()) }
     }
-    await waitForQueue(cache, visible: 2, prefetch: 0)
+    await waitForQueue(cache, visible: 1, prefetch: 0)
     let readyFinished = expectation(description: "JPEG finishes while frame extraction is held")
     let readyVideo = item("ready-jpeg")
     let ready = Task {
@@ -326,7 +358,7 @@ final class ArtworkCacheTests: XCTestCase {
     _ = await ready.value
     for task in slow { _ = await task.value }
     let peak = await gate.peak
-    XCTAssertEqual(peak, 1)
+    XCTAssertEqual(peak, 2)
   }
 
   func testPhotoArtworkUsesSharedPersistentCache() async {
