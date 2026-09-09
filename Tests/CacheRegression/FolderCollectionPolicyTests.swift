@@ -3,6 +3,22 @@ import XCTest
 @testable import CinevaCacheValidation
 
 final class FolderCollectionPolicyTests: XCTestCase {
+  func testOpenListThumbnailHintsRejectNonImageLocationsAndDirectories() throws {
+    let data = try JSONSerialization.data(withJSONObject: ["code": 200, "data": ["content": [
+      ["name": "movie.mp4", "is_dir": false, "thumb": "https://cdn.example.com/cover.jpg?sign=one"],
+      ["name": "folder", "is_dir": true, "thumb": "https://cdn.example.com/folder.jpg"],
+      ["name": "local.mp4", "is_dir": false, "thumb": "file:///private/cover.jpg"],
+      ["name": "relative.mp4", "is_dir": false, "thumb": "/cover.jpg"],
+      ["name": "auth.mp4", "is_dir": false, "thumb": "https://user:secret@example.com/cover.jpg"],
+      ["name": "empty.mp4", "is_dir": false, "thumb": ""]
+    ]]])
+    let hints = OpenListArtworkHints.parse(data)
+    XCTAssertEqual(hints.count, 1)
+    XCTAssertEqual(hints["movie.mp4"]?.host, "cdn.example.com")
+    XCTAssertTrue(OpenListArtworkHints.parse(Data("broken".utf8)).isEmpty)
+    XCTAssertTrue(OpenListArtworkHints.parse(Data(#"{"code":403,"data":{"content":[]}}"#.utf8)).isEmpty)
+  }
+
   func testIncrementalPageNeverMovesExistingViewportItems() {
     let current = [item("b", date: 200), item("d", date: 100)]
     let next = [item("a", date: 400), item("c", date: 300)]

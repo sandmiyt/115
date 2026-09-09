@@ -253,14 +253,16 @@ final class PlayerModel: PlaybackEngineControlling {
   }
 
   func prepareAndPlay() async {
-    guard !isPreparing else { return }
+    guard !Task.isCancelled, !isPreparing else { return }
     activateAudioSession()
     isPreparing = true
     didReachEnd = false
     defer { isPreparing = false }
 
     do {
-      sources = try await api.videoSources(for: item)
+      let loadedSources = try await api.videoSources(for: item)
+      try Task.checkCancellation()
+      sources = loadedSources
       guard !sources.isEmpty else {
         errorMessage = "媒体源没有返回可播放地址。"
         return
@@ -278,6 +280,7 @@ final class PlayerModel: PlaybackEngineControlling {
       }
       installTimeObserverIfNeeded()
     } catch {
+      guard !Task.isCancelled else { return }
       errorMessage = error.localizedDescription
     }
   }

@@ -280,6 +280,79 @@ final class ArtworkCacheTests: XCTestCase {
     XCTAssertFalse(saved)
   }
 
+  func testVisibleRequestsOvertakeQueuedPrefetch() async throws {
+    let probe = OrderedLoader(image: image())
+    let cache = ThumbnailService(disk: disk, namespace: { "mount-a" },
+                                 loader: { item, _ in await probe.load(item.id) })
+    let owner = UUID()
+    await cache.suspendNetwork(for: owner)
+    let speculative = (0..<3).map { index in
+      let video = item("prefetch-\(index)")
+      return Task { await cache.thumbnail(for: video, api: APIClient(), isPrefetch: true) }
+    }
+    await waitForQueue(cache, visible: 0, prefetch: 3)
+    let visible = (0..<3).map { index in
+      let video = item("visible-\(index)")
+      return Task { await cache.thumbnail(for: video, api: APIClient()) }
+    }
+    await waitForQueue(cache, visible: 3, prefetch: 3)
+    await cache.resumeNetwork(for: owner)
+    for task in visible + speculative { _ = await task.value }
+    let order = await probe.order
+    XCTAssertEqual(order.count, 6)
+    XCTAssertTrue(order.prefix(3).allSatisfy { $0.hasPrefix("visible-") })
+  }
+
+  func testSlowFrameProbesLeaveImageDownloadSlotsAvailable() async {
+    let artwork = image()
+    let gate = FrameGate(image: artwork)
+    let cache = ThumbnailService(disk: disk, namespace: { "mount-a" },
+      loader: { item, _ in item.id.hasPrefix("slow-") ? nil : artwork },
+      frameLoader: { _, _ in await gate.load() })
+    let slow = (0..<3).map { index in
+      let video = item("slow-\(index)")
+      return Task { await cache.thumbnail(for: video, api: APIClient()) }
+    }
+    await waitForQueue(cache, visible: 2, prefetch: 0)
+    let readyFinished = expectation(description: "JPEG finishes while frame extraction is held")
+    let readyVideo = item("ready-jpeg")
+    let ready = Task {
+      let result = await cache.thumbnail(for: readyVideo, api: APIClient())
+      XCTAssertNotNil(result)
+      readyFinished.fulfill()
+    }
+    await fulfillment(of: [readyFinished], timeout: 2)
+    await gate.release()
+    _ = await ready.value
+    for task in slow { _ = await task.value }
+    let peak = await gate.peak
+    XCTAssertEqual(peak, 1)
+  }
+
+  func testPhotoArtworkUsesSharedPersistentCache() async {
+    let photo = CloudItem(id: "/115/photo.jpg", parentID: "/115", name: "photo.jpg",
+      isDirectory: false, pickCode: "photo", sha1: "", size: 1024,
+      fileExtension: "jpg", isVideo: false, duration: 0, thumbnailURLString: nil,
+      modifiedAt: Date(timeIntervalSince1970: 1000))
+    let probe = LoadProbe(image: image())
+    let first = await service(probe).thumbnail(for: photo, api: APIClient())
+    let offline = LoadProbe(image: nil)
+    let cached = await service(offline).thumbnail(for: photo, api: APIClient())
+    XCTAssertNotNil(first)
+    XCTAssertNotNil(cached)
+    let calls = await offline.calls
+    XCTAssertEqual(calls, 0)
+  }
+
+  private func waitForQueue(_ cache: ThumbnailService, visible: Int, prefetch: Int) async {
+    for _ in 0..<200 {
+      let counts = await cache.queuedRequestCounts()
+      if counts.visible == visible, counts.prefetch == prefetch { return }
+      try? await Task.sleep(nanoseconds: 5_000_000)
+    }
+    XCTFail("Queue did not reach expected state")
+  }
+
   private func waitForCalls(_ probe: LoadProbe, count: Int) async {
     for _ in 0..<200 {
       let calls = await probe.calls
@@ -328,5 +401,38 @@ private actor RecoveringLoader {
   func load() -> UIImage? {
     calls += 1
     return calls == 1 ? nil : image
+  }
+}
+
+private actor OrderedLoader {
+  let image: UIImage
+  private(set) var order: [String] = []
+  init(image: UIImage) { self.image = image }
+  func load(_ id: String) async -> UIImage? {
+    order.append(id)
+    do { try await Task.sleep(nanoseconds: 100_000_000) }
+    catch { return nil }
+    return image
+  }
+}
+
+private actor FrameGate {
+  let image: UIImage
+  private var released = false
+  private var active = 0
+  private(set) var peak = 0
+  private var waiters: [CheckedContinuation<Void, Never>] = []
+  init(image: UIImage) { self.image = image }
+  func load() async -> UIImage? {
+    active += 1
+    peak = max(peak, active)
+    defer { active -= 1 }
+    if !released { await withCheckedContinuation { waiters.append($0) } }
+    return image
+  }
+  func release() {
+    released = true
+    for waiter in waiters { waiter.resume() }
+    waiters.removeAll()
   }
 }

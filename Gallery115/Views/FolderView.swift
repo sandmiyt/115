@@ -79,8 +79,14 @@ struct FolderView: View {
   @State private var nextOffset = 0
   @State private var hasMore = true
   @State private var isRefreshing = false
+  @State private var refreshTask: Task<Void, Never>?
   @State private var pagingRevision = 0
   @State private var showMediaSetup = false
+  @AppStorage("gallery115.compactGrid") private var compactGrid = true
+  @State private var gridScrollPosition: String?
+  @State private var artworkRefreshRevision = 0
+  @State private var isSearching = false
+  @State private var selectedPhoto: CloudItem?
   @Namespace private var playerTransition
 
   var body: some View {
@@ -97,7 +103,7 @@ struct FolderView: View {
         } actions: {
           Button("重试") { Task { await loadFirstPage(forceRefresh: true) } }
         }
-      } else if displayItems.isEmpty {
+      } else if displayItems.isEmpty && !isSearching && (!query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !hasMore) {
         ContentUnavailableView(
           query.isEmpty ? emptyFilterTitle : "没有搜索结果",
           systemImage: query.isEmpty ? emptyFilterSystemImage : "magnifyingglass",
@@ -107,14 +113,21 @@ struct FolderView: View {
         content
       }
     }
+    .environment(\.artworkRefreshRevision, artworkRefreshRevision)
+    .onDisappear { refreshTask?.cancel(); refreshTask = nil }
     .navigationTitle(title)
     .navigationBarTitleDisplayMode(folderID == appState.rootFolderID ? .large : .inline)
     .navigationDestination(for: CloudItem.self) { item in
       FolderView(folderID: item.id, title: item.name)
     }
     .searchable(text: $query, prompt: "搜索当前目录")
-    .onChange(of: query) { _, _ in rebuildDisplayItems() }
+    .onChange(of: query) { _, _ in
+      searchItems = nil
+      isSearching = !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      rebuildDisplayItems()
+    }
     .onChange(of: mediaFilter) { _, _ in rebuildDisplayItems() }
+    .sensoryFeedback(.selection, trigger: mediaFilter)
     .onChange(of: appState.libraryStore.favorites.map(\.id)) { _, _ in rebuildDisplayItems() }
     .task(id: "\(query)|\(sortMode.rawValue)") { await updateSearchResults() }
     .toolbar {
@@ -145,6 +158,8 @@ struct FolderView: View {
           Divider()
 
           Menu {
+            Toggle("相册式方形网格", isOn: $compactGrid)
+            Divider()
             Button {
               appState.browserLayout = .grid
             } label: {
@@ -193,7 +208,8 @@ struct FolderView: View {
 
         Button {
           guard !isRefreshing else { return }
-          Task { await refreshCurrentFolder() }
+          refreshTask?.cancel()
+          refreshTask = Task { await refreshCurrentFolder() }
         } label: {
           if isRefreshing {
             ProgressView()
@@ -205,6 +221,17 @@ struct FolderView: View {
         .disabled(isRefreshing)
         .accessibilityLabel(isRefreshing ? "正在刷新资料库" : "刷新资料库")
         .accessibilityHint("重新读取新增或删除的媒体")
+      }
+    }
+    .safeAreaInset(edge: .top, spacing: 0) {
+      if appState.isConfigured {
+        Picker("媒体类型", selection: $mediaFilter) {
+          ForEach(MediaFilter.allCases) { filter in Text(filter.title).tag(filter) }
+        }
+        .pickerStyle(.segmented)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(.bar)
       }
     }
     .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -227,6 +254,10 @@ struct FolderView: View {
       PlayerScreen(item: item, playlist: playlistItems)
         .cinevaPlayerZoomTransition(sourceID: item.id, in: playerTransition)
     }
+    .fullScreenCover(item: $selectedPhoto) { item in
+      PhotoPreviewScreen(item: item)
+        .cinevaPlayerZoomTransition(sourceID: item.id, in: playerTransition)
+    }
     .sheet(isPresented: $showMediaSetup) {
       SetupView()
     }
@@ -235,7 +266,7 @@ struct FolderView: View {
         showMediaSetup = false
       }
     }
-    .task(id: "\(folderID)|\(appState.isConfigured)|\(appState.isAppUnlocked)|\(sortMode.rawValue)") {
+    .task(id: "\(appState.mediaSourceRevision)|\(folderID)|\(appState.isConfigured)|\(appState.isAppUnlocked)|\(sortMode.rawValue)") {
       guard appState.isAppUnlocked else { return }
       if appState.isConfigured {
         await loadFirstPage(forceRefresh: false)
@@ -276,42 +307,36 @@ struct FolderView: View {
     switch appState.browserLayout {
     case .grid:
       ScrollView {
-        LazyVGrid(columns: columns, spacing: 11) {
-          ForEach(displayItems) { item in
-            if item.isDirectory {
-              NavigationLink(value: item) {
-                FolderCard(item: item)
-              }
-              .buttonStyle(FolderCardButtonStyle())
-            } else if item.isPhoto {
-              PhotoFileCard(item: item)
-            } else {
-              VideoCard(item: item, transitionNamespace: playerTransition) {
-                selectedVideo = item
+        LazyVGrid(columns: columns, spacing: compactGrid ? 2 : 11) {
+          Section {
+            ForEach(displayItems) { item in
+              if item.isDirectory {
+                NavigationLink(value: item) {
+                  FolderCard(item: item, compact: compactGrid)
+                }
+                .buttonStyle(FolderCardButtonStyle())
+              } else if item.isPhoto {
+                VideoCard(item: item, transitionNamespace: playerTransition, compact: compactGrid) {
+                  selectedPhoto = item
+                }
+              } else {
+                VideoCard(item: item, transitionNamespace: playerTransition, compact: compactGrid) {
+                  selectedVideo = item
+                }
               }
             }
-          }
-
-          if query.isEmpty, hasMore {
-            Color.clear
-              .frame(height: 1)
-              .onAppear { Task { await loadNextPage() } }
-          }
-
-          if isLoadingMore {
-            ProgressView()
-              .frame(maxWidth: .infinity)
-              .padding(.vertical, 18)
+          } footer: {
+            paginationFooter.padding(.vertical, 20)
           }
         }
         .id("grid-\(folderID)-\(safeGridColumns)")
-        .transaction { transaction in
-          transaction.animation = nil
-        }
-        .padding(.horizontal, 10)
-        .padding(.top, 10)
-        .padding(.bottom, 30)
+        .scrollTargetLayout()
+        .padding(.horizontal, compactGrid ? 2 : 10)
+        .padding(.top, compactGrid ? 2 : 10)
+
       }
+      .scrollPosition(id: $gridScrollPosition, anchor: .top)
+      .scrollDismissesKeyboard(.interactively)
       .refreshable { await refreshCurrentFolder() }
 
     case .list:
@@ -322,7 +347,11 @@ struct FolderView: View {
               FolderListRow(item: item)
             }
           } else if item.isPhoto {
-            PhotoListRow(item: item)
+            Button { selectedPhoto = item } label: {
+              PhotoListRow(item: item)
+                .cinevaPlayerTransitionSource(id: item.id, in: playerTransition)
+            }
+            .buttonStyle(.plain)
           } else {
             Button {
               selectedVideo = item
@@ -337,24 +366,34 @@ struct FolderView: View {
           }
         }
 
-        if query.isEmpty, hasMore {
-          Color.clear
-            .frame(height: 1)
-            .listRowSeparator(.hidden)
-            .onAppear { Task { await loadNextPage() } }
-        }
-
-        if isLoadingMore {
-          HStack {
-            Spacer()
-            ProgressView()
-            Spacer()
-          }
+        paginationFooter
           .listRowSeparator(.hidden)
-        }
       }
       .listStyle(.plain)
+      .scrollDismissesKeyboard(.interactively)
       .refreshable { await refreshCurrentFolder() }
+    }
+  }
+
+  @ViewBuilder
+  private var paginationFooter: some View {
+    if isSearching {
+      ProgressView("正在搜索…").font(.caption)
+    } else if query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, hasMore {
+      if let transientMessage, !isLoadingMore {
+        Button("继续加载") { Task { await loadNextPage() } }
+          .accessibilityHint(transientMessage)
+      } else {
+        ProgressView().controlSize(.small)
+          .frame(maxWidth: .infinity, minHeight: 36)
+          .task(id: "\(pagingRevision)|\(nextOffset)|\(mediaFilter.rawValue)|\(isInitialLoading)|\(isRefreshing)") {
+            await loadNextPage()
+          }
+      }
+    } else if !displayItems.isEmpty {
+      Text("\(displayItems.count) 个项目")
+        .font(.caption).foregroundStyle(.secondary)
+        .frame(maxWidth: .infinity)
     }
   }
 
@@ -362,7 +401,7 @@ struct FolderView: View {
     displayItems.lazy
       .filter(\.isVideo)
       .prefix(12)
-      .map { "\($0.id):\($0.sha1)" }
+      .map { "\($0.id):\($0.size)" }
       .joined(separator: "|")
   }
 
@@ -445,7 +484,7 @@ struct FolderView: View {
 
   private var columns: [GridItem] {
     Array(
-      repeating: GridItem(.flexible(minimum: 0), spacing: 9, alignment: .top),
+      repeating: GridItem(.flexible(minimum: 0), spacing: compactGrid ? 2 : 9, alignment: .top),
       count: safeGridColumns
     )
   }
@@ -472,10 +511,10 @@ struct FolderView: View {
     }
 
     displayItems = output
+  }
 
-    // Build the queue only when the underlying directory changes instead of
-    // sorting the entire video list on every SwiftUI body invalidation.
-    playlistItems = source
+  private func rebuildPlaylistItems() {
+    playlistItems = items
       .filter { !$0.isDirectory && $0.isVideo }
       .sorted {
         let comparison = $0.name.localizedStandardCompare($1.name)
@@ -501,7 +540,7 @@ struct FolderView: View {
     let revision = pagingRevision
     isLoadingMore = false
     isRefreshing = true
-    defer { isRefreshing = false }
+    defer { if revision == pagingRevision { isRefreshing = false } }
 
     // Manual refresh means a real directory synchronization, not just a repaint
     // of the currently visible page. The first forced page invalidates both
@@ -515,6 +554,7 @@ struct FolderView: View {
 
     do {
       repeat {
+        guard revision == pagingRevision, !Task.isCancelled else { return }
         let page = try await appState.api.listFolderPage(
           id: folderID,
           offset: offset,
@@ -530,9 +570,11 @@ struct FolderView: View {
 
       guard revision == pagingRevision, !Task.isCancelled else { return }
 
+      artworkRefreshRevision &+= 1
       items = CloudItemCollectionPolicy.ordered(refreshed, by: collectionSortOrder)
       searchItems = nil
       rebuildDisplayItems()
+      rebuildPlaylistItems()
       nextOffset = offset
       hasMore = lastPage?.hasMore ?? false
       errorMessage = nil
@@ -550,7 +592,7 @@ struct FolderView: View {
         await updateSearchResults()
       }
     } catch {
-      guard !Task.isCancelled else { return }
+      guard !Task.isCancelled, revision == pagingRevision else { return }
       appState.markMediaOffline()
       transientMessage = "刷新失败，已保留当前资料库。"
     }
@@ -562,7 +604,8 @@ struct FolderView: View {
     let revision = pagingRevision
     isInitialLoading = items.isEmpty
     isLoadingMore = false
-    defer { isInitialLoading = false }
+    isRefreshing = false
+    defer { if revision == pagingRevision { isInitialLoading = false } }
 
     do {
       let page = try await appState.api.listFolderPage(
@@ -573,9 +616,11 @@ struct FolderView: View {
         sortOrder: collectionSortOrder
       )
       guard revision == pagingRevision, !Task.isCancelled else { return }
+      isInitialLoading = false
       items = CloudItemCollectionPolicy.ordered(page.items, by: collectionSortOrder)
       searchItems = nil
       rebuildDisplayItems()
+      rebuildPlaylistItems()
       nextOffset = page.limit
       hasMore = page.hasMore
       errorMessage = nil
@@ -593,8 +638,11 @@ struct FolderView: View {
         transientMessage = nil
         didScheduleBackgroundRefresh = true
       }
+      if !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !Task.isCancelled {
+        await updateSearchResults()
+      }
     } catch {
-      guard !Task.isCancelled else { return }
+      guard !Task.isCancelled, revision == pagingRevision else { return }
       appState.markMediaOffline()
       errorMessage = error.localizedDescription
     }
@@ -602,6 +650,7 @@ struct FolderView: View {
 
   @MainActor
   private func refreshFirstPageSilently() async {
+    let revision = pagingRevision
     do {
       let page = try await appState.api.listFolderPage(
         id: folderID,
@@ -610,13 +659,15 @@ struct FolderView: View {
         forceRefresh: true,
         sortOrder: collectionSortOrder
       )
-      guard !Task.isCancelled else { return }
+      guard !Task.isCancelled, revision == pagingRevision else { return }
+      artworkRefreshRevision &+= 1
       items = CloudItemCollectionPolicy.mergingFirstPage(
         page.items,
         into: items,
         by: collectionSortOrder
       )
       rebuildDisplayItems()
+      rebuildPlaylistItems()
       nextOffset = max(nextOffset, page.offset + page.limit)
       if let total = page.total {
         hasMore = nextOffset < total
@@ -629,7 +680,7 @@ struct FolderView: View {
         appState.markMediaConnected()
       }
     } catch {
-      guard !Task.isCancelled else { return }
+      guard !Task.isCancelled, revision == pagingRevision else { return }
       // Keep the already rendered cache; a background refresh must never blank the directory.
       appState.markMediaUsingCache()
     }
@@ -638,26 +689,37 @@ struct FolderView: View {
   @MainActor
   private func updateSearchResults() async {
     guard appState.isAppUnlocked else {
+      isSearching = false
       searchItems = nil
       rebuildDisplayItems()
       return
     }
     let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else {
+      isSearching = false
       searchItems = nil
       rebuildDisplayItems()
       return
     }
 
+    let revision = pagingRevision
+    isSearching = true
+    defer {
+      if !Task.isCancelled, revision == pagingRevision,
+        trimmed == query.trimmingCharacters(in: .whitespacesAndNewlines) { isSearching = false }
+    }
     try? await Task.sleep(for: .milliseconds(180))
-    guard !Task.isCancelled else { return }
+    guard !Task.isCancelled, revision == pagingRevision,
+        trimmed == query.trimmingCharacters(in: .whitespacesAndNewlines) else { return }
     do {
       let all = try await appState.api.listFolder(id: folderID)
-      guard !Task.isCancelled else { return }
+      guard !Task.isCancelled, revision == pagingRevision,
+        trimmed == query.trimmingCharacters(in: .whitespacesAndNewlines) else { return }
       searchItems = CloudItemCollectionPolicy.ordered(all, by: collectionSortOrder)
       rebuildDisplayItems()
     } catch {
-      guard !Task.isCancelled else { return }
+      guard !Task.isCancelled, revision == pagingRevision,
+        trimmed == query.trimmingCharacters(in: .whitespacesAndNewlines) else { return }
       // Search the loaded page rather than failing the whole screen.
       searchItems = items
       rebuildDisplayItems()
@@ -666,11 +728,13 @@ struct FolderView: View {
 
   @MainActor
   private func loadNextPage() async {
-    guard hasMore, !isLoadingMore else { return }
+    guard hasMore, !isLoadingMore, !isRefreshing, !isInitialLoading,
+      appState.isAppUnlocked, appState.isConfigured, !Task.isCancelled else { return }
     let requestedOffset = nextOffset
     let revision = pagingRevision
     isLoadingMore = true
-    defer { isLoadingMore = false }
+    transientMessage = nil
+    defer { if revision == pagingRevision { isLoadingMore = false } }
 
     do {
       let page = try await appState.api.listFolderPage(
@@ -687,6 +751,7 @@ struct FolderView: View {
         by: collectionSortOrder
       )
       rebuildDisplayItems()
+      rebuildPlaylistItems()
       nextOffset = requestedOffset + page.limit
       hasMore = page.hasMore
       if page.servedFromCache {
@@ -698,13 +763,13 @@ struct FolderView: View {
         appState.markMediaConnected()
       }
     } catch let error as CloudProviderError {
-      guard !Task.isCancelled else { return }
+      guard !Task.isCancelled, revision == pagingRevision else { return }
       // Keep the mounted directory visible. The user can continue browsing what has
       // already been indexed instead of losing the whole screen to a temporary 405.
       appState.markMediaOffline()
       transientMessage = error.localizedDescription
     } catch {
-      guard !Task.isCancelled else { return }
+      guard !Task.isCancelled, revision == pagingRevision else { return }
       appState.markMediaOffline()
       transientMessage = "网络暂时不可用，已保留当前资料库。"
     }
@@ -712,16 +777,18 @@ struct FolderView: View {
 }
 
 private struct FolderCardButtonStyle: ButtonStyle {
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
   func makeBody(configuration: Configuration) -> some View {
     configuration.label
-      .scaleEffect(configuration.isPressed ? 0.985 : 1)
+      .scaleEffect(configuration.isPressed && !reduceMotion ? 0.975 : 1)
       .opacity(configuration.isPressed ? 0.90 : 1)
-      .animation(.spring(response: 0.24, dampingFraction: 0.86), value: configuration.isPressed)
+      .animation(reduceMotion ? nil : .smooth(duration: 0.18), value: configuration.isPressed)
   }
 }
 
 private struct FolderCard: View {
   let item: CloudItem
+  var compact = false
 
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
@@ -736,18 +803,26 @@ private struct FolderCard: View {
           .foregroundStyle(CinevaTheme.accent)
           .padding(14)
       }
-      .aspectRatio(16 / 9, contentMode: .fit)
-      .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+      .aspectRatio(compact ? 1 : 16 / 9, contentMode: .fit)
+      .clipShape(RoundedRectangle(cornerRadius: compact ? 3 : 12, style: .continuous))
+      .overlay(alignment: .topLeading) {
+        if compact {
+          Text(item.name).font(.caption.weight(.semibold)).lineLimit(2)
+            .foregroundStyle(.primary).padding(8)
+        }
+      }
 
-      Text(item.name)
-        .font(.subheadline.weight(.semibold))
-        .foregroundStyle(.primary)
-        .lineLimit(2)
-        .multilineTextAlignment(.leading)
+      if !compact {
+        Text(item.name)
+          .font(.subheadline.weight(.semibold))
+          .foregroundStyle(.primary)
+          .lineLimit(2)
+          .multilineTextAlignment(.leading)
 
-      Text("文件夹")
-        .font(.caption2)
-        .foregroundStyle(.secondary)
+        Text("文件夹")
+          .font(.caption2)
+          .foregroundStyle(.secondary)
+      }
     }
     .contentShape(Rectangle())
   }
@@ -781,71 +856,15 @@ private struct FolderListRow: View {
   }
 }
 
-private struct PhotoFileCard: View {
-  @Environment(AppState.self) private var appState
-  let item: CloudItem
-
-  var body: some View {
-    VStack(alignment: .leading, spacing: 5) {
-      ZStack {
-        LinearGradient(
-          colors: [Color.secondary.opacity(0.13), Color.secondary.opacity(0.05)],
-          startPoint: .topLeading,
-          endPoint: .bottomTrailing
-        )
-        Image(systemName: "photo.fill")
-          .font(.system(size: 32, weight: .medium))
-          .foregroundStyle(.secondary.opacity(0.72))
-      }
-      .aspectRatio(16 / 9, contentMode: .fit)
-      .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-
-      Text(item.name)
-        .font(.caption.weight(.semibold))
-        .foregroundStyle(.primary)
-        .lineLimit(2)
-
-      HStack(spacing: 5) {
-        Text(item.formattedSize)
-          .font(.caption2)
-          .foregroundStyle(.secondary)
-        Spacer(minLength: 2)
-        if appState.libraryStore.isFavorite(item) {
-          Image(systemName: "heart.fill")
-            .font(.caption2)
-            .foregroundStyle(CinevaTheme.accent)
-        }
-      }
-    }
-    .contentShape(Rectangle())
-    .contextMenu {
-      let isFavorite = appState.libraryStore.isFavorite(item)
-      Button {
-        appState.libraryStore.toggleFavorite(item)
-        let feedback = UIImpactFeedbackGenerator(style: .medium)
-        feedback.prepare()
-        feedback.impactOccurred(intensity: 0.82)
-      } label: {
-        Label(isFavorite ? "取消收藏" : "收藏", systemImage: isFavorite ? "heart.slash" : "heart")
-      }
-    }
-  }
-}
-
 private struct PhotoListRow: View {
   @Environment(AppState.self) private var appState
   let item: CloudItem
 
   var body: some View {
     HStack(spacing: 13) {
-      ZStack {
-        RoundedRectangle(cornerRadius: 12, style: .continuous)
-          .fill(Color.secondary.opacity(0.10))
-        Image(systemName: "photo.fill")
-          .font(.title3)
-          .foregroundStyle(.secondary)
-      }
-      .frame(width: 82, height: 48)
+      VideoArtwork(item: item)
+        .frame(width: 82, height: 48)
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
 
       VStack(alignment: .leading, spacing: 5) {
         Text(item.name)
@@ -937,9 +956,10 @@ private struct VideoListRow: View {
   }
 
   private var progress: Double {
-    guard item.duration > 0 else { return 0 }
+    let duration = appState.libraryStore.knownDuration(for: item)
+    guard duration > 0 else { return 0 }
     let position = appState.libraryStore.resumePosition(for: item)
-    guard position > 2, position < item.duration - 8 else { return 0 }
-    return min(max(position / item.duration, 0), 1)
+    guard position > 2, position < duration - 8 else { return 0 }
+    return min(max(position / duration, 0), 1)
   }
 }

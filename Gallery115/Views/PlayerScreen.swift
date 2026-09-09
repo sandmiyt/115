@@ -15,6 +15,7 @@ private enum PlayerDragIntent {
 }
 
 struct PlayerScreen: View {
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @Environment(\.dismiss) private var dismiss
   @Environment(AppState.self) private var appState
 
@@ -103,6 +104,9 @@ struct PlayerScreen: View {
       // Prevent the modal recognizer from stealing the same finger stream; the
       // committed dismissal still uses the existing card-linked zoom transition.
       .interactiveDismissDisabled()
+      .transaction { transaction in
+        if reduceMotion { transaction.animation = nil }
+      }
   }
 
   private var playerBaseView: some View {

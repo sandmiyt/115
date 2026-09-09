@@ -171,3 +171,24 @@ enum CloudItemCollectionPolicy {
     return lhs.id < rhs.id
   }
 }
+
+/// Optional hints from OpenList's existing refresh response; WebDAV remains authoritative.
+enum OpenListArtworkHints {
+  static func parse(_ data: Data) -> [String: URL] {
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+      (json["code"] as? NSNumber)?.intValue == 200,
+      let payload = json["data"] as? [String: Any],
+      let entries = payload["content"] as? [[String: Any]] else { return [:] }
+    var result: [String: URL] = [:]
+    for entry in entries {
+      guard entry["is_dir"] as? Bool != true,
+        let name = entry["name"] as? String, !name.isEmpty,
+        let raw = entry["thumb"] as? String,
+        let url = URL(string: raw),
+        let scheme = url.scheme?.lowercased(), ["https", "http"].contains(scheme),
+        url.host != nil, url.user == nil, url.password == nil else { continue }
+      result[name] = url
+    }
+    return result
+  }
+}

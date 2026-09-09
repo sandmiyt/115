@@ -55,7 +55,8 @@ struct RootView: View {
     }
     .coordinateSpace(name: CinevaLaunchHeroSpace.name)
     .onPreferenceChange(HomeLogoFramePreferenceKey.self) { frame in
-      guard frame.width > 1, frame.height > 1 else { return }
+      guard launchHeroVisible, !launchHeroStarted,
+        frame.width > 1, frame.height > 1 else { return }
       homeLogoFrame = frame
       startLaunchHeroIfReady()
     }
@@ -484,11 +485,12 @@ private struct ContinueWatchingCard: View {
 }
 
 private struct HomeMediaButtonStyle: ButtonStyle {
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
   func makeBody(configuration: Configuration) -> some View {
     configuration.label
-      .scaleEffect(configuration.isPressed ? 0.985 : 1)
+      .scaleEffect(configuration.isPressed && !reduceMotion ? 0.985 : 1)
       .opacity(configuration.isPressed ? 0.90 : 1)
-      .animation(.spring(response: 0.24, dampingFraction: 0.86), value: configuration.isPressed)
+      .animation(reduceMotion ? nil : .smooth(duration: 0.18), value: configuration.isPressed)
   }
 }
 

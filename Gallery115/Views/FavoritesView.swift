@@ -3,6 +3,8 @@ import SwiftUI
 struct FavoritesView: View {
   @Environment(AppState.self) private var appState
   @State private var selectedVideo: CloudItem?
+  @State private var selectedPhoto: CloudItem?
+  @AppStorage("gallery115.compactGrid") private var compactGrid = true
   @Namespace private var playerTransition
 
   var body: some View {
@@ -15,22 +17,24 @@ struct FavoritesView: View {
         )
       } else {
         ScrollView {
-          LazyVGrid(columns: columns, spacing: 14) {
+          LazyVGrid(columns: columns, spacing: compactGrid ? 2 : 14) {
             ForEach(appState.libraryStore.favorites) { item in
-              VideoCard(item: item, transitionNamespace: playerTransition) {
-                selectedVideo = item
+              VideoCard(item: item, transitionNamespace: playerTransition, compact: compactGrid) {
+                if item.isPhoto { selectedPhoto = item }
+                else { selectedVideo = item }
               }
             }
           }
           .id("favorites-grid-\(safeGridColumns)")
-          .transaction { transaction in
-            transaction.animation = nil
-          }
-          .padding(14)
+          .padding(compactGrid ? 2 : 14)
         }
       }
     }
     .navigationTitle("收藏")
+    .fullScreenCover(item: $selectedPhoto) { item in
+      PhotoPreviewScreen(item: item)
+        .cinevaPlayerZoomTransition(sourceID: item.id, in: playerTransition)
+    }
     .fullScreenCover(item: $selectedVideo) { item in
       PlayerScreen(item: item)
         .cinevaPlayerZoomTransition(sourceID: item.id, in: playerTransition)
@@ -43,7 +47,7 @@ struct FavoritesView: View {
 
   private var columns: [GridItem] {
     Array(
-      repeating: GridItem(.flexible(minimum: 0), spacing: 10, alignment: .top),
+      repeating: GridItem(.flexible(minimum: 0), spacing: compactGrid ? 2 : 10, alignment: .top),
       count: safeGridColumns
     )
   }

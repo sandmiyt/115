@@ -103,11 +103,12 @@ struct RecentView: View {
 }
 
 private struct RecentRowButtonStyle: ButtonStyle {
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
   func makeBody(configuration: Configuration) -> some View {
     configuration.label
-      .scaleEffect(configuration.isPressed ? 0.988 : 1)
+      .scaleEffect(configuration.isPressed && !reduceMotion ? 0.988 : 1)
       .opacity(configuration.isPressed ? 0.88 : 1)
-      .animation(.spring(response: 0.24, dampingFraction: 0.86), value: configuration.isPressed)
+      .animation(reduceMotion ? nil : .smooth(duration: 0.18), value: configuration.isPressed)
   }
 }
 

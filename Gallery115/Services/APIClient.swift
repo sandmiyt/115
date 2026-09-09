@@ -76,6 +76,19 @@ actor APIClient {
     }
   }
 
+  func photoSource(for item: CloudItem) async throws -> VideoSource? {
+    guard item.isPhoto else { return nil }
+    switch source {
+    case .webDAV: return try await webDAV.videoSources(for: item).first
+    case .cloud115: return try await cloud115.photoSource(for: item)
+    }
+  }
+
+  func serverThumbnailURL(for item: CloudItem) async -> URL? {
+    guard source == .webDAV else { return nil }
+    return await webDAV.serverThumbnailURL(for: item)
+  }
+
   func posterData(for item: CloudItem) async -> Data? {
     guard source == .webDAV else { return nil }
     return await webDAV.posterData(for: item)

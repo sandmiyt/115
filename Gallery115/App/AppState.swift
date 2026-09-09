@@ -110,6 +110,7 @@ final class AppState {
   let thumbnailService = ThumbnailService()
   let libraryStore = LibraryStore()
 
+  private(set) var mediaSourceRevision = UUID()
   private(set) var mediaSourceKind: MediaSourceKind
   var isConfigured: Bool
   var biometricErrorMessage: String?
@@ -324,6 +325,7 @@ final class AppState {
     Task {
       await api.clearAllMountCaches()
       await thumbnailService.resetForSourceChange()
+      mediaSourceRevision = UUID()
     }
   }
 
@@ -363,6 +365,7 @@ final class AppState {
     Task {
       await api.clearAllMountCaches()
       await thumbnailService.resetForSourceChange()
+      mediaSourceRevision = UUID()
     }
     isAppUnlocked = true
     requiresAuthenticationAfterBackground = false

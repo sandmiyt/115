@@ -18,6 +18,8 @@ actor WebDAVProvider: CloudProvider {
   private var directoryFileIndexCache: [String: [String: CloudItem]] = [:]
   private var metadataCache: [String: LocalMediaMetadata] = [:]
   private var metadataMisses: Set<String> = []
+  private var serverThumbnailHints: [String: [String: URL]] = [:]
+  private let posterCache = NSCache<NSString, NSData>()
   private var lastRequestAt: Date = .distantPast
   private let cacheDirectory: URL
 
@@ -28,6 +30,8 @@ actor WebDAVProvider: CloudProvider {
     config.requestCachePolicy = .reloadIgnoringLocalCacheData
     config.httpMaximumConnectionsPerHost = 4
     session = URLSession(configuration: config)
+    posterCache.countLimit = 48
+    posterCache.totalCostLimit = 24 * 1_024 * 1_024
 
     let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
     cacheDirectory = base.appending(path: "CinevaWebDAVMountCache", directoryHint: .isDirectory)
@@ -109,6 +113,7 @@ actor WebDAVProvider: CloudProvider {
           orderedItemCache = orderedItemCache.filter { !$0.key.hasPrefix(cacheKey + "|sort|") }
           metadataCache.removeAll()
           metadataMisses.removeAll()
+    posterCache.removeAllObjects()
         }
         let fetched = try await fetchDirectory(
           configuration: configuration,
@@ -281,6 +286,13 @@ actor WebDAVProvider: CloudProvider {
     return metadata
   }
 
+  /// Optional server artwork from the last successful OpenList refresh.
+  func serverThumbnailURL(for item: CloudItem) -> URL? {
+    guard let configuration = store.configuration else { return nil }
+    let key = configuration.cacheNamespace + "|thumb|" + normalizeLogicalPath(item.parentID)
+    return serverThumbnailHints[key]?[item.name]
+  }
+
   /// Artwork discovery must not wait for NFO parsing or cache transient failures.
   func posterData(for item: CloudItem) async -> Data? {
     guard !Task.isCancelled, !item.isDirectory,
@@ -293,16 +305,30 @@ actor WebDAVProvider: CloudProvider {
       let candidates = ["\(stem)-poster.jpg", "\(stem)-poster.jpeg", "\(stem)-poster.png",
                         "\(stem)-thumb.jpg", "\(stem)-thumb.png", "\(stem).jpg", "\(stem).png",
                         "poster.jpg", "poster.jpeg", "poster.png", "folder.jpg", "cover.jpg"]
-      var index: [String: CloudItem] = [:]
-      for entry in entries where !entry.isDirectory {
-        if index[entry.name.lowercased()] == nil { index[entry.name.lowercased()] = entry }
+      let rawKey = configuration.cacheNamespace + "|raw|" + normalizeLogicalPath(item.parentID)
+      let index: [String: CloudItem]
+      if let cached = directoryFileIndexCache[rawKey] {
+        index = cached
+      } else {
+        var built: [String: CloudItem] = [:]
+        built.reserveCapacity(entries.count)
+        for entry in entries where !entry.isDirectory {
+          if built[entry.name.lowercased()] == nil { built[entry.name.lowercased()] = entry }
+        }
+        directoryFileIndexCache[rawKey] = built
+        index = built
       }
       for name in candidates {
         guard !Task.isCancelled else { return nil }
         guard let poster = index[name] else { continue }
+        let cacheKey = (configuration.cacheNamespace + "|poster|" + poster.id) as NSString
+        if let data = posterCache.object(forKey: cacheKey) { return data as Data }
         do {
-          return try await fetchResourceData(configuration: configuration,
+          let data = try await fetchResourceData(configuration: configuration,
             logicalPath: poster.id, maximumBytes: 12_000_000)
+          guard !Task.isCancelled else { return nil }
+          posterCache.setObject(data as NSData, forKey: cacheKey, cost: data.count)
+          return data
         } catch {
           if Task.isCancelled { return nil }
         }
@@ -391,11 +417,13 @@ actor WebDAVProvider: CloudProvider {
 
   func clearMountCache() async {
     memoryCache.removeAll()
+    serverThumbnailHints.removeAll()
     orderedItemCache.removeAll()
     rawDirectoryCache.removeAll()
     directoryFileIndexCache.removeAll()
     metadataCache.removeAll()
     metadataMisses.removeAll()
+          posterCache.removeAllObjects()
     try? FileManager.default.removeItem(at: cacheDirectory)
     try? FileManager.default.createDirectory(
       at: cacheDirectory,
@@ -419,6 +447,8 @@ actor WebDAVProvider: CloudProvider {
       let baseURL = openListBaseURL(configuration: configuration)
     else { return false }
 
+    let hintKey = configuration.cacheNamespace + "|thumb|" + normalizeLogicalPath(logicalPath)
+    serverThumbnailHints[hintKey] = nil
     do {
       let loginURL = baseURL
         .appending(path: "api")
@@ -436,6 +466,7 @@ actor WebDAVProvider: CloudProvider {
         "otp_code": "",
       ])
 
+      guard !Task.isCancelled else { return false }
       let (loginData, loginResponse) = try await session.data(for: loginRequest)
       guard let loginHTTP = loginResponse as? HTTPURLResponse,
         (200...299).contains(loginHTTP.statusCode),
@@ -446,6 +477,7 @@ actor WebDAVProvider: CloudProvider {
         !token.isEmpty
       else { return false }
 
+      guard !Task.isCancelled else { return false }
       let listURL = baseURL
         .appending(path: "api")
         .appending(path: "fs")
@@ -462,7 +494,7 @@ actor WebDAVProvider: CloudProvider {
         "path": normalizeLogicalPath(logicalPath),
         "password": "",
         "page": 1,
-        "per_page": 1,
+        "per_page": 10_000,
         "refresh": true,
       ])
 
@@ -472,6 +504,9 @@ actor WebDAVProvider: CloudProvider {
         let listJSON = try JSONSerialization.jsonObject(with: listData) as? [String: Any],
         (listJSON["code"] as? NSNumber)?.intValue == 200
       else { return false }
+      guard !Task.isCancelled else { return false }
+      let hintKey = configuration.cacheNamespace + "|thumb|" + normalizeLogicalPath(logicalPath)
+      serverThumbnailHints[hintKey] = OpenListArtworkHints.parse(listData)
       return true
     } catch {
       return false

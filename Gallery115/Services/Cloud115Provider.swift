@@ -177,11 +177,13 @@ actor Cloud115Provider: CloudProvider {
       transcodeError = error
     }
 
+    try Task.checkCancellation()
     do {
       let original = try await originalSource(pickCode: item.pickCode)
       sources.append(original)
     } catch {}
 
+    try Task.checkCancellation()
     let unique = Dictionary(grouping: sources, by: \.id).compactMap { $0.value.first }
     let sorted = unique.sorted { lhs, rhs in
       if lhs.isOriginal != rhs.isOriginal { return !lhs.isOriginal }
@@ -209,6 +211,11 @@ actor Cloud115Provider: CloudProvider {
       try Task.checkCancellation()
     }
     try Task.checkCancellation()
+    return try await originalSource(pickCode: item.pickCode)
+  }
+
+  func photoSource(for item: CloudItem) async throws -> VideoSource? {
+    guard item.isPhoto, !item.pickCode.isEmpty else { return nil }
     return try await originalSource(pickCode: item.pickCode)
   }
 
@@ -320,6 +327,7 @@ actor Cloud115Provider: CloudProvider {
     var transientAttempt = 0
 
     while true {
+      try Task.checkCancellation()
       let accessToken = try await auth.accessToken()
       let result: (Data, HTTPURLResponse)
       do {
@@ -332,9 +340,11 @@ actor Cloud115Provider: CloudProvider {
           accessToken: accessToken
         )
       } catch let error as URLError {
+        try Task.checkCancellation()
+        if error.code == .cancelled { throw CancellationError() }
         if transientAttempt < 1 {
           transientAttempt += 1
-          try? await Task.sleep(for: .milliseconds(350))
+          try await Task.sleep(for: .milliseconds(350))
           continue
         }
         throw CloudProviderError.network(error.localizedDescription)
@@ -364,7 +374,7 @@ actor Cloud115Provider: CloudProvider {
         // this as temporary overload rather than an instruction to log the user out.
         if transientAttempt < 2 {
           transientAttempt += 1
-          try? await Task.sleep(for: .milliseconds(1100 * transientAttempt))
+          try await Task.sleep(for: .milliseconds(1100 * transientAttempt))
           continue
         }
         throw CloudProviderError.rateLimited(
@@ -375,7 +385,7 @@ actor Cloud115Provider: CloudProvider {
       if http.statusCode == 429 {
         if transientAttempt < 2 {
           transientAttempt += 1
-          try? await Task.sleep(for: .milliseconds(1200 * transientAttempt))
+          try await Task.sleep(for: .milliseconds(1200 * transientAttempt))
           continue
         }
         throw CloudProviderError.rateLimited("115 请求过于频繁，请稍后再试。")
@@ -384,7 +394,7 @@ actor Cloud115Provider: CloudProvider {
       if http.statusCode >= 500 {
         if transientAttempt < 1 {
           transientAttempt += 1
-          try? await Task.sleep(for: .milliseconds(450))
+          try await Task.sleep(for: .milliseconds(450))
           continue
         }
         throw CloudProviderError.network("115 服务暂时不可用，请稍后再试。")
@@ -410,7 +420,7 @@ actor Cloud115Provider: CloudProvider {
         if isRateLimitCode(status.code, message: status.message) {
           if transientAttempt < 2 {
             transientAttempt += 1
-            try? await Task.sleep(for: .milliseconds(1200 * transientAttempt))
+            try await Task.sleep(for: .milliseconds(1200 * transientAttempt))
             continue
           }
           throw CloudProviderError.rateLimited(status.message)
@@ -452,7 +462,8 @@ actor Cloud115Provider: CloudProvider {
       request.httpBody = form.cloud115FormEncoded.data(using: .utf8)
     }
 
-    await waitForRequestSlot()
+    try await waitForRequestSlot()
+    try Task.checkCancellation()
     let (data, response) = try await session.data(for: request)
     guard let http = response as? HTTPURLResponse else {
       throw CloudProviderError.invalidResponse(path)
@@ -460,13 +471,18 @@ actor Cloud115Provider: CloudProvider {
     return (data, http)
   }
 
-  private func waitForRequestSlot() async {
-    let now = Date().timeIntervalSinceReferenceDate
-    let scheduled = max(now, nextRequestSlot)
-    nextRequestSlot = scheduled + requestInterval
-    let delay = scheduled - now
-    if delay > 0 {
-      try? await Task.sleep(for: .milliseconds(Int((delay * 1000).rounded(.up))))
+  private func waitForRequestSlot() async throws {
+    // Claim a slot only when it can be used. Cancelling queued thumbnail work
+    // must not reserve a long tail of future slots ahead of a playback request.
+    while true {
+      try Task.checkCancellation()
+      let now = ProcessInfo.processInfo.systemUptime
+      let delay = nextRequestSlot - now
+      if delay <= 0 {
+        nextRequestSlot = now + requestInterval
+        return
+      }
+      try await Task.sleep(for: .seconds(delay))
     }
   }
 

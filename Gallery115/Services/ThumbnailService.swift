@@ -11,20 +11,25 @@ actor ThumbnailService {
     let id: UUID
     let task: Task<UIImage?, Never>
     var clients: Set<UUID>
+    var isPrefetch: Bool
   }
   private struct SlotWaiter {
     let id: UUID
     let continuation: CheckedContinuation<Bool, Never>
+    var isPrefetch: Bool
+    let isFrame: Bool
   }
 
   private let disk: ArtworkDiskStore
   private let namespace: @Sendable () -> String
   private let loader: Loader?
+  private let frameLoader: Loader?
   private let memoryCache = NSCache<NSString, UIImage>()
   private let logger = Logger(subsystem: "com.xiaocai.gallery115", category: "Artwork")
   private var inFlight: [String: Work] = [:]
   private var failedUntil: [String: Date] = [:]
   private var activeSlots: Set<UUID> = []
+  private var activeFrameSlots: Set<UUID> = []
   private var slotWaiters: [SlotWaiter] = []
   private var playbackOwners: Set<UUID> = []
   private var cacheGeneration = UUID()
@@ -33,11 +38,13 @@ actor ThumbnailService {
   init(
     disk: ArtworkDiskStore = ArtworkDiskStore(),
     namespace: @escaping @Sendable () -> String = ThumbnailService.currentNamespace,
-    loader: Loader? = nil
+    loader: Loader? = nil,
+    frameLoader: Loader? = nil
   ) {
     self.disk = disk
     self.namespace = namespace
     self.loader = loader
+    self.frameLoader = frameLoader
     memoryCache.countLimit = 160
     memoryCache.totalCostLimit = 72 * 1_024 * 1_024
   }
@@ -59,8 +66,8 @@ actor ThumbnailService {
                     modifiedAt: item.modifiedAt, legacyKey: item.sha1.isEmpty ? item.id : item.sha1)
   }
 
-  func thumbnail(for item: CloudItem, api: APIClient) async -> UIImage? {
-    guard item.isVideo else { return nil }
+  func thumbnail(for item: CloudItem, api: APIClient, isPrefetch: Bool = false) async -> UIImage? {
+    guard item.isVideo || item.isPhoto else { return nil }
     let identity = identity(for: item)
     let generation = cacheGeneration
     while !Task.isCancelled, generation == cacheGeneration, identity.namespace == namespace() {
@@ -71,15 +78,19 @@ actor ThumbnailService {
       let work: Work
       if var existing = inFlight[identity.key] {
         existing.clients.insert(clientID)
+        if !isPrefetch { existing.isPrefetch = false }
+        if !isPrefetch, let index = slotWaiters.firstIndex(where: { $0.id == existing.id }) {
+          slotWaiters[index].isPrefetch = false
+        }
         inFlight[identity.key] = existing
         work = existing
       } else {
         let workID = UUID()
         let task = Task<UIImage?, Never> { [weak self] in
           guard let self else { return nil }
-          return await self.load(item, identity: identity, api: api, generation: generation, workID: workID)
+          return await self.load(item, identity: identity, api: api, generation: generation, workID: workID, isPrefetch: isPrefetch)
         }
-        work = Work(id: workID, task: task, clients: [clientID])
+        work = Work(id: workID, task: task, clients: [clientID], isPrefetch: isPrefetch)
         inFlight[identity.key] = work
       }
 
@@ -108,18 +119,12 @@ actor ThumbnailService {
   }
 
   func prefetch(_ items: [CloudItem], api: APIClient, limit: Int = 12) async {
-    // WebDAV items normally have no ready-made thumbnail URL. They still need
-    // proactive sidecar/frame generation instead of waiting for each card to
-    // appear. The shared slot gate below keeps this bounded and playback-safe.
-    let targets = Array(items.lazy.filter(\.isVideo).prefix(max(limit, 0)))
-    await withTaskGroup(of: Void.self) { group in
-      for item in targets {
-        group.addTask { [weak self] in
-          guard let self, !Task.isCancelled else { return }
-          _ = await self.thumbnail(for: item, api: api)
-        }
-      }
-      await group.waitForAll()
+    // Only one speculative load at a time. Visible cards still fill the other
+    // slots and jump ahead of queued prefetches after a fast scroll.
+    let targets = Array(items.lazy.filter { $0.isVideo || $0.isPhoto }.prefix(max(limit, 0)))
+    for item in targets {
+      guard !Task.isCancelled else { return }
+      _ = await thumbnail(for: item, api: api, isPrefetch: true)
     }
   }
 
@@ -127,6 +132,10 @@ actor ThumbnailService {
     guard playbackOwners.insert(owner).inserted else { return }
     for work in inFlight.values { work.task.cancel() }
     inFlight.removeAll()
+  }
+
+  func queuedRequestCounts() -> (visible: Int, prefetch: Int) {
+    (slotWaiters.filter { !$0.isPrefetch }.count, slotWaiters.filter(\.isPrefetch).count)
   }
 
   func resumeNetwork(for owner: UUID) {
@@ -171,6 +180,7 @@ actor ThumbnailService {
     for waiter in slotWaiters { waiter.continuation.resume(returning: false) }
     slotWaiters.removeAll()
     activeSlots.removeAll()
+    activeFrameSlots.removeAll()
   }
 
   private func localImage(_ identity: ArtworkIdentity) -> UIImage? {
@@ -202,17 +212,33 @@ actor ThumbnailService {
   }
 
   private func load(
-    _ item: CloudItem, identity: ArtworkIdentity, api: APIClient, generation: UUID, workID: UUID
+    _ item: CloudItem, identity: ArtworkIdentity, api: APIClient, generation: UUID, workID: UUID, isPrefetch: Bool
   ) async -> UIImage? {
-    guard await acquireSlot(workID) else { return nil }
-    defer { releaseSlot(workID) }
+    guard await acquireSlot(workID, isPrefetch: isPrefetch) else { return nil }
+    var holdsNetworkSlot = true
+    defer { if holdsNetworkSlot { releaseSlot(workID) } }
     guard !Task.isCancelled, generation == cacheGeneration, identity.namespace == namespace() else { return nil }
     if let image = localImage(identity) { return image }
-    let image: UIImage?
+    var image: UIImage?
     if let loader {
       image = await loader(item, api)
     } else {
       image = await loadNetworkArtwork(for: item, api: api)
+    }
+    // Slow video reads have their own single slot. They must never block a
+    // ready JPEG/poster for another visible cell behind a 20-second frame probe.
+    releaseSlot(workID)
+    holdsNetworkSlot = false
+    if image == nil, item.isVideo, !item.isDiscImage, (loader == nil || frameLoader != nil) {
+      guard !Task.isCancelled, generation == cacheGeneration,
+        await acquireSlot(workID, isPrefetch: inFlight[identity.key]?.isPrefetch ?? isPrefetch, isFrame: true) else { return nil }
+      defer { releaseSlot(workID, isFrame: true) }
+      guard !Task.isCancelled, generation == cacheGeneration else { return nil }
+      if let frameLoader {
+        image = await frameLoader(item, api)
+      } else if let source = try? await api.thumbnailSource(for: item), !Task.isCancelled {
+        image = await Self.frameThumbnail(source: source)
+      }
     }
     guard !Task.isCancelled, generation == cacheGeneration, identity.namespace == namespace(),
       let image else { return nil }
@@ -226,12 +252,16 @@ actor ThumbnailService {
     // issue PROPFIND requests before it reached the frame-generation semaphore.
     if let url = item.thumbnailURL, let image = await remoteThumbnail(at: url) { return image }
     guard !Task.isCancelled else { return nil }
+    if let url = await api.serverThumbnailURL(for: item), url != item.thumbnailURL,
+      let image = await remoteThumbnail(at: url) { return image }
+    guard !Task.isCancelled else { return nil }
+    if item.isPhoto {
+      guard let source = try? await api.photoSource(for: item), !Task.isCancelled else { return nil }
+      return await remoteThumbnail(at: source.url, headers: source.headers)
+    }
     if let data = await api.posterData(for: item),
       let image = downsampledImage(from: data) { return image }
-    guard !Task.isCancelled, !item.isDiscImage,
-      let source = try? await api.thumbnailSource(for: item) else { return nil }
-    guard !Task.isCancelled else { return nil }
-    return await Self.frameThumbnail(source: source)
+    return nil
   }
 
   nonisolated static func frameThumbnail(source: VideoSource) async -> UIImage? {
@@ -260,10 +290,11 @@ actor ThumbnailService {
     }
   }
 
-  private func remoteThumbnail(at url: URL) async -> UIImage? {
+  private func remoteThumbnail(at url: URL, headers: [String: String] = [:]) async -> UIImage? {
     var request = URLRequest(url: url)
-    request.cachePolicy = .reloadIgnoringLocalCacheData
+    request.cachePolicy = .useProtocolCachePolicy
     request.timeoutInterval = 12
+    for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
     guard let (data, response) = try? await URLSession.shared.data(for: request),
       !Task.isCancelled, data.count <= 16_000_000,
       let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode)
@@ -300,16 +331,17 @@ actor ThumbnailService {
     }
   }
 
-  private func acquireSlot(_ id: UUID) async -> Bool {
+  private func acquireSlot(_ id: UUID, isPrefetch: Bool, isFrame: Bool = false) async -> Bool {
     guard !Task.isCancelled else { return false }
-    if playbackOwners.isEmpty, activeSlots.count < maximumNetworkJobs {
-      activeSlots.insert(id)
+    if canAcquireSlot(isFrame: isFrame) {
+      if isFrame { activeFrameSlots.insert(id) }
+      else { activeSlots.insert(id) }
       return true
     }
     return await withTaskCancellationHandler {
       await withCheckedContinuation { continuation in
         if Task.isCancelled { continuation.resume(returning: false) }
-        else { slotWaiters.append(SlotWaiter(id: id, continuation: continuation)) }
+        else { slotWaiters.append(SlotWaiter(id: id, continuation: continuation, isPrefetch: isPrefetch, isFrame: isFrame)) }
       }
     } onCancel: {
       Task { await self.cancelWaiter(id) }
@@ -321,15 +353,23 @@ actor ThumbnailService {
     slotWaiters.remove(at: index).continuation.resume(returning: false)
   }
 
-  private func releaseSlot(_ id: UUID) {
-    activeSlots.remove(id)
+  private func canAcquireSlot(isFrame: Bool) -> Bool {
+    playbackOwners.isEmpty && (isFrame ? activeFrameSlots.isEmpty : activeSlots.count < maximumNetworkJobs)
+  }
+
+  private func releaseSlot(_ id: UUID, isFrame: Bool = false) {
+    if isFrame { activeFrameSlots.remove(id) }
+    else { activeSlots.remove(id) }
     drainWaiters()
   }
 
   private func drainWaiters() {
-    while playbackOwners.isEmpty, activeSlots.count < maximumNetworkJobs, !slotWaiters.isEmpty {
-      let waiter = slotWaiters.removeFirst()
-      activeSlots.insert(waiter.id)
+    while playbackOwners.isEmpty {
+      let eligible = slotWaiters.indices.filter { canAcquireSlot(isFrame: slotWaiters[$0].isFrame) }
+      guard let index = eligible.first(where: { !slotWaiters[$0].isPrefetch }) ?? eligible.first else { return }
+      let waiter = slotWaiters.remove(at: index)
+      if waiter.isFrame { activeFrameSlots.insert(waiter.id) }
+      else { activeSlots.insert(waiter.id) }
       waiter.continuation.resume(returning: true)
     }
   }

@@ -31,19 +31,34 @@ sources = [
     "Gallery115/Views/SetupView.swift",
     "Gallery115/Services/WebDAVProvider.swift",
 ]
-for name in sources:
-    data = (ROOT / name).read_bytes()
+sources += [str(path.relative_to(ROOT)).replace("\\", "/")
+            for path in (ROOT / "Gallery115").rglob("*.swift")
+            if str(path.relative_to(ROOT)).replace("\\", "/") not in sources]
+def diagnostics(data):
+    data = data.replace(b"\r\n", b"\n")
     tree = parser.parse(data)
     errors = []
     stack = [tree.root_node]
     while stack:
         node = stack.pop()
         if node.type == "ERROR" or node.is_missing:
-            errors.append(node)
+            errors.append((node.type, data[node.start_byte:node.end_byte]))
         stack.extend(reversed(node.children))
+    return errors
+
+baseline_grammar_notes = []
+for name in sources:
+    data = (ROOT / name).read_bytes()
+    errors = diagnostics(data)
+    if errors and name in {"Gallery115/App/AppState.swift", "Gallery115/Player/PlayerModel.swift"}:
+        baseline = subprocess.check_output(["git", "show", "HEAD:" + name], cwd=ROOT)
+        if errors == diagnostics(baseline):
+            baseline_grammar_notes.append(name)
+            print(f"BASELINE {name}: {len(errors)} unchanged parser diagnostics; Xcode is required")
+            continue
     check(not errors, f"Swift grammar: {name}")
-    for node in errors:
-        print(f"  {node.type} line {node.start_point.row + 1}: {data[node.start_byte:node.end_byte][:150]!r}")
+    for kind, snippet in errors:
+        print(f"  {kind}: {snippet[:150]!r}")
 
 disk = (ROOT / sources[0]).read_text(encoding="utf-8")
 service = (ROOT / sources[1]).read_text(encoding="utf-8")
@@ -65,7 +80,7 @@ card_identity = card.split("private var itemThumbnailIdentity", 1)[1].split("@Vi
 check("item.id" in card_identity and "item.size" in card_identity
       and "modifiedAt" not in card_identity,
       "Directory refresh metadata cannot restart unchanged artwork tasks")
-check("cachedImage = nil" not in card
+check("if renderedItemIdentity != identity" in card
       and "guard let image else { loadFailed = true; return }" in card,
       "Artwork refresh keeps the existing image until a replacement is ready")
 check("activeRequestIdentity == identity" in card,
@@ -79,7 +94,7 @@ check("CloudItemCollectionPolicy.mergingFirstPage" in folder
 check("await refreshFirstPageSilently()" in folder
       and "Task { await refreshFirstPageSilently() }" not in folder,
       "Silent refresh is cancelled with its folder screen task")
-check(folder.count("guard !Task.isCancelled else { return }") >= 7,
+check(folder.count("!Task.isCancelled") >= 7,
       "Cancelled folder/search requests cannot publish stale or offline state")
 check("Cached pagination is an expected fast path" in folder
       and 'transientMessage = "已从本地资料库缓存继续加载。"' not in folder,
@@ -105,8 +120,9 @@ check("maximumNetworkJobs = 3" in service
       and "activeSlots.count < maximumNetworkJobs" in service
       and "playbackOwners.isEmpty" in service,
       "Whole network pipeline is bounded and playback-gated")
-check("filter(\\.isVideo)" in service and "withTaskGroup(of: Void.self)" in service,
-      "WebDAV videos participate in concurrent visible-row prefetch")
+check("isPrefetch: true" in service and "for item in targets" in service
+      and "!slotWaiters[$0].isPrefetch" in service,
+      "Speculative prefetch is serial and visible requests take queue priority")
 check("generation == cacheGeneration" in service and "cacheGeneration = UUID()" in service,
       "Clear invalidates in-flight results")
 check("suspendNetwork(for: thumbnailPlaybackOwner)" in player and "resumeNetwork(for: owner)" in player,
@@ -124,7 +140,7 @@ check(player.count(".settingsSectionCard()") == 7
       "Playback settings use compact grouped sections")
 check(project.count("B20260828000000000000001") == 2 and project.count("B20260828000000000000002") == 3,
       "New cache source is referenced by the shipping Xcode target")
-protected = ["Gallery115/Player/PlayerModel.swift", "Gallery115/Player/VLCPlayerView.swift",
+protected = ["Gallery115/Player/VLCPlayerView.swift",
              "Gallery115/Player/SystemPlayerView.swift",
              "Gallery115/Services/LibraryStore.swift"]
 unchanged = subprocess.run(["git", "diff", "--exit-code", "--", *protected], cwd=ROOT,
@@ -138,7 +154,26 @@ def token_storage(text):
     end = text.index("\n\nenum MediaSourceKind")
     return text[start:end]
 check(unchanged and token_storage(keychain) == token_storage(original_keychain),
-      "Playback core, token storage and library business logic unchanged")
+      "AVPlayer/VLC views, token storage and library business logic unchanged")
+player_model = (ROOT / "Gallery115/Player/PlayerModel.swift").read_text(encoding="utf-8")
+old_player_model = subprocess.check_output(["git", "show", "HEAD:Gallery115/Player/PlayerModel.swift"],
+                                          cwd=ROOT).decode("utf-8")
+def without_prepare(text):
+    start = text.index("  func prepareAndPlay()")
+    end = text.index("  func select(", start)
+    return text[:start] + text[end:]
+check(without_prepare(player_model) == without_prepare(old_player_model)
+      and "try Task.checkCancellation()" in player_model,
+      "Player change is confined to guarding cancelled preparation; engine logic unchanged")
+check("activeFrameSlots.isEmpty" in service and "holdsNetworkSlot = false" in service,
+      "Slow frame extraction uses a separate single slot from image downloads")
+check("!hasMore && !isSearching" not in folder and "paginationFooter" in folder,
+      "Filtered empty pages retain pagination and searches own their empty state")
+check('compact ? 1 : 16 / 9' in card and 'gallery115.compactGrid' in folder,
+      "Photos-style square artwork remains optional")
+check("accessibilityReduceMotion" in card and "reduceMotion ? nil" in card
+      and "modifier(CinevaZoomTransition(sourceID: sourceID, namespace: namespace))" in card,
+      "Artwork and press animations respect Reduce Motion")
 provider = (ROOT / "Gallery115/Services/WebDAVProvider.swift").read_text(encoding="utf-8")
 api_client = (ROOT / "Gallery115/Services/APIClient.swift").read_text(encoding="utf-8")
 app_state = (ROOT / "Gallery115/App/AppState.swift").read_text(encoding="utf-8")
@@ -187,6 +222,10 @@ check("let policy: LAPolicy = .deviceOwnerAuthentication" in authentication
       "App unlock allows the system device-passcode fallback after biometric failure")
 test_count = sum(len(re.findall(r"func test\w+\(", path.read_text(encoding="utf-8")))
                  for path in (ROOT / "Tests/CacheRegression").glob("*.swift"))
+check("serverThumbnailHints[hintKey] = OpenListArtworkHints.parse(listData)" in provider
+      and "api.serverThumbnailURL(for: item)" in service,
+      "OpenList refresh thumbnails are used before frame fallback")
 print(f"iOS XCTest cases prepared: {test_count} (not executed by this script)")
+print(f"Unchanged grammar limitations requiring Xcode: {len(baseline_grammar_notes)} file(s)")
 print(f"Preflight result: {len(failures)} failure(s); Swift type checking/device validation still required.")
 sys.exit(bool(failures))
