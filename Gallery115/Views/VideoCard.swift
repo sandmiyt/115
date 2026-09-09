@@ -152,6 +152,7 @@ extension EnvironmentValues {
 
 /// Cached artwork with stable geometry: square grid tiles or aspect-fit landscape cards.
 struct VideoArtwork: View {
+  @Environment(\.scenePhase) private var scenePhase
   @Environment(AppState.self) private var appState
   @Environment(\.artworkRefreshRevision) private var artworkRefreshRevision
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -164,7 +165,6 @@ struct VideoArtwork: View {
   @State private var renderedItemIdentity: String?
   @State private var activeRequestIdentity: String?
   @State private var isLoading = false
-  @State private var loadFailed = false
 
   var body: some View {
     GeometryReader { proxy in
@@ -178,10 +178,6 @@ struct VideoArtwork: View {
         } else {
           ZStack {
             placeholder
-            if loadFailed {
-              Text("加载未完成，可长按重试").font(.caption2).foregroundStyle(.secondary)
-                .frame(maxHeight: .infinity, alignment: .bottom).padding(.bottom, 6)
-            }
             if isLoading {
               ProgressView()
                 .controlSize(.small)
@@ -195,14 +191,14 @@ struct VideoArtwork: View {
       .clipped()
     }
     .aspectRatio(aspectRatio, contentMode: .fit)
-    .task(id: "\(itemThumbnailIdentity)|\(artworkRefreshRevision)") {
+    .task(id: "\(itemThumbnailIdentity)|\(artworkRefreshRevision)|\(scenePhase)") {
+      guard scenePhase == .active else { return }
       let identity = itemThumbnailIdentity
       if renderedItemIdentity != identity {
         cachedImage = nil
         renderedItemIdentity = identity
       }
       if loadedIdentity == identity, cachedImage != nil { return }
-      loadFailed = false
       activeRequestIdentity = identity
       isLoading = false
       // Keep already-rendered artwork visible during a directory refresh. A
@@ -227,24 +223,26 @@ struct VideoArtwork: View {
         var result: UIImage?
         // Queue time is not a download failure. Each active network/frame stage
         // has its own deadline; a busy directory must not expire queued cards.
-        for delay in [0, 6, 15, 30, 60] {
+        var attempt = 0
+        while !Task.isCancelled {
+          let delay = [0, 6, 15, 30, 60][min(attempt, 4)]
           if delay > 0 {
             spinner.cancel()
             isLoading = false
-            loadFailed = true
             do { try await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000_000) }
             catch { return nil as UIImage? }
           }
           guard !Task.isCancelled else { return nil as UIImage? }
           result = await service.thumbnail(for: requestedItem, api: api)
           if result != nil { break }
+          attempt = min(attempt + 1, 4)
         }
         return result
       } onCancel: {
         spinner.cancel()
       }
       guard !Task.isCancelled else { return }
-      guard let image else { loadFailed = true; return }
+      guard let image else { return }
       let shouldFadeIn = cachedImage == nil && isLoading && !reduceMotion
       withAnimation(shouldFadeIn ? .easeOut(duration: 0.16) : nil) {
         cachedImage = image
@@ -488,32 +486,77 @@ private struct MediaGridPinchModifier: ViewModifier {
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @Binding var columnCount: Int
   let tapGate: MediaGridTapGate
-  @GestureState private var scale: CGFloat = 1
-  @GestureState private var anchor: UnitPoint = .center
+  @State private var scale: CGFloat = 1
+  @State private var anchor: UnitPoint = .center
+  @State private var startColumns = 3
+  @State private var tracking = false
+  @State private var settleTask: Task<Void, Never>?
+  @GestureState private var gestureActive = false
 
   func body(content: Content) -> some View {
     content
       .scaleEffect(scale, anchor: anchor)
       .highPriorityGesture(
         MagnifyGesture(minimumScaleDelta: 0.01)
-          .updating($scale) { value, state, _ in
+          .updating($gestureActive) { _, active, _ in active = true }
+          .onChanged { value in
             tapGate.suppressTap()
-            state = min(max(value.magnification, 0.82), 1.22)
-          }
-          .updating($anchor) { value, state, _ in state = value.startAnchor }
-          .onEnded { value in
-            tapGate.suppressTap()
-            let target = MediaGridZoomPolicy.targetColumns(from: columnCount,
-              magnification: Double(value.magnification))
-            // Interpolating every lazy-grid cell's geometry causes large-directory
-            // layout spikes. Keep the live transform, then commit one layout pass.
+            if !tracking {
+              settleTask?.cancel()
+              settleTask = nil
+              tracking = true
+              startColumns = MediaGridZoomPolicy.normalized(columnCount)
+              anchor = value.startAnchor
+            }
             var transaction = Transaction(animation: nil)
             transaction.disablesAnimations = true
-            withTransaction(transaction) { columnCount = target }
+            withTransaction(transaction) {
+              scale = CGFloat(MediaGridZoomPolicy.liveScale(Double(value.magnification)))
+            }
+          }
+          .onEnded { value in
+            tapGate.suppressTap()
+            tracking = false
+            let target = MediaGridZoomPolicy.targetColumns(from: startColumns,
+              magnification: Double(value.magnification))
+            // Preserve apparent cell width through the discrete layout commit,
+            // then animate only the enclosing transform to its resting scale.
+            var transaction = Transaction(animation: nil)
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+              scale = CGFloat(MediaGridZoomPolicy.handoffScale(Double(scale),
+                from: startColumns, to: target))
+              columnCount = target
+            }
+            settle()
           }
       )
-      .onChange(of: scale) { old, new in
-        if old != 1, new == 1 { tapGate.suppressTap() }
+      .onChange(of: gestureActive) { _, active in
+        if !active, tracking {
+          tracking = false
+          tapGate.suppressTap()
+          settle()
+        }
       }
+      .onDisappear {
+        settleTask?.cancel()
+        settleTask = nil
+        tracking = false
+        scale = 1
+      }
+  }
+
+  private func settle() {
+    settleTask?.cancel()
+    settleTask = Task { @MainActor in
+      // Let SwiftUI install the compensated layout before starting the spring.
+      do { try await Task.sleep(nanoseconds: 16_000_000) }
+      catch { return }
+      guard !Task.isCancelled, !tracking else { return }
+      withAnimation(reduceMotion ? nil : .spring(response: 0.32, dampingFraction: 0.92)) {
+        scale = 1
+      }
+      settleTask = nil
+    }
   }
 }

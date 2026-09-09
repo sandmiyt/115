@@ -27,6 +27,7 @@ actor ThumbnailService {
   private let memoryCache = NSCache<NSString, UIImage>()
   private let logger = Logger(subsystem: "com.xiaocai.gallery115", category: "Artwork")
   private var inFlight: [String: Work] = [:]
+  private var frameAttempts: [String: Int] = [:]
   private var failedUntil: [String: Date] = [:]
   private var activeSlots: Set<UUID> = []
   private var activeFrameSlots: Set<UUID> = []
@@ -167,6 +168,7 @@ actor ThumbnailService {
     for work in inFlight.values { work.task.cancel() }
     inFlight.removeAll()
     failedUntil.removeAll()
+    frameAttempts.removeAll()
     memoryCache.removeAllObjects()
     do {
       try disk.clear()
@@ -184,6 +186,7 @@ actor ThumbnailService {
     for work in inFlight.values { work.task.cancel() }
     inFlight.removeAll()
     failedUntil.removeAll()
+    frameAttempts.removeAll()
     memoryCache.removeAllObjects()
     for waiter in slotWaiters { waiter.continuation.resume(returning: false) }
     slotWaiters.removeAll()
@@ -241,7 +244,11 @@ actor ThumbnailService {
       defer { releaseSlot(workID, isFrame: true) }
       guard !Task.isCancelled, generation == cacheGeneration else { return nil }
       let frameLoader = self.frameLoader
-      image = await Self.boundedArtwork(seconds: 15) {
+      let attempt = frameAttempts[identity.key, default: 0]
+      if frameAttempts.count > 1_024 { frameAttempts.removeAll() }
+      frameAttempts[identity.key] = min(attempt + 1, 2)
+      let frameBudget = Double([15, 30, 60][min(attempt, 2)])
+      image = await Self.boundedArtwork(seconds: frameBudget) {
         if let frameLoader { return await frameLoader(item, api) }
         guard let source = try? await api.thumbnailSource(for: item), !Task.isCancelled else { return nil }
         return await Self.frameThumbnail(source: source)
@@ -250,6 +257,7 @@ actor ThumbnailService {
     guard !Task.isCancelled, generation == cacheGeneration, identity.namespace == namespace(),
       let image else { return nil }
     failedUntil[identity.key] = nil
+    frameAttempts[identity.key] = nil
     _ = persist(image, identity: identity)
     return image
   }
@@ -322,7 +330,7 @@ actor ThumbnailService {
   nonisolated static func frameThumbnail(source: VideoSource) async -> UIImage? {
     let probe = ThumbnailFrameProbe(source: source)
     let timeout = Task {
-      do { try await Task.sleep(nanoseconds: 20_000_000_000) }
+      do { try await Task.sleep(nanoseconds: 60_000_000_000) }
       catch { return }
       probe.cancel()
     }

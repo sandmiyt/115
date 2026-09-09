@@ -950,7 +950,16 @@ struct PlayerScreen: View {
       }
       .accessibilityLabel("返回")
 
-      Spacer(minLength: 6)
+      VStack(spacing: 3) {
+        Text(currentItem.name)
+          .font(.subheadline.weight(.semibold))
+          .lineLimit(1).truncationMode(.middle)
+        Text(activeIsBuffering ? "正在缓冲" : (activeIsPlaying ? "正在播放" : "已暂停"))
+          .font(.caption2).foregroundStyle(.white.opacity(0.65))
+      }
+      .foregroundStyle(.white)
+      .frame(maxWidth: .infinity)
+      .accessibilityElement(children: .combine)
 
       playerIconButton("ellipsis") {
         openSettingsPanel()
@@ -1639,6 +1648,19 @@ struct PlayerScreen: View {
         }
         .shadow(color: .black.opacity(isScrubbing ? 0.24 : 0.18), radius: isScrubbing ? 13 : 9, y: 4)
         .animation(.spring(response: 0.30, dampingFraction: 0.88, blendDuration: 0.06), value: isScrubbing)
+        HStack {
+          Text(formatTime(isScrubbing ? scrubValue : activeCurrentTime))
+          Spacer()
+          Text("−\(formatTime(max(activeDuration - (isScrubbing ? scrubValue : activeCurrentTime), 0)))")
+        }
+        .font(.caption2.monospacedDigit())
+        .foregroundStyle(.white.opacity(0.72))
+        .padding(.horizontal, 12)
+        .frame(maxWidth: landscape ? 620 : 390)
+        .opacity(isScrubbing ? 0 : 1)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("已播放 \(formatTime(activeCurrentTime))，总时长 \(formatTime(activeDuration))")
+
       }
     }
     .padding(.leading, max(proxy.safeAreaInsets.leading, landscape ? 28 : 20))
@@ -1664,7 +1686,7 @@ struct PlayerScreen: View {
         .font(.system(size: 17, weight: .semibold))
         .contentTransition(.symbolEffect)
         .foregroundStyle(.white)
-        .frame(width: 40, height: 40)
+        .frame(width: 44, height: 44)
         .contentShape(Rectangle())
     }
     .buttonStyle(PlayerPressScaleStyle(pressedScale: 0.92))
@@ -1687,7 +1709,7 @@ struct PlayerScreen: View {
         .font(.system(size: 16, weight: .semibold))
         .contentTransition(.symbolEffect)
         .foregroundStyle(.white)
-        .frame(width: 40, height: 40)
+        .frame(width: 44, height: 44)
         .contentShape(Rectangle())
     }
     .buttonStyle(PlayerPressScaleStyle(pressedScale: 0.92))
@@ -1836,7 +1858,7 @@ struct PlayerScreen: View {
     Image(systemName: systemName)
       .font(.system(size: 15, weight: .semibold))
       .foregroundStyle(.white)
-      .frame(width: 40, height: 40)
+      .frame(width: 44, height: 44)
       .background {
         Circle()
           .fill(.ultraThinMaterial)
@@ -2851,13 +2873,14 @@ private struct PlayerGestureFeedbackView: View {
 }
 
 private struct PlayerPressScaleStyle: ButtonStyle {
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
   var pressedScale: CGFloat = 0.94
 
   func makeBody(configuration: Configuration) -> some View {
     configuration.label
-      .scaleEffect(configuration.isPressed ? pressedScale : 1)
+      .scaleEffect(configuration.isPressed && !reduceMotion ? pressedScale : 1)
       .opacity(configuration.isPressed ? 0.86 : 1)
-      .animation(.spring(response: 0.22, dampingFraction: 0.78), value: configuration.isPressed)
+      .animation(reduceMotion ? nil : .spring(response: 0.22, dampingFraction: 0.78), value: configuration.isPressed)
   }
 }
 

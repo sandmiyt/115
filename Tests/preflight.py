@@ -81,7 +81,7 @@ check("item.id" in card_identity and "item.size" in card_identity
       and "modifiedAt" not in card_identity,
       "Directory refresh metadata cannot restart unchanged artwork tasks")
 check("if renderedItemIdentity != identity" in card
-      and "guard let image else { loadFailed = true; return }" in card,
+      and "guard let image else { return }" in card,
       "Artwork refresh keeps the existing image until a replacement is ready")
 check("activeRequestIdentity == identity" in card,
       "Cancelled recycled artwork cells clear only their own loading state")
@@ -165,15 +165,19 @@ def without_prepare(text):
 check(without_prepare(player_model) == without_prepare(old_player_model)
       and "try Task.checkCancellation()" in player_model,
       "Player change is confined to guarding cancelled preparation; engine logic unchanged")
-check("boundedArtwork(seconds: 18)" in service and "boundedArtwork(seconds: 15)" in service
+check("boundedArtwork(seconds: 18)" in service and "boundedArtwork(seconds: frameBudget)" in service
       and "boundedArtwork(seconds: 45)" not in card
-      and "for delay in [0, 6, 15, 30, 60]" in card,
+      and "[0, 6, 15, 30, 60][min(attempt, 4)]" in card,
       "Active artwork stages have deadlines; queued cells retain automatic retries")
 check(".highPriorityGesture(" in card and "guard tapGate?.allowsTap != false" in card
       and ".simultaneousGesture(" not in card,
       "Pinch takes priority over taps and guards release-time video activation")
 check("struct MediaGridPinchModifier" in card and "transaction.disablesAnimations = true" in card,
       "Pinch transform state is isolated and density changes avoid whole-grid interpolation")
+check("MediaGridZoomPolicy.handoffScale" in card and "spring(response: 0.32" in card,
+      "Density handoff compensates thumbnail size before a transform-only settle")
+check("loadFailed" not in card and "guard scenePhase == .active" in card,
+      "Thumbnail retries keep a neutral placeholder and stop in background")
 check("MagnifyGesture(minimumScaleDelta:" in card and "MediaGridZoomPolicy" in card,
       "Media grids support pinch density changes with stable item identity")
 check("activeFrameSlots.count < maximumFrameJobs" in service and "holdsNetworkSlot = false" in service,

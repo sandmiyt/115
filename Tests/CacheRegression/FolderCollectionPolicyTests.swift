@@ -3,6 +3,26 @@ import XCTest
 @testable import CinevaCacheValidation
 
 final class FolderCollectionPolicyTests: XCTestCase {
+  func testZoomHandoffPreservesApparentCellSize() {
+    for oldColumns in MediaGridZoomPolicy.levels {
+      for newColumns in MediaGridZoomPolicy.levels {
+        let scale = 1.18
+        let compensated = MediaGridZoomPolicy.handoffScale(scale, from: oldColumns, to: newColumns)
+        XCTAssertEqual(1200 / Double(oldColumns) * scale,
+                       1200 / Double(newColumns) * compensated, accuracy: 0.000001)
+      }
+    }
+  }
+
+  func testLiveZoomTracksFingersAndSoftensOnlyOuterLimits() {
+    XCTAssertEqual(MediaGridZoomPolicy.liveScale(1.3), 1.3)
+    XCTAssertEqual(MediaGridZoomPolicy.liveScale(0.8), 0.8)
+    XCTAssertEqual(MediaGridZoomPolicy.liveScale(.nan), 1)
+    XCTAssertLessThan(MediaGridZoomPolicy.liveScale(4), 1.85)
+    XCTAssertGreaterThan(MediaGridZoomPolicy.liveScale(0.1), 0.5)
+    XCTAssertEqual(MediaGridZoomPolicy.liveScale(1.650001), 1.65, accuracy: 0.000001)
+  }
+
   func testMediaZoomDirectionAndBounds() {
     XCTAssertEqual(MediaGridZoomPolicy.targetColumns(from: 3, magnification: 1.2), 2)
     XCTAssertEqual(MediaGridZoomPolicy.targetColumns(from: 3, magnification: 0.8), 4)

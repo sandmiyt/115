@@ -1,9 +1,27 @@
 import SwiftUI
 
 struct SettingsView: View {
+  @Environment(AppState.self) private var appState
   var body: some View {
     List {
       Section {
+        HStack(spacing: 14) {
+          Image(systemName: "play.rectangle.on.rectangle.fill")
+            .font(.system(size: 27, weight: .medium))
+            .foregroundStyle(CinevaTheme.accent)
+            .frame(width: 58, height: 58)
+            .background(CinevaTheme.accent.opacity(0.10), in: RoundedRectangle(cornerRadius: 16))
+          VStack(alignment: .leading, spacing: 5) {
+            Text("Cineva").font(.title2.weight(.bold))
+            Text(appState.isConfigured ? "已设置媒体源 · \(appState.mediaSourceKind.title)" : "连接媒体源，开始浏览")
+              .font(.subheadline).foregroundStyle(.secondary)
+          }
+        }
+        .padding(.vertical, 8)
+        .accessibilityElement(children: .combine)
+        .listRowBackground(Color.clear)
+      }
+      Section("媒体与外观") {
         NavigationLink {
           MediaSourceSettingsView()
         } label: {
@@ -24,6 +42,8 @@ struct SettingsView: View {
           )
         }
 
+      }
+      Section("播放体验") {
         NavigationLink {
           PlaybackSettingsView()
         } label: {
@@ -34,6 +54,8 @@ struct SettingsView: View {
           )
         }
 
+      }
+      Section("管理") {
         NavigationLink {
           PrivacySettingsView()
         } label: {
@@ -65,6 +87,7 @@ struct SettingsView: View {
         }
       }
     }
+    .listStyle(.insetGrouped)
     .navigationTitle("设置")
   }
 }
@@ -74,12 +97,24 @@ private struct SettingsCategoryRow: View {
   let subtitle: String
   let systemName: String
 
+  private var iconColor: Color {
+    switch systemName {
+    case "externaldrive.fill": .blue
+    case "paintbrush.fill": .purple
+    case "play.rectangle.fill": .orange
+    case "lock.shield.fill": .green
+    case "externaldrive.badge.timemachine": .teal
+    default: .gray
+    }
+  }
+
   var body: some View {
     HStack(spacing: 13) {
       Image(systemName: systemName)
         .font(.system(size: 18, weight: .semibold))
-        .frame(width: 30, height: 30)
-        .foregroundStyle(.tint)
+        .foregroundStyle(.white)
+        .frame(width: 36, height: 36)
+        .background(iconColor.gradient, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
 
       VStack(alignment: .leading, spacing: 3) {
         Text(title)
@@ -250,6 +285,8 @@ private struct MediaSourceSettingsView: View {
 }
 
 private struct AppearanceSettingsView: View {
+  @AppStorage("gallery115.mediaGridColumns") private var mediaGridColumns = 3
+  @AppStorage("gallery115.compactGrid") private var compactGrid = true
   @Environment(AppState.self) private var appState
 
   var body: some View {
@@ -273,7 +310,15 @@ private struct AppearanceSettingsView: View {
         }
 
         if appState.browserLayout == .grid {
-          LabeledContent("封面列数") {
+          Toggle("相册式媒体网格", isOn: $compactGrid)
+          Picker("视频与图片列数", selection: $mediaGridColumns) {
+            ForEach(MediaGridZoomPolicy.levels, id: \.self) { count in
+              Text("\(count) 列").tag(count)
+            }
+          }
+          Text("在资料库中双指缩放可调整媒体大小，文件夹布局独立设置。")
+            .font(.footnote).foregroundStyle(.secondary)
+          LabeledContent("文件夹列数") {
             Menu {
               ForEach([2, 3, 4], id: \.self) { count in
                 Button {
@@ -292,9 +337,11 @@ private struct AppearanceSettingsView: View {
           }
         }
 
-        Picker("缩略图", selection: $appState.artworkMode) {
-          ForEach(AppState.ArtworkMode.allCases) { mode in
-            Text(mode.title).tag(mode)
+        if !compactGrid || appState.browserLayout != .grid {
+          Picker("缩略图适配", selection: $appState.artworkMode) {
+            ForEach(AppState.ArtworkMode.allCases) { mode in
+              Text(mode.title).tag(mode)
+            }
           }
         }
       }

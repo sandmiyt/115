@@ -197,6 +197,17 @@ enum OpenListArtworkHints {
 enum MediaGridZoomPolicy {
   static let levels = [1, 2, 3, 4, 6]
 
+  static func liveScale(_ magnification: Double) -> Double {
+    guard magnification.isFinite, magnification > 0 else { return 1 }
+    if magnification < 0.65 { return 0.65 - 0.15 * (1 - exp(-(0.65 - magnification) * 4)) }
+    if magnification > 1.65 { return 1.65 + 0.2 * (1 - exp(-(magnification - 1.65) * 3)) }
+    return magnification
+  }
+
+  static func handoffScale(_ scale: Double, from oldColumns: Int, to newColumns: Int) -> Double {
+    scale * Double(normalized(newColumns)) / Double(normalized(oldColumns))
+  }
+
   static func normalized(_ columns: Int) -> Int {
     levels.min(by: { abs($0 - min(max(columns, 1), 6)) < abs($1 - min(max(columns, 1), 6)) }) ?? 3
   }
