@@ -136,7 +136,7 @@ check(".frame(width: width, height: proxy.size.height, alignment: .leading)" in 
       and "let trackInset: CGFloat = isScrubbing ? scrubTrackInset : 42" in player,
       "Scrub times and timeline share one centered coordinate space")
 check(player.count(".settingsSectionCard()") == 7
-      and "VStack(alignment: .leading, spacing: 14)" in player,
+      and "LazyVStack(alignment: .leading, spacing: 12)" in player,
       "Playback settings use compact grouped sections")
 check(project.count("B20260828000000000000001") == 2 and project.count("B20260828000000000000002") == 3,
       "New cache source is referenced by the shipping Xcode target")
@@ -178,6 +178,13 @@ check("MediaGridZoomPolicy.handoffScale" in card and "spring(response: 0.32" in 
       "Density handoff compensates thumbnail size before a transform-only settle")
 check("loadFailed" not in card and "guard scenePhase == .active" in card,
       "Thumbnail retries keep a neutral placeholder and stop in background")
+check("loadedFolderScope == scope, !items.isEmpty { return }" in folder,
+      "Returning to a loaded folder does not truncate its later pages")
+check("struct StableLibraryScrollView" in folder and "!ids.contains(position)" in folder
+      and "LazyVStack(spacing: 14)" not in folder,
+      "Scroll state is isolated, invalid anchors reset and nested lazy container is removed")
+check("CGSize(width: 640, height: 360)" in service and "item.isPhoto ? 960 : 640" in service,
+      "Video artwork decode pressure is reduced while photo resolution is retained")
 check("MagnifyGesture(minimumScaleDelta:" in card and "MediaGridZoomPolicy" in card,
       "Media grids support pinch density changes with stable item identity")
 check("activeFrameSlots.count < maximumFrameJobs" in service and "holdsNetworkSlot = false" in service,

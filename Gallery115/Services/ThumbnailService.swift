@@ -80,7 +80,7 @@ actor ThumbnailService {
     let identity = identity(for: item)
     let generation = cacheGeneration
     while !Task.isCancelled, generation == cacheGeneration, identity.namespace == namespace() {
-      if let image = localImage(identity) { return image }
+      if let image = localImage(identity, maximumPixelSize: item.isPhoto ? 960 : 640) { return image }
       if let retry = failedUntil[identity.key], retry > Date() { return nil }
 
       let clientID = UUID()
@@ -194,11 +194,11 @@ actor ThumbnailService {
     activeFrameSlots.removeAll()
   }
 
-  private func localImage(_ identity: ArtworkIdentity) -> UIImage? {
+  private func localImage(_ identity: ArtworkIdentity, maximumPixelSize: Int) -> UIImage? {
     if let image = memoryCache.object(forKey: identity.key as NSString) { return image }
     do {
       guard let data = try disk.read(identity) else { return nil }
-      guard let image = downsampledImage(from: data) else {
+      guard let image = downsampledImage(from: data, maximumPixelSize: maximumPixelSize) else {
         disk.remove(identity)
         return nil
       }
@@ -229,7 +229,7 @@ actor ThumbnailService {
     var holdsNetworkSlot = true
     defer { if holdsNetworkSlot { releaseSlot(workID) } }
     guard !Task.isCancelled, generation == cacheGeneration, identity.namespace == namespace() else { return nil }
-    if let image = localImage(identity) { return image }
+    if let image = localImage(identity, maximumPixelSize: item.isPhoto ? 960 : 640) { return image }
     var image = await Self.boundedArtwork(seconds: 18) { [self] in
       if let loader { return await loader(item, api) }
       return await loadNetworkArtwork(for: item, api: api)
@@ -265,11 +265,11 @@ actor ThumbnailService {
   private func loadNetworkArtwork(for item: CloudItem, api: APIClient) async -> UIImage? {
     // The slot covers sidecar discovery too. Previously every visible card could
     // issue PROPFIND requests before it reached the frame-generation semaphore.
-    if let url = item.thumbnailURL, let image = await remoteThumbnail(at: url) { return image }
+    if let url = item.thumbnailURL, let image = await remoteThumbnail(at: url, maximumPixelSize: item.isPhoto ? 960 : 640) { return image }
     guard !Task.isCancelled else { return nil }
     if item.isPhoto {
       guard let source = try? await api.photoSource(for: item), !Task.isCancelled else { return nil }
-      return await remoteThumbnail(at: source.url, headers: source.headers)
+      return await remoteThumbnail(at: source.url, headers: source.headers, maximumPixelSize: 960)
     }
     return await Self.firstAvailableArtwork([
       { [self] in
@@ -353,7 +353,7 @@ actor ThumbnailService {
     }
   }
 
-  private func remoteThumbnail(at url: URL, headers: [String: String] = [:]) async -> UIImage? {
+  private func remoteThumbnail(at url: URL, headers: [String: String] = [:], maximumPixelSize: Int = 640) async -> UIImage? {
     var request = URLRequest(url: url)
     request.cachePolicy = .useProtocolCachePolicy
     request.timeoutInterval = 8
@@ -362,7 +362,7 @@ actor ThumbnailService {
       !Task.isCancelled, data.count <= 16_000_000,
       let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode)
     else { return nil }
-    return downsampledImage(from: data)
+    return downsampledImage(from: data, maximumPixelSize: maximumPixelSize)
   }
 
   private func cacheInMemory(_ image: UIImage, key: String) {
@@ -371,12 +371,12 @@ actor ThumbnailService {
     memoryCache.setObject(image, forKey: key as NSString, cost: min(width * height * 4, 16 * 1_024 * 1_024))
   }
 
-  private func downsampledImage(from data: Data) -> UIImage? {
+  private func downsampledImage(from data: Data, maximumPixelSize: Int = 640) -> UIImage? {
     guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
     let options: [CFString: Any] = [
       kCGImageSourceCreateThumbnailFromImageAlways: true,
       kCGImageSourceCreateThumbnailWithTransform: true,
-      kCGImageSourceThumbnailMaxPixelSize: 960,
+      kCGImageSourceThumbnailMaxPixelSize: maximumPixelSize,
       kCGImageSourceShouldCacheImmediately: true,
     ]
     guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
@@ -458,7 +458,7 @@ private final class ThumbnailFrameProbe: @unchecked Sendable {
     asset = AVURLAsset(url: source.url, options: options)
     generator = AVAssetImageGenerator(asset: asset)
     generator.appliesPreferredTrackTransform = true
-    generator.maximumSize = CGSize(width: 960, height: 540)
+    generator.maximumSize = CGSize(width: 640, height: 360)
     generator.requestedTimeToleranceBefore = CMTime(seconds: 0.5, preferredTimescale: 600)
     generator.requestedTimeToleranceAfter = CMTime(seconds: 1, preferredTimescale: 600)
   }

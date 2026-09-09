@@ -66,6 +66,21 @@ final class ArtworkCacheTests: XCTestCase {
     XCTAssertNil(empty)
   }
 
+  func testExistingLargeVideoCoverIsDownsampledOnDiskCacheRead() async throws {
+    let video = item()
+    let large = UIGraphicsImageRenderer(size: CGSize(width: 1920, height: 1080)).image { context in
+      UIColor.blue.setFill()
+      context.fill(CGRect(x: 0, y: 0, width: 1920, height: 1080))
+    }
+    let data = try XCTUnwrap(large.jpegData(compressionQuality: 0.8))
+    try disk.write(data, for: identity(video))
+    let cache = ThumbnailService(disk: disk, namespace: { "mount-a" })
+    let loaded = await cache.thumbnail(for: video, api: APIClient())
+    let cover = try XCTUnwrap(loaded)
+    XCTAssertLessThanOrEqual(cover.size.width * cover.scale, 640)
+    XCTAssertGreaterThan(cover.size.width * cover.scale, 0)
+  }
+
   private var root: URL!
   private var disk: ArtworkDiskStore!
 

@@ -972,7 +972,7 @@ struct PlayerScreen: View {
       .top,
       landscape
         ? max(proxy.safeAreaInsets.top + 18, 26)
-        : max(proxy.safeAreaInsets.top + 20, 36)
+        : max(proxy.safeAreaInsets.top, 59) + 32
     )
     .padding(.bottom, landscape ? 20 : 12)
     .background(
@@ -1215,8 +1215,10 @@ struct PlayerScreen: View {
 
   private func settingsPanel(proxy: GeometryProxy) -> some View {
     let landscape = proxy.size.width > proxy.size.height
-    let panelWidth = landscape ? min(330.0, proxy.size.width * 0.40) : max(proxy.size.width - 32, 280)
-    let panelHeight = landscape ? min(proxy.size.height * 0.80, 450) : min(proxy.size.height * 0.68, 540)
+    let availableWidth = max(0, proxy.size.width - proxy.safeAreaInsets.leading - proxy.safeAreaInsets.trailing - 24)
+    let availableHeight = max(0, proxy.size.height - max(proxy.safeAreaInsets.top, landscape ? 0 : 59) - proxy.safeAreaInsets.bottom - 24)
+    let panelWidth = min(availableWidth, landscape ? 360 : 420)
+    let panelHeight = min(availableHeight, landscape ? 450 : 600)
 
     return VStack(spacing: 0) {
       HStack(spacing: 10) {
@@ -1228,19 +1230,20 @@ struct PlayerScreen: View {
           Image(systemName: "xmark")
             .font(.system(size: 13, weight: .bold))
             .foregroundStyle(.white.opacity(0.86))
-            .frame(width: 30, height: 30)
+            .frame(width: 44, height: 44)
             .background(.white.opacity(0.07), in: Circle())
         }
         .buttonStyle(.plain)
+        .accessibilityLabel("关闭播放设置")
       }
       .padding(.horizontal, 16)
-      .padding(.top, 14)
-      .padding(.bottom, 10)
+      .padding(.top, 8)
+      .padding(.bottom, 8)
 
       Divider().overlay(.white.opacity(0.08))
 
-      ScrollView(showsIndicators: false) {
-        VStack(alignment: .leading, spacing: 14) {
+      ScrollView {
+        LazyVStack(alignment: .leading, spacing: 12) {
           if let model {
             settingsSpeedSection(model: model)
 
@@ -1505,7 +1508,7 @@ struct PlayerScreen: View {
         .font(.caption.weight(.semibold))
         .foregroundStyle(.white)
         .frame(maxWidth: .infinity)
-        .frame(height: 34)
+        .frame(minHeight: 44)
         .background(selected ? .white.opacity(0.17) : .white.opacity(0.055), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
         .overlay {
           if selected {
@@ -1514,7 +1517,8 @@ struct PlayerScreen: View {
           }
         }
     }
-    .buttonStyle(.plain)
+    .buttonStyle(PlayerPressScaleStyle(pressedScale: 0.98))
+    .accessibilityAddTraits(selected ? .isSelected : [])
   }
 
   private func settingsRow(
@@ -1530,7 +1534,8 @@ struct PlayerScreen: View {
           .frame(width: 20)
         Text(title)
           .font(.subheadline)
-          .lineLimit(1)
+          .lineLimit(3)
+          .fixedSize(horizontal: false, vertical: true)
         Spacer()
         if selected {
           Image(systemName: "checkmark")
@@ -1539,10 +1544,12 @@ struct PlayerScreen: View {
       }
       .foregroundStyle(.white.opacity(selected ? 1 : 0.86))
       .padding(.horizontal, 12)
-      .frame(height: 39)
+      .padding(.vertical, 10)
+      .frame(minHeight: 44)
       .background(selected ? .white.opacity(0.11) : .clear, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
-    .buttonStyle(.plain)
+    .buttonStyle(PlayerPressScaleStyle(pressedScale: 0.98))
+    .accessibilityAddTraits(selected ? .isSelected : [])
   }
 
   private func settingsUnavailableRow(_ title: String, systemName: String) -> some View {

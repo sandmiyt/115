@@ -86,7 +86,7 @@ struct FolderView: View {
   @State private var showMediaSetup = false
   @AppStorage("gallery115.compactGrid") private var compactGrid = true
   @AppStorage("gallery115.mediaGridColumns") private var mediaGridColumns = 3
-  @State private var gridScrollPosition: String?
+  @State private var loadedFolderScope: String?
   @State private var artworkRefreshRevision = 0
   @State private var isSearching = false
   @State private var selectedPhoto: CloudItem?
@@ -317,8 +317,9 @@ struct FolderView: View {
   private var content: some View {
     switch appState.browserLayout {
     case .grid:
-      ScrollView {
-        LazyVStack(spacing: 14) {
+      StableLibraryScrollView(itemIDs: Set(displayItems.map(\.id)),
+                              resetKey: "\(appState.mediaSourceRevision)|\(folderID)|\(sortMode.rawValue)") {
+        VStack(spacing: 14) {
           if !displayedFolders.isEmpty {
             LazyVGrid(columns: columns, spacing: 11) {
               ForEach(displayedFolders) { item in
@@ -326,6 +327,7 @@ struct FolderView: View {
                   .buttonStyle(FolderCardButtonStyle())
               }
             }
+            .scrollTargetLayout()
             .padding(.horizontal, 10)
             .padding(.top, 10)
           }
@@ -339,7 +341,6 @@ struct FolderView: View {
           }
         }
       }
-      .scrollPosition(id: $gridScrollPosition, anchor: .top)
       .scrollDismissesKeyboard(.interactively)
       .refreshable { await refreshCurrentFolder() }
 
@@ -606,6 +607,19 @@ struct FolderView: View {
 
   @MainActor
   private func loadFirstPage(forceRefresh: Bool) async {
+    let scope = "\(appState.mediaSourceRevision)|\(folderID)|\(sortMode.rawValue)"
+    // SwiftUI restarts screen tasks on tab/navigation return. Do not truncate a
+    // populated directory while its scroll position still points at a later page.
+    if !forceRefresh, loadedFolderScope == scope, !items.isEmpty { return }
+    if loadedFolderScope != scope {
+      items = []
+      searchItems = nil
+      rebuildDisplayItems()
+      playlistItems = []
+      nextOffset = 0
+      hasMore = true
+      didScheduleBackgroundRefresh = false
+    }
     pagingRevision &+= 1
     let revision = pagingRevision
     isInitialLoading = items.isEmpty
@@ -622,6 +636,7 @@ struct FolderView: View {
         sortOrder: collectionSortOrder
       )
       guard revision == pagingRevision, !Task.isCancelled else { return }
+      loadedFolderScope = scope
       isInitialLoading = false
       items = CloudItemCollectionPolicy.ordered(page.items, by: collectionSortOrder)
       searchItems = nil
@@ -955,5 +970,29 @@ private struct VideoListRow: View {
     let position = appState.libraryStore.resumePosition(for: item)
     guard position > 2, position < duration - 8 else { return 0 }
     return min(max(position / duration, 0), 1)
+  }
+}
+
+/// Scroll position changes must not re-evaluate the folder's menus, filters and
+/// media cell builder for every row crossed during a drag.
+private struct StableLibraryScrollView<Content: View>: View {
+  let itemIDs: Set<String>
+  let resetKey: String
+  let content: Content
+  @State private var position: String?
+
+  init(itemIDs: Set<String>, resetKey: String, @ViewBuilder content: () -> Content) {
+    self.itemIDs = itemIDs
+    self.resetKey = resetKey
+    self.content = content()
+  }
+
+  var body: some View {
+    ScrollView { content }
+      .scrollPosition(id: $position, anchor: .top)
+      .onChange(of: itemIDs) { _, ids in
+        if let position, !ids.contains(position) { self.position = nil }
+      }
+      .onChange(of: resetKey) { _, _ in position = nil }
   }
 }

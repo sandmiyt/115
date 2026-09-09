@@ -1,27 +1,9 @@
 import SwiftUI
 
 struct SettingsView: View {
-  @Environment(AppState.self) private var appState
   var body: some View {
     List {
       Section {
-        HStack(spacing: 14) {
-          Image(systemName: "play.rectangle.on.rectangle.fill")
-            .font(.system(size: 27, weight: .medium))
-            .foregroundStyle(CinevaTheme.accent)
-            .frame(width: 58, height: 58)
-            .background(CinevaTheme.accent.opacity(0.10), in: RoundedRectangle(cornerRadius: 16))
-          VStack(alignment: .leading, spacing: 5) {
-            Text("Cineva").font(.title2.weight(.bold))
-            Text(appState.isConfigured ? "已设置媒体源 · \(appState.mediaSourceKind.title)" : "连接媒体源，开始浏览")
-              .font(.subheadline).foregroundStyle(.secondary)
-          }
-        }
-        .padding(.vertical, 8)
-        .accessibilityElement(children: .combine)
-        .listRowBackground(Color.clear)
-      }
-      Section("媒体与外观") {
         NavigationLink {
           MediaSourceSettingsView()
         } label: {
@@ -42,8 +24,6 @@ struct SettingsView: View {
           )
         }
 
-      }
-      Section("播放体验") {
         NavigationLink {
           PlaybackSettingsView()
         } label: {
@@ -54,8 +34,6 @@ struct SettingsView: View {
           )
         }
 
-      }
-      Section("管理") {
         NavigationLink {
           PrivacySettingsView()
         } label: {
@@ -87,7 +65,6 @@ struct SettingsView: View {
         }
       }
     }
-    .listStyle(.insetGrouped)
     .navigationTitle("设置")
   }
 }
@@ -97,24 +74,12 @@ private struct SettingsCategoryRow: View {
   let subtitle: String
   let systemName: String
 
-  private var iconColor: Color {
-    switch systemName {
-    case "externaldrive.fill": .blue
-    case "paintbrush.fill": .purple
-    case "play.rectangle.fill": .orange
-    case "lock.shield.fill": .green
-    case "externaldrive.badge.timemachine": .teal
-    default: .gray
-    }
-  }
-
   var body: some View {
     HStack(spacing: 13) {
       Image(systemName: systemName)
         .font(.system(size: 18, weight: .semibold))
-        .foregroundStyle(.white)
-        .frame(width: 36, height: 36)
-        .background(iconColor.gradient, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .frame(width: 30, height: 30)
+        .foregroundStyle(.tint)
 
       VStack(alignment: .leading, spacing: 3) {
         Text(title)
