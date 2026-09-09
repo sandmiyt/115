@@ -8,10 +8,14 @@ struct VideoCard: View {
   let item: CloudItem
   var transitionNamespace: Namespace.ID? = nil
   var compact = false
+  @Environment(\.mediaGridTapGate) private var tapGate
   let onOpen: () -> Void
 
   var body: some View {
-    Button(action: onOpen) {
+    Button {
+      guard tapGate?.allowsTap != false else { return }
+      onOpen()
+    } label: {
       VStack(alignment: .leading, spacing: 7) {
         MediaArtworkCard(item: item, progress: resumeProgress, compact: compact)
           .cinevaPlayerTransitionSource(id: item.id, in: transitionNamespace)
@@ -175,7 +179,7 @@ struct VideoArtwork: View {
           ZStack {
             placeholder
             if loadFailed {
-              Text("暂无缩略图").font(.caption2).foregroundStyle(.secondary)
+              Text("加载未完成，可长按重试").font(.caption2).foregroundStyle(.secondary)
                 .frame(maxHeight: .infinity, alignment: .bottom).padding(.bottom, 6)
             }
             if isLoading {
@@ -220,19 +224,22 @@ struct VideoArtwork: View {
       let api = appState.api
       let requestedItem = item
       let image = await withTaskCancellationHandler {
-        await ThumbnailService.boundedArtwork(seconds: 45) {
-          var result: UIImage?
-          for attempt in 0..<3 {
-            if attempt > 0 {
-              do { try await Task.sleep(nanoseconds: 6_000_000_000) }
-              catch { return nil as UIImage? }
-            }
-            guard !Task.isCancelled else { return nil as UIImage? }
-            result = await service.thumbnail(for: requestedItem, api: api)
-            if result != nil { break }
+        var result: UIImage?
+        // Queue time is not a download failure. Each active network/frame stage
+        // has its own deadline; a busy directory must not expire queued cards.
+        for delay in [0, 6, 15, 30, 60] {
+          if delay > 0 {
+            spinner.cancel()
+            isLoading = false
+            loadFailed = true
+            do { try await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000_000) }
+            catch { return nil as UIImage? }
           }
-          return result
+          guard !Task.isCancelled else { return nil as UIImage? }
+          result = await service.thumbnail(for: requestedItem, api: api)
+          if result != nil { break }
         }
+        return result
       } onCancel: {
         spinner.cancel()
       }
@@ -421,8 +428,7 @@ struct PinchMediaGrid<Cell: View, Footer: View>: View {
   let compact: Bool
   private let cell: (CloudItem) -> Cell
   private let footer: () -> Footer
-  @GestureState private var pinchScale: CGFloat = 1
-  @GestureState private var pinchAnchor: UnitPoint = .center
+  @State private var tapGate = MediaGridTapGate()
 
   init(items: [CloudItem], columnCount: Binding<Int>, compact: Bool,
        @ViewBuilder cell: @escaping (CloudItem) -> Cell,
@@ -447,21 +453,8 @@ struct PinchMediaGrid<Cell: View, Footer: View>: View {
     }
     .scrollTargetLayout()
     .padding(.horizontal, compact ? 2 : 10)
-    .scaleEffect(pinchScale, anchor: pinchAnchor)
-    .simultaneousGesture(
-      MagnifyGesture(minimumScaleDelta: 0.02)
-        .updating($pinchScale) { value, state, _ in
-          state = min(max(value.magnification, 0.72), 1.6)
-        }
-        .updating($pinchAnchor) { value, state, _ in state = value.startAnchor }
-        .onEnded { value in
-          let target = MediaGridZoomPolicy.targetColumns(from: safeColumns,
-                                                         magnification: Double(value.magnification))
-          withAnimation(reduceMotion ? nil : .smooth(duration: 0.24)) {
-            columnCount = target
-          }
-        }
-    )
+    .environment(\.mediaGridTapGate, tapGate)
+    .modifier(MediaGridPinchModifier(columnCount: $columnCount, tapGate: tapGate))
     .sensoryFeedback(.selection, trigger: safeColumns)
     .accessibilityAction(named: Text("放大缩略图")) {
       columnCount = MediaGridZoomPolicy.targetColumns(from: safeColumns, magnification: 1.2)
@@ -469,5 +462,58 @@ struct PinchMediaGrid<Cell: View, Footer: View>: View {
     .accessibilityAction(named: Text("缩小缩略图")) {
       columnCount = MediaGridZoomPolicy.targetColumns(from: safeColumns, magnification: 0.8)
     }
+  }
+}
+
+/// A reference gate avoids invalidating every card on each gesture sample.
+private final class MediaGridTapGate {
+  var blockedUntil: TimeInterval = 0
+  var allowsTap: Bool { ProcessInfo.processInfo.systemUptime >= blockedUntil }
+  func suppressTap() { blockedUntil = ProcessInfo.processInfo.systemUptime + 0.5 }
+}
+
+private struct MediaGridTapGateKey: EnvironmentKey {
+  static let defaultValue: MediaGridTapGate? = nil
+}
+
+private extension EnvironmentValues {
+  var mediaGridTapGate: MediaGridTapGate? {
+    get { self[MediaGridTapGateKey.self] }
+    set { self[MediaGridTapGateKey.self] = newValue }
+  }
+}
+
+/// Gesture samples update the transform wrapper, not the grid's cell builder.
+private struct MediaGridPinchModifier: ViewModifier {
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
+  @Binding var columnCount: Int
+  let tapGate: MediaGridTapGate
+  @GestureState private var scale: CGFloat = 1
+  @GestureState private var anchor: UnitPoint = .center
+
+  func body(content: Content) -> some View {
+    content
+      .scaleEffect(scale, anchor: anchor)
+      .highPriorityGesture(
+        MagnifyGesture(minimumScaleDelta: 0.01)
+          .updating($scale) { value, state, _ in
+            tapGate.suppressTap()
+            state = min(max(value.magnification, 0.82), 1.22)
+          }
+          .updating($anchor) { value, state, _ in state = value.startAnchor }
+          .onEnded { value in
+            tapGate.suppressTap()
+            let target = MediaGridZoomPolicy.targetColumns(from: columnCount,
+              magnification: Double(value.magnification))
+            // Interpolating every lazy-grid cell's geometry causes large-directory
+            // layout spikes. Keep the live transform, then commit one layout pass.
+            var transaction = Transaction(animation: nil)
+            transaction.disablesAnimations = true
+            withTransaction(transaction) { columnCount = target }
+          }
+      )
+      .onChange(of: scale) { old, new in
+        if old != 1, new == 1 { tapGate.suppressTap() }
+      }
   }
 }

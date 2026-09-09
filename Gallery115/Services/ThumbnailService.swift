@@ -259,16 +259,42 @@ actor ThumbnailService {
     // issue PROPFIND requests before it reached the frame-generation semaphore.
     if let url = item.thumbnailURL, let image = await remoteThumbnail(at: url) { return image }
     guard !Task.isCancelled else { return nil }
-    if let url = await api.serverThumbnailURL(for: item), url != item.thumbnailURL,
-      let image = await remoteThumbnail(at: url) { return image }
-    guard !Task.isCancelled else { return nil }
     if item.isPhoto {
       guard let source = try? await api.photoSource(for: item), !Task.isCancelled else { return nil }
       return await remoteThumbnail(at: source.url, headers: source.headers)
     }
-    if let data = await api.posterData(for: item),
-      let image = downsampledImage(from: data) { return image }
-    return nil
+    return await Self.firstAvailableArtwork([
+      { [self] in
+        guard let url = await api.serverThumbnailURL(for: item), url != item.thumbnailURL,
+          !Task.isCancelled else { return nil }
+        return await remoteThumbnail(at: url)
+      },
+      { [self] in
+        guard let data = await api.posterData(for: item), !Task.isCancelled else { return nil }
+        return await decodeArtwork(data)
+      }
+    ])
+  }
+
+  private func decodeArtwork(_ data: Data) -> UIImage? { downsampledImage(from: data) }
+
+  typealias ArtworkOperation = @Sendable () async -> UIImage?
+
+  nonisolated static func firstAvailableArtwork(_ operations: [ArtworkOperation]) async -> UIImage? {
+    guard !operations.isEmpty else { return nil }
+    let completion = ArtworkCompletion(remaining: operations.count)
+    return await withTaskCancellationHandler {
+      await withCheckedContinuation { continuation in
+        completion.install(continuation)
+        let tasks = operations.map { operation in
+          Task {
+            guard !Task.isCancelled else { completion.candidateFinished(nil); return }
+            completion.candidateFinished(await operation())
+          }
+        }
+        completion.attach(tasks)
+      }
+    } onCancel: { completion.finish(nil) }
   }
 
   /// Unlike a task-group race, this does not await an uncooperative loser.
@@ -445,6 +471,18 @@ private final class ArtworkCompletion: @unchecked Sendable {
   private var result: UIImage?
   private var continuation: CheckedContinuation<UIImage?, Never>?
   private var tasks: [Task<Void, Never>] = []
+  private var remaining: Int
+
+  init(remaining: Int = 1) { self.remaining = remaining }
+
+  func candidateFinished(_ image: UIImage?) {
+    if let image { finish(image); return }
+    lock.lock()
+    remaining -= 1
+    let exhausted = remaining == 0
+    lock.unlock()
+    if exhausted { finish(nil) }
+  }
 
   func install(_ continuation: CheckedContinuation<UIImage?, Never>) {
     lock.lock()

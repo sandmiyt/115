@@ -166,8 +166,14 @@ check(without_prepare(player_model) == without_prepare(old_player_model)
       and "try Task.checkCancellation()" in player_model,
       "Player change is confined to guarding cancelled preparation; engine logic unchanged")
 check("boundedArtwork(seconds: 18)" in service and "boundedArtwork(seconds: 15)" in service
-      and "boundedArtwork(seconds: 45)" in card,
-      "Artwork stages and visible-cell waiting have completion deadlines")
+      and "boundedArtwork(seconds: 45)" not in card
+      and "for delay in [0, 6, 15, 30, 60]" in card,
+      "Active artwork stages have deadlines; queued cells retain automatic retries")
+check(".highPriorityGesture(" in card and "guard tapGate?.allowsTap != false" in card
+      and ".simultaneousGesture(" not in card,
+      "Pinch takes priority over taps and guards release-time video activation")
+check("struct MediaGridPinchModifier" in card and "transaction.disablesAnimations = true" in card,
+      "Pinch transform state is isolated and density changes avoid whole-grid interpolation")
 check("MagnifyGesture(minimumScaleDelta:" in card and "MediaGridZoomPolicy" in card,
       "Media grids support pinch density changes with stable item identity")
 check("activeFrameSlots.count < maximumFrameJobs" in service and "holdsNetworkSlot = false" in service,

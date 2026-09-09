@@ -36,6 +36,36 @@ final class ArtworkCacheTests: XCTestCase {
     await task.value
   }
 
+  func testReadyArtworkDoesNotWaitForSlowAlternative() async {
+    let ready = image()
+    let gate = FrameGate(image: ready)
+    let returned = expectation(description: "ready poster wins without waiting for server")
+    let task = Task {
+      let result = await ThumbnailService.firstAvailableArtwork([
+        { await gate.load() }, { ready }
+      ])
+      XCTAssertNotNil(result)
+      returned.fulfill()
+    }
+    await fulfillment(of: [returned], timeout: 2)
+    await gate.release()
+    await task.value
+  }
+
+  func testMissingCandidateDoesNotDiscardLaterArtwork() async {
+    let ready = image()
+    let result = await ThumbnailService.firstAvailableArtwork([
+      { nil },
+      {
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        return ready
+      }
+    ])
+    XCTAssertNotNil(result)
+    let empty = await ThumbnailService.firstAvailableArtwork([{ nil }, { nil }])
+    XCTAssertNil(empty)
+  }
+
   private var root: URL!
   private var disk: ArtworkDiskStore!
 
