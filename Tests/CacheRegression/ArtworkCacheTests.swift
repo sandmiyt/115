@@ -253,6 +253,23 @@ final class ArtworkCacheTests: XCTestCase {
     XCTAssertNil(try disk.read(identity(item())))
   }
 
+  func testTransientFailureIsThrottledThenCanRecover() async throws {
+    let probe = RecoveringLoader(image: image())
+    let cache = ThumbnailService(disk: disk, namespace: { "mount-a" },
+                                 loader: { _, _ in await probe.load() })
+    let first = await cache.thumbnail(for: item(), api: APIClient())
+    let immediate = await cache.thumbnail(for: item(), api: APIClient())
+    XCTAssertNil(first)
+    XCTAssertNil(immediate)
+    let initialCalls = await probe.calls
+    XCTAssertEqual(initialCalls, 1)
+    try await Task.sleep(nanoseconds: 5_200_000_000)
+    let recovered = await cache.thumbnail(for: item(), api: APIClient())
+    XCTAssertNotNil(recovered)
+    let calls = await probe.calls
+    XCTAssertEqual(calls, 2)
+  }
+
   func testDiskWriteFailureIsReported() async throws {
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     let notDirectory = root.appendingPathComponent("file-not-folder")
@@ -302,4 +319,14 @@ private actor HeldLoader {
     return await withCheckedContinuation { continuation = $0 }
   }
   func finish() { continuation?.resume(returning: image); continuation = nil }
+}
+
+private actor RecoveringLoader {
+  let image: UIImage
+  private(set) var calls = 0
+  init(image: UIImage) { self.image = image }
+  func load() -> UIImage? {
+    calls += 1
+    return calls == 1 ? nil : image
+  }
 }

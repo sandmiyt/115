@@ -66,7 +66,7 @@ check("item.id" in card_identity and "item.size" in card_identity
       and "modifiedAt" not in card_identity,
       "Directory refresh metadata cannot restart unchanged artwork tasks")
 check("cachedImage = nil" not in card
-      and "guard let image else { return }" in card,
+      and "guard let image else { loadFailed = true; return }" in card,
       "Artwork refresh keeps the existing image until a replacement is ready")
 check("activeRequestIdentity == identity" in card,
       "Cancelled recycled artwork cells clear only their own loading state")
@@ -176,7 +176,7 @@ check('case .updated: return ("user_utime", "0")' in cloud_provider
       and 'case .size: return ("file_size", "0")' in cloud_provider
       and "sortKey: sortOrder.rawValue" in cloud_provider,
       "115 pagination sorting and cache identity stay aligned")
-check("if !Task.isCancelled { metadataMisses.insert(item.id) }" in provider,
+check("A transport error is not evidence" in provider,
       "Cancelled artwork discovery cannot poison metadata miss cache")
 authentication = app_state.split("  private func authenticate(reason:", 1)[1].split("  private enum Keys", 1)[0]
 check("let policy: LAPolicy = .deviceOwnerAuthentication" in authentication

@@ -91,7 +91,7 @@ actor ThumbnailService {
       if inFlight[identity.key]?.id == work.id {
         inFlight[identity.key] = nil
         if result == nil, !work.task.isCancelled, generation == cacheGeneration {
-          failedUntil[identity.key] = Date().addingTimeInterval(120)
+          failedUntil[identity.key] = Date().addingTimeInterval(5)
         }
       }
       guard !Task.isCancelled, generation == cacheGeneration, identity.namespace == namespace() else { return nil }
@@ -226,10 +226,10 @@ actor ThumbnailService {
     // issue PROPFIND requests before it reached the frame-generation semaphore.
     if let url = item.thumbnailURL, let image = await remoteThumbnail(at: url) { return image }
     guard !Task.isCancelled else { return nil }
-    if let metadata = await api.localMetadata(for: item), let data = metadata.posterData,
+    if let data = await api.posterData(for: item),
       let image = downsampledImage(from: data) { return image }
     guard !Task.isCancelled, !item.isDiscImage,
-      let source = try? await api.videoSources(for: item).first else { return nil }
+      let source = try? await api.thumbnailSource(for: item) else { return nil }
     guard !Task.isCancelled else { return nil }
     return await Self.frameThumbnail(source: source)
   }

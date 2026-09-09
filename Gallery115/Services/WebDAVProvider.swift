@@ -199,7 +199,7 @@ actor WebDAVProvider: CloudProvider {
       } catch {
         // Playback may cancel background artwork discovery. Cancellation does
         // not mean the file has no metadata and must not poison the miss cache.
-        if !Task.isCancelled { metadataMisses.insert(item.id) }
+        // A transport error is not evidence that sidecars are absent.
         return nil
       }
     }
@@ -279,6 +279,36 @@ actor WebDAVProvider: CloudProvider {
     }
     metadataCache[item.id] = metadata
     return metadata
+  }
+
+  /// Artwork discovery must not wait for NFO parsing or cache transient failures.
+  func posterData(for item: CloudItem) async -> Data? {
+    guard !Task.isCancelled, !item.isDirectory,
+      let configuration = store.configuration else { return nil }
+    if let data = metadataCache[item.id]?.posterData { return data }
+    do {
+      let entries = try await fetchDirectoryEntries(
+        configuration: configuration, logicalPath: normalizeLogicalPath(item.parentID))
+      let stem = URL(fileURLWithPath: item.name).deletingPathExtension().lastPathComponent.lowercased()
+      let candidates = ["\(stem)-poster.jpg", "\(stem)-poster.jpeg", "\(stem)-poster.png",
+                        "\(stem)-thumb.jpg", "\(stem)-thumb.png", "\(stem).jpg", "\(stem).png",
+                        "poster.jpg", "poster.jpeg", "poster.png", "folder.jpg", "cover.jpg"]
+      var index: [String: CloudItem] = [:]
+      for entry in entries where !entry.isDirectory {
+        if index[entry.name.lowercased()] == nil { index[entry.name.lowercased()] = entry }
+      }
+      for name in candidates {
+        guard !Task.isCancelled else { return nil }
+        guard let poster = index[name] else { continue }
+        do {
+          return try await fetchResourceData(configuration: configuration,
+            logicalPath: poster.id, maximumBytes: 12_000_000)
+        } catch {
+          if Task.isCancelled { return nil }
+        }
+      }
+    } catch { return nil }
+    return nil
   }
 
   func externalSubtitles(for item: CloudItem) async -> [ExternalSubtitleTrack] {

@@ -193,6 +193,25 @@ actor Cloud115Provider: CloudProvider {
     throw CloudProviderError.noPlayableSource
   }
 
+  /// Small artwork needs the cheapest available transcode, not playback quality.
+  func thumbnailSource(for item: CloudItem) async throws -> VideoSource? {
+    guard !item.pickCode.isEmpty else { return nil }
+    do {
+      let sources = try await transcodedSources(pickCode: item.pickCode)
+      try Task.checkCancellation()
+      if let source = sources.min(by: { $0.definition < $1.definition }) { return source }
+    } catch let error as CloudProviderError {
+      switch error {
+      case .authenticationRequired, .rateLimited: throw error
+      default: break
+      }
+    } catch {
+      try Task.checkCancellation()
+    }
+    try Task.checkCancellation()
+    return try await originalSource(pickCode: item.pickCode)
+  }
+
   func updateVideoHistory(pickCode: String, seconds: Int, watchEnd: Bool) async {
     guard !pickCode.isEmpty else { return }
     _ = try? await authorizedRequest(

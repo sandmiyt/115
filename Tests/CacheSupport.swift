@@ -3,6 +3,8 @@ import Foundation
 
 // Test-only boundaries. No account/network access is permitted in cache tests.
 actor APIClient {
+  func thumbnailSource(for item: CloudItem) async throws -> VideoSource? { nil }
+  func posterData(for item: CloudItem) async -> Data? { nil }
   func localMetadata(for item: CloudItem) async -> TestMetadata? { nil }
   func videoSources(for item: CloudItem) async throws -> [VideoSource] { [] }
 }

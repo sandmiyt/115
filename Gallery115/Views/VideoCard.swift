@@ -134,6 +134,7 @@ struct VideoArtwork: View {
   @State private var loadedIdentity: String?
   @State private var activeRequestIdentity: String?
   @State private var isLoading = false
+  @State private var loadFailed = false
 
   var body: some View {
     GeometryReader { proxy in
@@ -147,6 +148,10 @@ struct VideoArtwork: View {
         } else {
           ZStack {
             placeholder
+            if loadFailed {
+              Text("暂无缩略图").font(.caption2).foregroundStyle(.secondary)
+                .frame(maxHeight: .infinity, alignment: .bottom).padding(.bottom, 6)
+            }
             if isLoading {
               ProgressView()
                 .controlSize(.small)
@@ -163,6 +168,7 @@ struct VideoArtwork: View {
     .task(id: itemThumbnailIdentity) {
       let identity = itemThumbnailIdentity
       if loadedIdentity == identity, cachedImage != nil { return }
+      loadFailed = false
       activeRequestIdentity = identity
       isLoading = false
       // Keep already-rendered artwork visible during a directory refresh. A
@@ -181,12 +187,22 @@ struct VideoArtwork: View {
         }
       }
       let image = await withTaskCancellationHandler {
-        await appState.thumbnailService.thumbnail(for: item, api: appState.api)
+        var result: UIImage?
+        for attempt in 0..<3 {
+          if attempt > 0 {
+            do { try await Task.sleep(nanoseconds: 6_000_000_000) }
+            catch { return nil as UIImage? }
+          }
+          guard !Task.isCancelled else { return nil as UIImage? }
+          result = await appState.thumbnailService.thumbnail(for: item, api: appState.api)
+          if result != nil { break }
+        }
+        return result
       } onCancel: {
         spinner.cancel()
       }
       guard !Task.isCancelled else { return }
-      guard let image else { return }
+      guard let image else { loadFailed = true; return }
       let shouldFadeIn = cachedImage == nil && isLoading
       withAnimation(shouldFadeIn ? .easeOut(duration: 0.16) : nil) {
         cachedImage = image
