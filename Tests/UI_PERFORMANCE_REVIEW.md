@@ -140,3 +140,18 @@ ETag 语义参考：https://github.com/OpenListTeam/OpenList/blob/main/server/we
 - https://developer.apple.com/documentation/uikit/uicollectionview/startinteractivetransition(to:completion:)
 
 设备验收：在目录中部、最后一屏和不足一屏时双向捏合；缓慢反向、快速松手、跨多档；确认缩放后首个点击可播放；缩放时触发分页/刷新或返回；收藏批量取消及文件夹导航；大字体和横竖屏切换。必须观察内容边界、焦点跳动、转场停止及主线程耗时后才能确认手感修复。
+
+
+## 2026-09-10：识别失败与误触回归
+
+用户仍反馈难以触发、误开视频，因此上一节的交互不能视为验收通过。
+
+代码可确认：原点击保护仅在 pinch action 收到 began 后启用，识别失败的双指操作没有保护；只允许与 pan 同时识别，并未阻止 UIHostingConfiguration 内部手势使父 pinch 失败。没有设备事件记录，不能断言这是所有触发失败的唯一原因。
+
+修复：使用 UIPinchGestureRecognizer 子类，在 touchesBegan 观察到媒体区域内第二根手指时先阻止卡片动作并暂停 pan，仍由系统计算缩放比例；防止同一集合及后代视图的识别器提前使 pinch 失败，外部导航/系统手势仍遵循默认规则。保护持续到 reset，失败/取消/结束都会恢复滚动并短暂屏蔽残留点击；拆除视图也显式恢复。删除 began 里立即关闭又开启 pan 的操作；两指持有期间延迟快照重配。
+
+参考 Apple 的自定义手势生命周期与冲突规则：
+https://developer.apple.com/documentation/uikit/uigesturerecognizer/canbeprevented(by:)
+https://developer.apple.com/documentation/uikit/uigesturerecognizer/touchesbegan(_:with:)
+
+验证：Windows 源码预检、git diff --check。没有 Xcode/设备执行证据，47 个既有 XCTest 不覆盖 UIKit 手势竞争；必须测试双指无明显移动、先滑后加第二指、失败/取消后再次单指滚动、长按菜单、快速重复捏合、双指结束后视频点击，以及当前 IPA 的提交版本。未声称运行时已修复。

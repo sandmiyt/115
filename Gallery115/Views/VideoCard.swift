@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import UIKit.UIGestureRecognizerSubclass
 
 struct VideoCard: View {
   @Environment(AppState.self) private var appState
@@ -434,7 +435,8 @@ struct PhotoPreviewScreen: View {
 /// A reference gate avoids invalidating every card on each gesture sample.
 private final class MediaGridTapGate {
   var blockedUntil: TimeInterval = 0
-  var allowsTap: Bool { ProcessInfo.processInfo.systemUptime >= blockedUntil }
+  var hasMultipleTouches = false
+  var allowsTap: Bool { !hasMultipleTouches && ProcessInfo.processInfo.systemUptime >= blockedUntil }
   func suppressTap() { blockedUntil = ProcessInfo.processInfo.systemUptime + 0.5 }
 }
 
@@ -529,6 +531,7 @@ struct PhotoLibraryGrid<FolderCell: View, MediaCell: View, Footer: View>: UIView
   static func dismantleUIView(_ uiView: UICollectionView, coordinator: Coordinator) {
     coordinator.active = false
     coordinator.refreshTask?.cancel()
+    coordinator.releaseTouchOwnership()
     if coordinator.transition != nil, !coordinator.finishing { uiView.cancelInteractiveTransition() }
     uiView.removeGestureRecognizer(coordinator.pinch)
   }
@@ -550,7 +553,7 @@ struct PhotoLibraryGrid<FolderCell: View, MediaCell: View, Footer: View>: UIView
     var targetRatio: CGFloat = 1
     var scope: String?
     var refreshTask: Task<Void, Never>?
-    lazy var pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
+    lazy var pinch = LibraryPriorityPinchRecognizer(target: self, action: #selector(handlePinch(_:)))
 
     init(parent: PhotoLibraryGrid) { self.parent = parent }
     func newLayout(columns: Int? = nil) -> PhotoGridLayout {
@@ -583,6 +586,19 @@ struct PhotoLibraryGrid<FolderCell: View, MediaCell: View, Footer: View>: UIView
         }
         return cell
       }
+      pinch.shouldClaim = { [weak self] point in
+        guard let self, let view = self.view, view.numberOfSections > 1,
+          view.numberOfItems(inSection: 1) > 0 else { return false }
+        let layout = (self.transition?.currentLayout ?? view.collectionViewLayout) as? PhotoGridLayout
+        return layout?.mediaRegion.contains(point) == true
+      }
+      pinch.onClaim = { [weak self] in
+        guard let self else { return }
+        self.tapGate.hasMultipleTouches = true
+        self.tapGate.suppressTap()
+        self.view?.panGestureRecognizer.isEnabled = false
+      }
+      pinch.onRelease = { [weak self] in self?.releaseTouchOwnership() }
       pinch.delegate = self
       pinch.cancelsTouchesInView = true
       view.addGestureRecognizer(pinch)
@@ -595,7 +611,7 @@ struct PhotoLibraryGrid<FolderCell: View, MediaCell: View, Footer: View>: UIView
     }
 
     func applyLatest() {
-      guard active, !finishing, transition == nil, let view else { return }
+      guard active, !tapGate.hasMultipleTouches, !finishing, transition == nil, let view else { return }
       foldersByID = Dictionary(parent.folders.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
       mediaByID = Dictionary(parent.items.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
       var seen = Set<PhotoGridID>()
@@ -639,6 +655,13 @@ struct PhotoLibraryGrid<FolderCell: View, MediaCell: View, Footer: View>: UIView
       return layout
     }
 
+    func releaseTouchOwnership() {
+      tapGate.hasMultipleTouches = false
+      tapGate.suppressTap()
+      view?.panGestureRecognizer.isEnabled = true
+      applyLatest()
+    }
+
     func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
       guard !finishing, transition == nil, let view,
         let layout = view.collectionViewLayout as? PhotoGridLayout else { return false }
@@ -647,6 +670,7 @@ struct PhotoLibraryGrid<FolderCell: View, MediaCell: View, Footer: View>: UIView
     }
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
       shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+      // Keep a first-finger scroll from failing the still-possible pinch.
       otherGestureRecognizer === view?.panGestureRecognizer
     }
 
@@ -655,8 +679,6 @@ struct PhotoLibraryGrid<FolderCell: View, MediaCell: View, Footer: View>: UIView
       tapGate.suppressTap()
       switch recognizer.state {
       case .began:
-        view.panGestureRecognizer.isEnabled = false
-        view.panGestureRecognizer.isEnabled = true
         let point = recognizer.location(in: view)
         anchorIndex = view.indexPathsForVisibleItems.filter { $0.section == 1 }.min {
           let first = view.layoutAttributesForItem(at: $0)?.center ?? .zero
@@ -840,5 +862,53 @@ final class PhotoGridTransitionLayout: UICollectionViewTransitionLayout {
     let progress = min(max(transitionProgress, 0), 1)
     return CGSize(width: start.width + (end.width - start.width) * progress,
                   height: start.height + (end.height - start.height) * progress)
+  }
+}
+
+/// A card's hosted recognizers must not fail the parent pinch while the first
+/// finger is down. Claim two-touch intent before UIPinch reaches .began so even
+/// an unsuccessful pinch cannot turn into a card activation.
+final class LibraryPriorityPinchRecognizer: UIPinchGestureRecognizer {
+  var shouldClaim: ((CGPoint) -> Bool)?
+  var onClaim: (() -> Void)?
+  var onRelease: (() -> Void)?
+  private var trackedTouches = Set<UITouch>()
+  private var claimed = false
+
+  override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool {
+    if let view, let other = preventingGestureRecognizer.view,
+      other === view || other.isDescendant(of: view) { return false }
+    // Navigation/system gestures outside this collection keep their normal priority.
+    return super.canBePrevented(by: preventingGestureRecognizer)
+  }
+
+  override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+    trackedTouches.formUnion(touches)
+    if !claimed, trackedTouches.count >= 2, let view {
+      let points = trackedTouches.map { $0.location(in: view) }
+      let center = CGPoint(x: points.map(\.x).reduce(0, +) / CGFloat(points.count),
+                           y: points.map(\.y).reduce(0, +) / CGFloat(points.count))
+      if shouldClaim?(center) == true {
+        claimed = true
+        onClaim?()
+      }
+    }
+    super.touchesBegan(touches, with: event)
+  }
+
+  override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+    trackedTouches.subtract(touches)
+    super.touchesEnded(touches, with: event)
+  }
+
+  override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+    trackedTouches.subtract(touches)
+    super.touchesCancelled(touches, with: event)
+  }
+
+  override func reset() {
+    super.reset()
+    trackedTouches.removeAll()
+    if claimed { claimed = false; onRelease?() }
   }
 }

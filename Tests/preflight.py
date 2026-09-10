@@ -168,9 +168,13 @@ check("boundedArtwork(seconds: 18)" in service and "boundedArtwork(seconds: fram
       and "boundedArtwork(seconds: 45)" not in card
       and "[0, 6, 15, 30, 60][min(attempt, 4)]" in card,
       "Active artwork stages have deadlines; queued cells retain automatic retries")
-check("UIPinchGestureRecognizer(target:" in card and "guard tapGate?.allowsTap != false" in card
+check("LibraryPriorityPinchRecognizer(target:" in card and "guard tapGate?.allowsTap != false" in card
       and ".simultaneousGesture(" not in card,
       "Pinch takes priority over taps and guards release-time video activation")
+check("override func canBePrevented" in card and "other.isDescendant(of: view)" in card
+      and "trackedTouches.count >= 2" in card and "!hasMultipleTouches" in card
+      and "coordinator.releaseTouchOwnership()" in card,
+      "Two-touch intent blocks taps before recognition; hosted gestures cannot fail pinch; teardown releases pan")
 check("struct PhotoLibraryGrid" in card and "startInteractiveTransition(to: target)" in card,
       "Media cells use a native interactive collection layout")
 check("PhotoGridTransitionPolicy.progress" in card and "finishInteractiveTransition()" in card
