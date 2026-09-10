@@ -90,6 +90,8 @@ struct FolderView: View {
   @State private var artworkRefreshRevision = 0
   @State private var isSearching = false
   @State private var selectedPhoto: CloudItem?
+  @State private var isSelecting = false
+  @State private var selectedIDs = Set<String>()
   @Namespace private var playerTransition
 
   var body: some View {
@@ -116,6 +118,15 @@ struct FolderView: View {
         content
       }
     }
+    .safeAreaInset(edge: .bottom) {
+      if isSelecting {
+        MediaSelectionBar(count: selectedIDs.count, onSelectAll: {
+          selectedIDs = Set(displayItems.filter(\.isVideo).map(\.id))
+        }, onDone: { isSelecting = false; selectedIDs.removeAll() }, onFavorite: {
+          applySelectedFavorites(true)
+        }, onUnfavorite: { applySelectedFavorites(false) })
+      }
+    }
     .environment(\.artworkRefreshRevision, artworkRefreshRevision)
     .onDisappear { refreshTask?.cancel(); refreshTask = nil }
     .navigationTitle(title)
@@ -137,6 +148,11 @@ struct FolderView: View {
       ToolbarItemGroup(placement: .topBarTrailing) {
         Menu {
           Menu {
+            Button(isSelecting ? "完成选择" : "选择视频", systemImage: "checkmark.circle") {
+              isSelecting.toggle()
+              selectedIDs.removeAll()
+            }
+            Divider()
             Picker("筛选", selection: $mediaFilter) {
               ForEach(MediaFilter.allCases) { filter in
                 Label(filter.title, systemImage: filter.systemImage)
@@ -317,7 +333,7 @@ struct FolderView: View {
   private var content: some View {
     switch appState.browserLayout {
     case .grid:
-      StableLibraryScrollView(itemIDs: Set(displayItems.map(\.id)),
+      StableLibraryScrollView(itemIDs: Set(displayItems.map(\.id)), layoutColumns: mediaGridColumns,
                               resetKey: "\(appState.mediaSourceRevision)|\(folderID)|\(sortMode.rawValue)") {
         VStack(spacing: 14) {
           if !displayedFolders.isEmpty {
@@ -325,6 +341,7 @@ struct FolderView: View {
               ForEach(displayedFolders) { item in
                 NavigationLink(value: item) { FolderCard(item: item) }
                   .buttonStyle(FolderCardButtonStyle())
+                  .disabled(isSelecting)
               }
             }
             .scrollTargetLayout()
@@ -332,7 +349,9 @@ struct FolderView: View {
             .padding(.top, 10)
           }
           PinchMediaGrid(items: displayedMedia, columnCount: $mediaGridColumns, compact: compactGrid) { item in
-            VideoCard(item: item, transitionNamespace: playerTransition, compact: compactGrid) {
+            VideoCard(item: item, transitionNamespace: playerTransition, compact: compactGrid,
+                      selectionMode: isSelecting, isSelected: selectedIDs.contains(item.id)) {
+              if isSelecting { toggleSelection(item); return }
               if item.isPhoto { selectedPhoto = item }
               else { selectedVideo = item }
             }
@@ -351,18 +370,26 @@ struct FolderView: View {
             NavigationLink(value: item) {
               FolderListRow(item: item)
             }
+            .disabled(isSelecting)
           } else if item.isPhoto {
-            Button { selectedPhoto = item } label: {
+            Button { if !isSelecting { selectedPhoto = item } } label: {
               PhotoListRow(item: item)
                 .cinevaPlayerTransitionSource(id: item.id, in: playerTransition)
             }
             .buttonStyle(.plain)
           } else {
             Button {
+              if isSelecting { toggleSelection(item); return }
               selectedVideo = item
             } label: {
-              VideoListRow(item: item)
-                .cinevaPlayerTransitionSource(id: item.id, in: playerTransition)
+              HStack {
+                if isSelecting {
+                  Image(systemName: selectedIDs.contains(item.id) ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(.tint)
+                }
+                VideoListRow(item: item)
+                  .cinevaPlayerTransitionSource(id: item.id, in: playerTransition)
+              }
             }
             .buttonStyle(.plain)
             .contextMenu {
@@ -497,6 +524,9 @@ struct FolderView: View {
   @MainActor
   private func rebuildDisplayItems() {
     let source = searchItems ?? items
+    if appState.mediaSourceKind == .webDAV {
+      appState.libraryStore.reconcileFavorites(with: source)
+    }
     let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
     var output = trimmed.isEmpty
       ? source
@@ -515,6 +545,7 @@ struct FolderView: View {
       output = output.filter { !$0.isDirectory && appState.libraryStore.isFavorite($0) }
     }
 
+    selectedIDs.formIntersection(Set(output.filter(\.isVideo).map(\.id)))
     displayItems = output
     displayedFolders = output.filter(\.isDirectory)
     displayedMedia = output.filter { !$0.isDirectory }
@@ -527,6 +558,18 @@ struct FolderView: View {
         let comparison = $0.name.localizedStandardCompare($1.name)
         return comparison == .orderedSame ? $0.id < $1.id : comparison == .orderedAscending
       }
+  }
+
+  private func toggleSelection(_ item: CloudItem) {
+    guard item.isVideo else { return }
+    if !selectedIDs.insert(item.id).inserted { selectedIDs.remove(item.id) }
+  }
+
+  private func applySelectedFavorites(_ enabled: Bool) {
+    let selected = displayItems.filter { selectedIDs.contains($0.id) && $0.isVideo }
+    appState.libraryStore.setFavorites(selected, enabled: enabled)
+    selectedIDs.removeAll()
+    isSelecting = false
   }
 
   private var collectionSortOrder: CloudItemSortOrder {
@@ -612,6 +655,8 @@ struct FolderView: View {
     // populated directory while its scroll position still points at a later page.
     if !forceRefresh, loadedFolderScope == scope, !items.isEmpty { return }
     if loadedFolderScope != scope {
+      isSelecting = false
+      selectedIDs.removeAll()
       items = []
       searchItems = nil
       rebuildDisplayItems()
@@ -635,6 +680,8 @@ struct FolderView: View {
         forceRefresh: forceRefresh,
         sortOrder: collectionSortOrder
       )
+      guard revision == pagingRevision, !Task.isCancelled else { return }
+      await appState.thumbnailService.warmLocalThumbnails(page.items)
       guard revision == pagingRevision, !Task.isCancelled else { return }
       loadedFolderScope = scope
       isInitialLoading = false
@@ -978,21 +1025,32 @@ private struct VideoListRow: View {
 private struct StableLibraryScrollView<Content: View>: View {
   let itemIDs: Set<String>
   let resetKey: String
+  let layoutColumns: Int
   let content: Content
   @State private var position: String?
 
-  init(itemIDs: Set<String>, resetKey: String, @ViewBuilder content: () -> Content) {
+  init(itemIDs: Set<String>, layoutColumns: Int, resetKey: String, @ViewBuilder content: () -> Content) {
     self.itemIDs = itemIDs
+    self.layoutColumns = layoutColumns
     self.resetKey = resetKey
     self.content = content()
   }
 
   var body: some View {
-    ScrollView { content }
-      .scrollPosition(id: $position, anchor: .top)
-      .onChange(of: itemIDs) { _, ids in
-        if let position, !ids.contains(position) { self.position = nil }
-      }
-      .onChange(of: resetKey) { _, _ in position = nil }
+    ScrollViewReader { reader in
+      ScrollView { content }
+        .clipped()
+        .scrollPosition(id: $position, anchor: .top)
+        .onChange(of: itemIDs) { _, ids in
+          if let position, !ids.contains(position) { self.position = nil }
+        }
+        .onChange(of: resetKey) { _, _ in position = nil }
+        .task(id: layoutColumns) {
+          guard let anchor = position, itemIDs.contains(anchor) else { return }
+          await Task.yield()
+          guard !Task.isCancelled else { return }
+          reader.scrollTo(anchor, anchor: .top)
+        }
+    }
   }
 }

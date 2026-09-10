@@ -141,8 +141,7 @@ check(player.count(".settingsSectionCard()") == 7
 check(project.count("B20260828000000000000001") == 2 and project.count("B20260828000000000000002") == 3,
       "New cache source is referenced by the shipping Xcode target")
 protected = ["Gallery115/Player/VLCPlayerView.swift",
-             "Gallery115/Player/SystemPlayerView.swift",
-             "Gallery115/Services/LibraryStore.swift"]
+             "Gallery115/Player/SystemPlayerView.swift"]
 unchanged = subprocess.run(["git", "diff", "--exit-code", "--", *protected], cwd=ROOT,
                            capture_output=True).returncode == 0
 keychain = (ROOT / "Gallery115/Services/KeychainStore.swift").read_text(encoding="utf-8")
@@ -154,7 +153,7 @@ def token_storage(text):
     end = text.index("\n\nenum MediaSourceKind")
     return text[start:end]
 check(unchanged and token_storage(keychain) == token_storage(original_keychain),
-      "AVPlayer/VLC views, token storage and library business logic unchanged")
+      "AVPlayer/VLC views and token storage unchanged")
 player_model = (ROOT / "Gallery115/Player/PlayerModel.swift").read_text(encoding="utf-8")
 old_player_model = subprocess.check_output(["git", "show", "HEAD:Gallery115/Player/PlayerModel.swift"],
                                           cwd=ROOT).decode("utf-8")
@@ -185,6 +184,13 @@ check("struct StableLibraryScrollView" in folder and "!ids.contains(position)" i
       "Scroll state is isolated, invalid anchors reset and nested lazy container is removed")
 check("CGSize(width: 640, height: 360)" in service and "item.isPhoto ? 960 : 640" in service,
       "Video artwork decode pressure is reduced while photo resolution is retained")
+check("FavoriteRelocationPolicy.reconciled" in (ROOT / "Gallery115/Services/LibraryStore.swift").read_text(encoding="utf-8")
+      and "reconcileFavorites(with: source)" in folder,
+      "Directory snapshots reconcile relocated favorites before favorite filtering")
+check("cachedThumbnail(for: item)" in card and "warmLocalThumbnails(page.items)" in folder,
+      "First-frame artwork can use memory and prewarmed disk covers")
+check("scaleEffect(max(scale, 1)" in card and "reader.scrollTo(anchor, anchor: .top)" in folder,
+      "Pinch avoids shrinking the entire scroll surface below viewport width and restores anchor")
 check("MagnifyGesture(minimumScaleDelta:" in card and "MediaGridZoomPolicy" in card,
       "Media grids support pinch density changes with stable item identity")
 check("activeFrameSlots.count < maximumFrameJobs" in service and "holdsNetworkSlot = false" in service,

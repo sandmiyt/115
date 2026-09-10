@@ -81,6 +81,21 @@ final class ArtworkCacheTests: XCTestCase {
     XCTAssertGreaterThan(cover.size.width * cover.scale, 0)
   }
 
+  func testLocalWarmupMakesCoverAvailableWithoutAnAsyncViewRequest() async throws {
+    let video = item()
+    let data = try XCTUnwrap(image().jpegData(compressionQuality: 0.8))
+    try disk.write(data, for: identity(video))
+    let cache = ThumbnailService(disk: disk, namespace: { "mount-a" }, loader: { _, _ in
+      XCTFail("Cache warmup must not request the network")
+      return nil
+    })
+    XCTAssertNil(cache.cachedThumbnail(for: video))
+    await cache.warmLocalThumbnails([video])
+    XCTAssertNotNil(cache.cachedThumbnail(for: video))
+    _ = await cache.clearCache()
+    XCTAssertNil(cache.cachedThumbnail(for: video))
+  }
+
   private var root: URL!
   private var disk: ArtworkDiskStore!
 

@@ -24,7 +24,7 @@ actor ThumbnailService {
   private let namespace: @Sendable () -> String
   private let loader: Loader?
   private let frameLoader: Loader?
-  private let memoryCache = NSCache<NSString, UIImage>()
+  private nonisolated let memoryCache = ArtworkMemoryCache()
   private let logger = Logger(subsystem: "com.xiaocai.gallery115", category: "Artwork")
   private var inFlight: [String: Work] = [:]
   private var frameAttempts: [String: Int] = [:]
@@ -71,8 +71,25 @@ actor ThumbnailService {
   }
 
   private func identity(for item: CloudItem) -> ArtworkIdentity {
-    ArtworkIdentity(namespace: namespace(), itemID: item.id, size: item.size,
+    let scope = namespace()
+    memoryCache.namespaceSnapshot = scope
+    return ArtworkIdentity(namespace: scope, itemID: item.id, size: item.size,
                     modifiedAt: item.modifiedAt, legacyKey: item.sha1.isEmpty ? item.id : item.sha1)
+  }
+
+  /// NSCache lookups are thread-safe and never touch disk or decode on the UI thread.
+  nonisolated func cachedThumbnail(for item: CloudItem) -> UIImage? {
+    guard let scope = memoryCache.namespaceSnapshot else { return nil }
+    let identity = ArtworkIdentity(namespace: scope, itemID: item.id, size: item.size,
+      modifiedAt: item.modifiedAt, legacyKey: item.sha1.isEmpty ? item.id : item.sha1)
+    return memoryCache.object(forKey: identity.key as NSString)
+  }
+
+  func warmLocalThumbnails(_ items: [CloudItem], limit: Int = 24) {
+    for item in items.lazy.filter({ $0.isVideo || $0.isPhoto }).prefix(max(0, limit)) {
+      guard !Task.isCancelled else { return }
+      _ = localImage(identity(for: item), maximumPixelSize: item.isPhoto ? 960 : 640)
+    }
   }
 
   func thumbnail(for item: CloudItem, api: APIClient, isPrefetch: Bool = false) async -> UIImage? {
@@ -188,6 +205,7 @@ actor ThumbnailService {
     failedUntil.removeAll()
     frameAttempts.removeAll()
     memoryCache.removeAllObjects()
+    memoryCache.namespaceSnapshot = nil
     for waiter in slotWaiters { waiter.continuation.resume(returning: false) }
     slotWaiters.removeAll()
     activeSlots.removeAll()
@@ -525,4 +543,28 @@ private final class ArtworkCompletion: @unchecked Sendable {
     continuation?.resume(returning: image)
     tasks.forEach { $0.cancel() }
   }
+}
+
+/// NSCache provides its own synchronization. Keep raw cache mutation out of views.
+private final class ArtworkMemoryCache: @unchecked Sendable {
+  private let cache = NSCache<NSString, UIImage>()
+  private let namespaceLock = NSLock()
+  private var storedNamespace: String?
+  var namespaceSnapshot: String? {
+    get { namespaceLock.lock(); defer { namespaceLock.unlock() }; return storedNamespace }
+    set { namespaceLock.lock(); storedNamespace = newValue; namespaceLock.unlock() }
+  }
+  var countLimit: Int {
+    get { cache.countLimit }
+    set { cache.countLimit = newValue }
+  }
+  var totalCostLimit: Int {
+    get { cache.totalCostLimit }
+    set { cache.totalCostLimit = newValue }
+  }
+  func object(forKey key: NSString) -> UIImage? { cache.object(forKey: key) }
+  func setObject(_ image: UIImage, forKey key: NSString, cost: Int) {
+    cache.setObject(image, forKey: key, cost: cost)
+  }
+  func removeAllObjects() { cache.removeAllObjects() }
 }

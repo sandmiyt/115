@@ -223,3 +223,30 @@ enum MediaGridZoomPolicy {
     return levels[min(max(index + (magnification > 1 ? -1 : 1), 0), levels.count - 1)]
   }
 }
+
+/// Conservative WebDAV relocation matching; paths and expiring cover URLs are
+/// deliberately excluded. An ETag is a version hint, not assumed to be a SHA-1.
+enum FavoriteRelocationPolicy {
+  static func key(_ item: CloudItem) -> String? {
+    guard item.id.hasPrefix("/"), !item.isDirectory, item.size > 0 else { return nil }
+    let version = item.sha1.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !version.isEmpty else { return nil }
+    let fields = [item.name.precomposedStringWithCanonicalMapping,
+                  String(item.size), version, String(item.modifiedAt.timeIntervalSince1970)]
+    return fields.map { "\($0.utf8.count):\($0)" }.joined()
+  }
+
+  static func reconciled(_ favorites: [CloudItem], with items: [CloudItem]) -> [CloudItem] {
+    let byID = Dictionary(items.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+    let byKey = Dictionary(grouping: Array(byID.values).filter { key($0) != nil }, by: { key($0)! })
+    var seen = Set<String>()
+    return favorites.compactMap { saved in
+      let resolved: CloudItem
+      if let current = byID[saved.id] { resolved = current }
+      else if let fingerprint = key(saved), let matches = byKey[fingerprint], matches.count == 1 {
+        resolved = matches[0]
+      } else { resolved = saved }
+      return seen.insert(resolved.id).inserted ? resolved : nil
+    }
+  }
+}

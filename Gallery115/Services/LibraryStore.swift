@@ -7,24 +7,46 @@ final class LibraryStore {
   private(set) var favorites: [CloudItem] = []
   private(set) var recents: [PlaybackEntry] = []
 
-  private let defaults = UserDefaults.standard
+  private let defaults: UserDefaults
+  @ObservationIgnored private var favoriteIDs = Set<String>()
   private let encoder = JSONEncoder()
   private let decoder = JSONDecoder()
 
-  init() {
+  init(defaults: UserDefaults = .standard) {
+    self.defaults = defaults
     load()
   }
 
   func isFavorite(_ item: CloudItem) -> Bool {
-    favorites.contains { $0.id == item.id }
+    _ = favorites.count // Register the observable collection dependency.
+    return favoriteIDs.contains(item.id)
   }
 
   func toggleFavorite(_ item: CloudItem) {
-    if let index = favorites.firstIndex(where: { $0.id == item.id }) {
-      favorites.remove(at: index)
+    setFavorites([item], enabled: !isFavorite(item))
+  }
+
+  /// One collection publication and one write for an entire selection.
+  func setFavorites(_ items: [CloudItem], enabled: Bool) {
+    let media = items.filter { !$0.isDirectory && ($0.isVideo || $0.isPhoto) }
+    let ids = Set(media.map(\.id))
+    let updated: [CloudItem]
+    if enabled {
+      var seen = favoriteIDs
+      let additions = media.filter { seen.insert($0.id).inserted }
+      updated = additions + favorites
     } else {
-      favorites.insert(item, at: 0)
+      updated = favorites.filter { !ids.contains($0.id) }
     }
+    guard updated != favorites else { return }
+    favorites = updated
+    persistFavorites()
+  }
+
+  func reconcileFavorites(with items: [CloudItem]) {
+    let updated = FavoriteRelocationPolicy.reconciled(favorites, with: items)
+    guard updated != favorites else { return }
+    favorites = updated
     persistFavorites()
   }
 
@@ -79,6 +101,7 @@ final class LibraryStore {
       let decoded = try? decoder.decode([CloudItem].self, from: data)
     {
       favorites = decoded
+      favoriteIDs = Set(decoded.map(\.id))
     }
     if let data = defaults.data(forKey: Keys.recents),
       let decoded = try? decoder.decode([PlaybackEntry].self, from: data)
@@ -88,6 +111,7 @@ final class LibraryStore {
   }
 
   private func persistFavorites() {
+    favoriteIDs = Set(favorites.map(\.id))
     if let data = try? encoder.encode(favorites) {
       defaults.set(data, forKey: Keys.favorites)
     }

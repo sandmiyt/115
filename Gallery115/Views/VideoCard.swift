@@ -8,6 +8,8 @@ struct VideoCard: View {
   let item: CloudItem
   var transitionNamespace: Namespace.ID? = nil
   var compact = false
+  var selectionMode = false
+  var isSelected = false
   @Environment(\.mediaGridTapGate) private var tapGate
   let onOpen: () -> Void
 
@@ -20,7 +22,13 @@ struct VideoCard: View {
         MediaArtworkCard(item: item, progress: resumeProgress, compact: compact)
           .cinevaPlayerTransitionSource(id: item.id, in: transitionNamespace)
           .overlay(alignment: .topTrailing) {
-            if appState.libraryStore.isFavorite(item) {
+            if selectionMode && item.isVideo {
+              Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                .font(.system(size: 25, weight: .semibold))
+                .foregroundStyle(isSelected ? Color.accentColor : .white)
+                .background(.black.opacity(0.35), in: Circle())
+                .padding(7)
+            } else if appState.libraryStore.isFavorite(item) {
               Image(systemName: "heart.fill")
                 .font(.system(size: 10, weight: .bold))
                 .foregroundStyle(.white)
@@ -42,22 +50,26 @@ struct VideoCard: View {
     }
     .environment(\.artworkRefreshRevision, parentArtworkRevision &+ retryRevision)
     .buttonStyle(MediaCardButtonStyle())
+    .disabled(selectionMode && !item.isVideo)
     .accessibilityLabel(item.name)
-    .accessibilityHint(item.isPhoto ? "查看照片预览" : "播放视频")
+    .accessibilityHint(selectionMode ? "切换选择" : (item.isPhoto ? "查看照片预览" : "播放视频"))
+    .accessibilityAddTraits(isSelected ? .isSelected : [])
     .contextMenu {
-      Button { retryRevision &+= 1 } label: {
-        Label("重试缩略图", systemImage: "arrow.clockwise")
-      }
-      Button {
-        appState.libraryStore.toggleFavorite(item)
-        let feedback = UIImpactFeedbackGenerator(style: .medium)
-        feedback.prepare()
-        feedback.impactOccurred(intensity: 0.82)
-      } label: {
-        Label(
-          appState.libraryStore.isFavorite(item) ? "取消收藏" : "收藏",
-          systemImage: appState.libraryStore.isFavorite(item) ? "heart.slash" : "heart"
-        )
+      if !selectionMode {
+        Button { retryRevision &+= 1 } label: {
+          Label("重试缩略图", systemImage: "arrow.clockwise")
+        }
+        Button {
+          appState.libraryStore.toggleFavorite(item)
+          let feedback = UIImpactFeedbackGenerator(style: .medium)
+          feedback.prepare()
+          feedback.impactOccurred(intensity: 0.82)
+        } label: {
+          Label(
+            appState.libraryStore.isFavorite(item) ? "取消收藏" : "收藏",
+            systemImage: appState.libraryStore.isFavorite(item) ? "heart.slash" : "heart"
+          )
+        }
       }
     }
   }
@@ -172,8 +184,9 @@ struct VideoArtwork: View {
         artworkBackground
           .frame(width: proxy.size.width, height: proxy.size.height)
 
-        if let cachedImage {
-          artwork(Image(uiImage: cachedImage), in: proxy.size)
+        if let image = (renderedItemIdentity == itemThumbnailIdentity ? cachedImage : nil)
+          ?? appState.thumbnailService.cachedThumbnail(for: item) {
+          artwork(Image(uiImage: image), in: proxy.size)
             .transition(.opacity)
         } else {
           ZStack {
@@ -495,7 +508,7 @@ private struct MediaGridPinchModifier: ViewModifier {
 
   func body(content: Content) -> some View {
     content
-      .scaleEffect(scale, anchor: anchor)
+      .scaleEffect(max(scale, 1), anchor: UnitPoint(x: 0.5, y: min(max(anchor.y, 0), 1)))
       .highPriorityGesture(
         MagnifyGesture(minimumScaleDelta: 0.01)
           .updating($gestureActive) { _, active, _ in active = true }
@@ -558,5 +571,32 @@ private struct MediaGridPinchModifier: ViewModifier {
       }
       settleTask = nil
     }
+  }
+}
+
+struct MediaSelectionBar: View {
+  let count: Int
+  let onSelectAll: () -> Void
+  let onDone: () -> Void
+  let onFavorite: (() -> Void)?
+  let onUnfavorite: () -> Void
+
+  var body: some View {
+    VStack(spacing: 4) {
+      HStack {
+        Text("已选 \(count) 个视频").font(.subheadline.weight(.medium))
+        Spacer()
+        Button("完成", action: onDone)
+      }
+      HStack(spacing: 16) {
+        Button("全选已加载", action: onSelectAll)
+        Spacer(minLength: 8)
+        if let onFavorite { Button("收藏", action: onFavorite).disabled(count == 0) }
+        Button("取消收藏", action: onUnfavorite).disabled(count == 0)
+      }
+      .frame(minHeight: 44)
+    }
+    .padding(.horizontal, 16).padding(.top, 10)
+    .background(.regularMaterial)
   }
 }
