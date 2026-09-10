@@ -215,7 +215,7 @@ enum MediaGridZoomPolicy {
   static func targetColumns(from columns: Int, magnification: Double) -> Int {
     let current = normalized(columns)
     guard magnification.isFinite, magnification > 0,
-      magnification < 0.88 || magnification > 1.12 else { return current }
+      magnification < 0.94 || magnification > 1.06 else { return current }
     let target = Double(current) / min(max(magnification, 0.1), 10)
     let nearest = levels.min(by: { abs(Double($0) - target) < abs(Double($1) - target) }) ?? current
     if nearest != current { return nearest }

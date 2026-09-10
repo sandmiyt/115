@@ -78,6 +78,7 @@ struct PlayerScreen: View {
   @State private var subtitleLoadTask: Task<Void, Never>?
   @State private var auxiliaryLoadTask: Task<Void, Never>?
   @State private var thumbnailPlaybackOwner = UUID()
+  @State private var thumbnailOwnerActive = false
 
   init(item: CloudItem, playlist: [CloudItem] = []) {
     _currentItem = State(initialValue: item)
@@ -361,6 +362,7 @@ struct PlayerScreen: View {
   private func handlePlayerDisappear() {
     let thumbnails = appState.thumbnailService
     let owner = thumbnailPlaybackOwner
+    thumbnailOwnerActive = false
     Task { await thumbnails.resumeNetwork(for: owner) }
     showSettingsPanel = false
     showSpeedPanel = false
@@ -1971,10 +1973,16 @@ struct PlayerScreen: View {
 
   @MainActor
   private func prepareCurrentItem() async {
+    guard !Task.isCancelled else { return }
+    if !thumbnailOwnerActive {
+      thumbnailPlaybackOwner = UUID()
+      thumbnailOwnerActive = true
+    }
     let startupBeganAt = ProcessInfo.processInfo.systemUptime
     // Cached artwork stays available, but remote covers must yield the network
     // before AVPlayer/VLC opens the existing, unchanged WebDAV source.
     await appState.thumbnailService.suspendNetwork(for: thumbnailPlaybackOwner)
+    await appState.api.cancelBackgroundArtwork()
     // Item changes cancel the old task, but the same screen still owns priority.
     // Only handlePlayerDisappear releases this screen's token.
     guard !Task.isCancelled else { return }

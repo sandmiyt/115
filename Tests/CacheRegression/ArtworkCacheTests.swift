@@ -96,6 +96,22 @@ final class ArtworkCacheTests: XCTestCase {
     XCTAssertNil(cache.cachedThumbnail(for: video))
   }
 
+  func testLatePlaybackAcquireCannotCloseAnAlreadyReleasedGate() async {
+    let cache = service(LoadProbe(image: image()))
+    let owner = UUID()
+    await cache.resumeNetwork(for: owner)
+    await cache.suspendNetwork(for: owner)
+    let completed = expectation(description: "late owner does not trap directory requests")
+    let task = Task {
+      let result = await cache.thumbnail(for: item(), api: APIClient())
+      XCTAssertNotNil(result)
+      completed.fulfill()
+    }
+    await fulfillment(of: [completed], timeout: 2)
+    task.cancel()
+    await task.value
+  }
+
   private var root: URL!
   private var disk: ArtworkDiskStore!
 

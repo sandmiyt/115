@@ -109,3 +109,14 @@
 - Windows 源码预检及差异检查通过。43 个 XCTest 已编写但未执行，Xcode 类型检查、网盘路径匹配与真机交互尚待验证。
 
 ETag 语义参考：https://github.com/OpenListTeam/OpenList/blob/main/server/webdav/webdav.go
+
+## 回归修复：双指与滚动冲突、停住与播放竞争（本轮）
+
+- 将资料库和收藏网格的 SwiftUI MagnifyGesture 换为附着于实际 UIScrollView 的原生 UIPinchGestureRecognizer。滚动 pan 限制为单指；双指 pinch 开始时立即取消并恢复 pan，使前一根手指的拖动不能继续抢占。两个手指只在媒体网格区域触发，移除桥接视图时恢复原 pan 设置，保留点击保护。列数切换死区从 12% 调为 6%。
+- 去掉 ScrollViewReader.scrollTo 与 scrollPosition 并用、列数变化后主动滚动的补偿路径，仅保留系统定位绑定和无效定位清理。这是代码中可疑的重复布局来源，尚无真机堆栈证明它是全部卡死现象的根因。
+- 播放进入时显式取消 WebDAV/OpenList 独立封面发现任务，避免共享 Task 在卡片请求取消后继续请求网络。增加发现任务代次保护，旧任务结束不能清掉新任务槽位。
+- 已退出播放器的 owner 不能被迟到的 suspend 重新登记；播放器再次准备时使用新的 owner。磁盘缓存预读每项之间让出 actor，播放开始后停止预读，避免解码队列拖住播放优先权获取。
+- 没有降低原视频画质、修改 AVPlayer/VLC 播放地址或改变核心解码/缓冲策略。网络速度与码率仍需真实网盘测试，不能从静态检查推出首帧或持续播放的提升幅度。
+- 新增退出后迟到 acquire 的队列回归。Windows 源码预检与差异检查通过；44 个 XCTest 已编写但未执行。原生手势、取消/恢复滚动、卡死堆栈和真实网盘播放必须在 Xcode/iPhone 上验证。
+
+运行环境复核：本轮调用 XcodeBuildMCP 的模拟器列表返回 `spawn xcrun ENOENT`，没有可用模拟器，因此未执行 iOS 构建或手势测试。

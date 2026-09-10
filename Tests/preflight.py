@@ -168,7 +168,7 @@ check("boundedArtwork(seconds: 18)" in service and "boundedArtwork(seconds: fram
       and "boundedArtwork(seconds: 45)" not in card
       and "[0, 6, 15, 30, 60][min(attempt, 4)]" in card,
       "Active artwork stages have deadlines; queued cells retain automatic retries")
-check(".highPriorityGesture(" in card and "guard tapGate?.allowsTap != false" in card
+check("UIPinchGestureRecognizer(target:" in card and "guard tapGate?.allowsTap != false" in card
       and ".simultaneousGesture(" not in card,
       "Pinch takes priority over taps and guards release-time video activation")
 check("struct MediaGridPinchModifier" in card and "transaction.disablesAnimations = true" in card,
@@ -189,10 +189,13 @@ check("FavoriteRelocationPolicy.reconciled" in (ROOT / "Gallery115/Services/Libr
       "Directory snapshots reconcile relocated favorites before favorite filtering")
 check("cachedThumbnail(for: item)" in card and "warmLocalThumbnails(page.items)" in folder,
       "First-frame artwork can use memory and prewarmed disk covers")
-check("scaleEffect(max(scale, 1)" in card and "reader.scrollTo(anchor, anchor: .top)" in folder,
-      "Pinch avoids shrinking the entire scroll surface below viewport width and restores anchor")
-check("MagnifyGesture(minimumScaleDelta:" in card and "MediaGridZoomPolicy" in card,
+check("scaleEffect(max(scale, 1)" in card and "reader.scrollTo" not in folder and "ScrollViewReader" not in folder,
+      "Pinch stays within the viewport and scrolling uses only one position mechanism")
+check("maximumNumberOfTouches = 1" in card and "MediaGridZoomPolicy" in card,
       "Media grids support pinch density changes with stable item identity")
+check("!endedPlaybackOwners.contains(owner)" in service
+      and "await appState.api.cancelBackgroundArtwork()" in player,
+      "Ended playback owners cannot reclose artwork gate and playback cancels discovery")
 check("activeFrameSlots.count < maximumFrameJobs" in service and "holdsNetworkSlot = false" in service,
       "Slow frame extraction uses a separate bounded pool from image downloads")
 check("!hasMore && !isSearching" not in folder and "paginationFooter" in folder,

@@ -84,6 +84,10 @@ actor APIClient {
     }
   }
 
+  func cancelBackgroundArtwork() async {
+    await webDAV.cancelArtworkDiscovery()
+  }
+
   func serverThumbnailURL(for item: CloudItem) async -> URL? {
     guard source == .webDAV else { return nil }
     return await webDAV.serverThumbnailURL(for: item)

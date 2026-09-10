@@ -504,53 +504,41 @@ private struct MediaGridPinchModifier: ViewModifier {
   @State private var startColumns = 3
   @State private var tracking = false
   @State private var settleTask: Task<Void, Never>?
-  @GestureState private var gestureActive = false
 
   func body(content: Content) -> some View {
     content
       .scaleEffect(max(scale, 1), anchor: UnitPoint(x: 0.5, y: min(max(anchor.y, 0), 1)))
-      .highPriorityGesture(
-        MagnifyGesture(minimumScaleDelta: 0.01)
-          .updating($gestureActive) { _, active, _ in active = true }
-          .onChanged { value in
-            tapGate.suppressTap()
-            if !tracking {
-              settleTask?.cancel()
-              settleTask = nil
-              tracking = true
-              startColumns = MediaGridZoomPolicy.normalized(columnCount)
-              anchor = value.startAnchor
-            }
-            var transaction = Transaction(animation: nil)
-            transaction.disablesAnimations = true
-            withTransaction(transaction) {
-              scale = CGFloat(MediaGridZoomPolicy.liveScale(Double(value.magnification)))
-            }
+      .background(
+        LibraryPinchRecognizer(onChanged: { magnification, touchAnchor in
+          tapGate.suppressTap()
+          if !tracking {
+            settleTask?.cancel()
+            settleTask = nil
+            tracking = true
+            startColumns = MediaGridZoomPolicy.normalized(columnCount)
+            anchor = touchAnchor
           }
-          .onEnded { value in
-            tapGate.suppressTap()
-            tracking = false
+          var transaction = Transaction(animation: nil)
+          transaction.disablesAnimations = true
+          withTransaction(transaction) {
+            scale = CGFloat(MediaGridZoomPolicy.liveScale(Double(magnification)))
+          }
+        }, onEnded: { magnification, cancelled in
+          tapGate.suppressTap()
+          tracking = false
+          if !cancelled {
             let target = MediaGridZoomPolicy.targetColumns(from: startColumns,
-              magnification: Double(value.magnification))
-            // Preserve apparent cell width through the discrete layout commit,
-            // then animate only the enclosing transform to its resting scale.
+              magnification: Double(magnification))
             var transaction = Transaction(animation: nil)
             transaction.disablesAnimations = true
             withTransaction(transaction) {
-              scale = CGFloat(MediaGridZoomPolicy.handoffScale(Double(scale),
-                from: startColumns, to: target))
+              scale = CGFloat(MediaGridZoomPolicy.handoffScale(Double(scale), from: startColumns, to: target))
               columnCount = target
             }
-            settle()
           }
-      )
-      .onChange(of: gestureActive) { _, active in
-        if !active, tracking {
-          tracking = false
-          tapGate.suppressTap()
           settle()
-        }
-      }
+        })
+      )
       .onDisappear {
         settleTask?.cancel()
         settleTask = nil
@@ -598,5 +586,100 @@ struct MediaSelectionBar: View {
     }
     .padding(.horizontal, 16).padding(.top, 10)
     .background(.regularMaterial)
+  }
+}
+
+/// Attach to the actual scroll view so two-finger pinch and one-finger pan have
+/// explicit ownership. Never leave scrolling disabled while a gesture is active.
+private struct LibraryPinchRecognizer: UIViewRepresentable {
+  let onChanged: (CGFloat, UnitPoint) -> Void
+  let onEnded: (CGFloat, Bool) -> Void
+
+  func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
+  func makeUIView(context: Context) -> ProbeView {
+    let view = ProbeView()
+    view.isUserInteractionEnabled = false
+    view.onHierarchyChange = { [weak coordinator = context.coordinator] view in coordinator?.attach(view) }
+    return view
+  }
+  func updateUIView(_ uiView: ProbeView, context: Context) {
+    context.coordinator.parent = self
+    context.coordinator.attach(uiView)
+  }
+  static func dismantleUIView(_ uiView: ProbeView, coordinator: Coordinator) { coordinator.detach() }
+
+  final class ProbeView: UIView {
+    var onHierarchyChange: ((UIView) -> Void)?
+    override func didMoveToWindow() { super.didMoveToWindow(); onHierarchyChange?(self) }
+    override func layoutSubviews() { super.layoutSubviews(); onHierarchyChange?(self) }
+  }
+
+  @MainActor
+  final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+    var parent: LibraryPinchRecognizer
+    weak var scrollView: UIScrollView?
+    weak var probe: UIView?
+    var originalMaximumTouches = 1
+    var startAnchor = UnitPoint.center
+    lazy var pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
+
+    init(parent: LibraryPinchRecognizer) { self.parent = parent }
+
+    func attach(_ view: UIView) {
+      guard view.window != nil else { detach(); return }
+      var ancestor = view.superview
+      while let candidate = ancestor, !(candidate is UIScrollView) { ancestor = candidate.superview }
+      guard let scroll = ancestor as? UIScrollView else { return }
+      guard scrollView !== scroll else { return }
+      detach()
+      probe = view
+      scrollView = scroll
+      originalMaximumTouches = scroll.panGestureRecognizer.maximumNumberOfTouches
+      scroll.panGestureRecognizer.maximumNumberOfTouches = 1
+      pinch.delegate = self
+      pinch.cancelsTouchesInView = true
+      scroll.addGestureRecognizer(pinch)
+    }
+
+    func detach() {
+      let scroll = scrollView
+      scrollView = nil
+      probe = nil
+      if let scroll {
+        scroll.removeGestureRecognizer(pinch)
+        scroll.panGestureRecognizer.maximumNumberOfTouches = originalMaximumTouches
+      }
+    }
+
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+      guard let probe, probe.bounds.width > 0, probe.bounds.height > 0 else { return false }
+      return probe.bounds.contains(gestureRecognizer.location(in: probe))
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+      shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+      otherGestureRecognizer === scrollView?.panGestureRecognizer
+    }
+
+    @objc func handlePinch(_ recognizer: UIPinchGestureRecognizer) {
+      guard scrollView != nil, probe?.window != nil else { return }
+      switch recognizer.state {
+      case .began:
+        if let probe {
+          let point = recognizer.location(in: probe)
+          startAnchor = UnitPoint(x: min(max(point.x / max(probe.bounds.width, 1), 0), 1),
+                                  y: min(max(point.y / max(probe.bounds.height, 1), 0), 1))
+        }
+        if let pan = scrollView?.panGestureRecognizer {
+          pan.isEnabled = false
+          pan.isEnabled = true
+        }
+        parent.onChanged(recognizer.scale, startAnchor)
+      case .changed: parent.onChanged(recognizer.scale, startAnchor)
+      case .ended: parent.onEnded(recognizer.scale, false)
+      case .cancelled, .failed: parent.onEnded(recognizer.scale, true)
+      default: break
+      }
+    }
   }
 }

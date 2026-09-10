@@ -18,6 +18,7 @@ actor WebDAVProvider: CloudProvider {
   private var directoryFileIndexCache: [String: [String: CloudItem]] = [:]
   private var metadataCache: [String: LocalMediaMetadata] = [:]
   private var metadataMisses: Set<String> = []
+  private var thumbnailHintGeneration = UUID()
   private var thumbnailHintTasks: [String: Task<Bool, Never>] = [:]
   private var thumbnailHintRetry: [String: Date] = [:]
   private let artworkHintSession: URLSession = {
@@ -294,6 +295,13 @@ actor WebDAVProvider: CloudProvider {
     return metadata
   }
 
+  func cancelArtworkDiscovery() {
+    thumbnailHintGeneration = UUID()
+    for task in thumbnailHintTasks.values { task.cancel() }
+    thumbnailHintTasks.removeAll()
+    thumbnailHintRetry.removeAll()
+  }
+
   /// Read-only OpenList hints are shared by all cards in the same directory.
   func serverThumbnailURL(for item: CloudItem) async -> URL? {
     guard !Task.isCancelled, let configuration = store.configuration else { return nil }
@@ -305,12 +313,14 @@ actor WebDAVProvider: CloudProvider {
     }
     if let retry = thumbnailHintRetry[key], retry > Date() { return nil }
     thumbnailHintRetry[key] = Date().addingTimeInterval(30)
+    let generation = thumbnailHintGeneration
     let task = Task { [self] in
       await refreshOpenListDirectoryCache(configuration: configuration,
                                           logicalPath: item.parentID, refresh: false)
     }
     thumbnailHintTasks[key] = task
     _ = await task.value
+    guard generation == thumbnailHintGeneration else { return nil }
     thumbnailHintTasks[key] = nil
     return Task.isCancelled ? nil : serverThumbnailHints[key]?[item.name]
   }
@@ -439,9 +449,7 @@ actor WebDAVProvider: CloudProvider {
 
   func clearMountCache() async {
     memoryCache.removeAll()
-    for task in thumbnailHintTasks.values { task.cancel() }
-    thumbnailHintTasks.removeAll()
-    thumbnailHintRetry.removeAll()
+    cancelArtworkDiscovery()
     serverThumbnailHints.removeAll()
     orderedItemCache.removeAll()
     rawDirectoryCache.removeAll()

@@ -333,7 +333,7 @@ struct FolderView: View {
   private var content: some View {
     switch appState.browserLayout {
     case .grid:
-      StableLibraryScrollView(itemIDs: Set(displayItems.map(\.id)), layoutColumns: mediaGridColumns,
+      StableLibraryScrollView(itemIDs: Set(displayItems.map(\.id)),
                               resetKey: "\(appState.mediaSourceRevision)|\(folderID)|\(sortMode.rawValue)") {
         VStack(spacing: 14) {
           if !displayedFolders.isEmpty {
@@ -1025,32 +1025,22 @@ private struct VideoListRow: View {
 private struct StableLibraryScrollView<Content: View>: View {
   let itemIDs: Set<String>
   let resetKey: String
-  let layoutColumns: Int
   let content: Content
   @State private var position: String?
 
-  init(itemIDs: Set<String>, layoutColumns: Int, resetKey: String, @ViewBuilder content: () -> Content) {
+  init(itemIDs: Set<String>, resetKey: String, @ViewBuilder content: () -> Content) {
     self.itemIDs = itemIDs
-    self.layoutColumns = layoutColumns
     self.resetKey = resetKey
     self.content = content()
   }
 
   var body: some View {
-    ScrollViewReader { reader in
-      ScrollView { content }
-        .clipped()
-        .scrollPosition(id: $position, anchor: .top)
-        .onChange(of: itemIDs) { _, ids in
-          if let position, !ids.contains(position) { self.position = nil }
-        }
-        .onChange(of: resetKey) { _, _ in position = nil }
-        .task(id: layoutColumns) {
-          guard let anchor = position, itemIDs.contains(anchor) else { return }
-          await Task.yield()
-          guard !Task.isCancelled else { return }
-          reader.scrollTo(anchor, anchor: .top)
-        }
-    }
+    ScrollView { content }
+      .clipped()
+      .scrollPosition(id: $position, anchor: .top)
+      .onChange(of: itemIDs) { _, ids in
+        if let position, !ids.contains(position) { self.position = nil }
+      }
+      .onChange(of: resetKey) { _, _ in position = nil }
   }
 }

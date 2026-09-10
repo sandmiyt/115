@@ -33,6 +33,7 @@ actor ThumbnailService {
   private var activeFrameSlots: Set<UUID> = []
   private var slotWaiters: [SlotWaiter] = []
   private var playbackOwners: Set<UUID> = []
+  private var endedPlaybackOwners: Set<UUID> = []
   private var cacheGeneration = UUID()
   private let maximumNetworkJobs = 3
   private let maximumFrameJobs = 2
@@ -85,10 +86,11 @@ actor ThumbnailService {
     return memoryCache.object(forKey: identity.key as NSString)
   }
 
-  func warmLocalThumbnails(_ items: [CloudItem], limit: Int = 24) {
+  func warmLocalThumbnails(_ items: [CloudItem], limit: Int = 24) async {
     for item in items.lazy.filter({ $0.isVideo || $0.isPhoto }).prefix(max(0, limit)) {
-      guard !Task.isCancelled else { return }
+      guard !Task.isCancelled, playbackOwners.isEmpty else { return }
       _ = localImage(identity(for: item), maximumPixelSize: item.isPhoto ? 960 : 640)
+      await Task.yield()
     }
   }
 
@@ -155,7 +157,7 @@ actor ThumbnailService {
   }
 
   func suspendNetwork(for owner: UUID) {
-    guard !Task.isCancelled, playbackOwners.insert(owner).inserted else { return }
+    guard !Task.isCancelled, !endedPlaybackOwners.contains(owner), playbackOwners.insert(owner).inserted else { return }
     for work in inFlight.values { work.task.cancel() }
     inFlight.removeAll()
   }
@@ -165,6 +167,7 @@ actor ThumbnailService {
   }
 
   func resumeNetwork(for owner: UUID) {
+    endedPlaybackOwners.insert(owner)
     playbackOwners.remove(owner)
     drainWaiters()
   }
