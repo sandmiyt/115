@@ -115,6 +115,28 @@ final class FolderCollectionPolicyTests: XCTestCase {
                    ["small", "middle", "large"])
   }
 
+  func testInteractivePinchProgressInBothDirections() {
+    XCTAssertEqual(PhotoGridTransitionPolicy.progress(magnification: 1.25, targetRatio: 1.5), 0.5, accuracy: 0.0001)
+    XCTAssertEqual(PhotoGridTransitionPolicy.progress(magnification: 0.875, targetRatio: 0.75), 0.5, accuracy: 0.0001)
+    XCTAssertEqual(PhotoGridTransitionPolicy.progress(magnification: 1.5, targetRatio: 1.5), 1)
+    XCTAssertEqual(PhotoGridTransitionPolicy.progress(magnification: 0.75, targetRatio: 0.75), 1)
+  }
+
+  func testInteractivePinchReversalAndInvalidInputStayBounded() {
+    XCTAssertEqual(PhotoGridTransitionPolicy.progress(magnification: 0.9, targetRatio: 1.5), 0)
+    XCTAssertEqual(PhotoGridTransitionPolicy.progress(magnification: 1.1, targetRatio: 0.75), 0)
+    XCTAssertEqual(PhotoGridTransitionPolicy.progress(magnification: 3, targetRatio: 1.5), 1)
+    XCTAssertEqual(PhotoGridTransitionPolicy.progress(magnification: .nan, targetRatio: 1.5), 0)
+    XCTAssertEqual(PhotoGridTransitionPolicy.progress(magnification: 1.2, targetRatio: 1), 0)
+  }
+
+  func testInteractivePinchVelocityUsesZoomDirectionAndIsCapped() {
+    XCTAssertEqual(PhotoGridTransitionPolicy.projectedProgress(progress: 0.4, velocity: 1, targetRatio: 1.5), 0.6, accuracy: 0.0001)
+    XCTAssertEqual(PhotoGridTransitionPolicy.projectedProgress(progress: 0.4, velocity: -1, targetRatio: 0.75), 0.6, accuracy: 0.0001)
+    XCTAssertEqual(PhotoGridTransitionPolicy.projectedProgress(progress: 0, velocity: 100, targetRatio: 1.5), 0.2, accuracy: 0.0001)
+    XCTAssertEqual(PhotoGridTransitionPolicy.projectedProgress(progress: 0.1, velocity: -1, targetRatio: 1.5), 0)
+  }
+
   private func item(
     _ id: String,
     name: String? = nil,

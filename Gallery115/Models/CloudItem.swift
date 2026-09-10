@@ -250,3 +250,20 @@ enum FavoriteRelocationPolicy {
     }
   }
 }
+
+/// Progress is proportional to cell width, in both pinch directions.
+enum PhotoGridTransitionPolicy {
+  static func projectedProgress(progress: Double, velocity: Double, targetRatio: Double) -> Double {
+    guard progress.isFinite, velocity.isFinite, targetRatio.isFinite,
+      abs(targetRatio - 1) > 0.0001 else { return 0 }
+    // A short, capped projection avoids requiring a slow pinch to reach halfway.
+    let projected = progress + min(max(velocity * 0.10 / (targetRatio - 1), -0.2), 0.2)
+    return min(max(projected, 0), 1)
+  }
+
+  static func progress(magnification: Double, targetRatio: Double) -> Double {
+    guard magnification.isFinite, targetRatio.isFinite, magnification > 0,
+      targetRatio > 0, abs(targetRatio - 1) > 0.0001 else { return 0 }
+    return min(max((magnification - 1) / (targetRatio - 1), 0), 1)
+  }
+}

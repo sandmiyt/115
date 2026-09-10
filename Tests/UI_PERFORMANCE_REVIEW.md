@@ -120,3 +120,23 @@ ETag 语义参考：https://github.com/OpenListTeam/OpenList/blob/main/server/we
 - 新增退出后迟到 acquire 的队列回归。Windows 源码预检与差异检查通过；44 个 XCTest 已编写但未执行。原生手势、取消/恢复滚动、卡死堆栈和真实网盘播放必须在 Xcode/iPhone 上验证。
 
 运行环境复核：本轮调用 XcodeBuildMCP 的模拟器列表返回 `spawn xcrun ENOENT`，没有可用模拟器，因此未执行 iOS 构建或手势测试。
+
+
+## 2026-09-10：按开源网格过渡实现重新设计缩放
+
+本节替代上述整张 LazyVGrid 的 transform/scrollPosition 缩放方案。
+
+- 资料库和收藏页改用同一个 UICollectionView；SwiftUI 只提供卡片内容，滚动及布局由 UIKit 持有。文件夹保持原 FolderCard 外观及独立列数，媒体列数沿用 1/2/3/4/6。搜索、筛选、分页、下拉刷新和批量选择仍接入原业务。
+- 捏合驱动 UICollectionViewTransitionLayout 的连续进度，布局仅计算查询区域内的行。身份按文件 ID 去重；过渡期间延后数据快照更新，结束后应用最新结果。不存在每帧修改 SwiftUI 列数或整张长列表缩放。
+- 开源对照发现仅在手势 changed 中修改 offset 不够：原生结束/取消动画也必须同步定位，并在最终布局安装后恢复该定位。新增 PhotoGridTransitionLayout，在进度 setter 中插值焦点位置与内容高度、限制滚动边界；完成回调恢复定位并清除临时焦点。
+- 手势反向越过原始比例时取消当前方向的过渡；松手结合短时、限幅速度预测决定完成/回退。一个手势完成一档后可继续下一档；原生收尾期间短暂忽略 changed，实际跨档手感仍需设备检查。
+- 未引入旧版 Objective-C 库或 React Native 依赖，也未直接复制外部源码。TLLayoutTransitioning 较早，源码每帧枚举全部项目不适合直接搬入大目录；react-native-zoom-grid 是另一技术栈的交互参考，不是本项目运行时组件。此实现没有复刻其多层淡入淡出，也不能声称与苹果相册完全一致。
+- 源码预检、差异检查用于静态验证。新增双向进度、反向与非法值、速度投影测试，47 个 XCTest 已准备但未执行。当前 Windows 没有 xcrun/Xcode，尚未通过 iOS 类型检查、真机动画、万项目录性能或手势冲突实测。
+
+参考（直接阅读仓库实现和 Apple API 文档）：
+- https://github.com/SwiftKickMobile/TLLayoutTransitioning
+- https://github.com/SwiftKickMobile/TLLayoutTransitioning/blob/master/TLLayoutTransitioning/TLTransitionLayout.m
+- https://github.com/wassgha/react-native-zoom-grid/blob/main/src/ZoomGrid.tsx
+- https://developer.apple.com/documentation/uikit/uicollectionview/startinteractivetransition(to:completion:)
+
+设备验收：在目录中部、最后一屏和不足一屏时双向捏合；缓慢反向、快速松手、跨多档；确认缩放后首个点击可播放；缩放时触发分页/刷新或返回；收藏批量取消及文件夹导航；大字体和横竖屏切换。必须观察内容边界、焦点跳动、转场停止及主线程耗时后才能确认手感修复。

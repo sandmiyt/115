@@ -90,6 +90,7 @@ struct FolderView: View {
   @State private var artworkRefreshRevision = 0
   @State private var isSearching = false
   @State private var selectedPhoto: CloudItem?
+  @State private var selectedFolder: CloudItem?
   @State private var isSelecting = false
   @State private var selectedIDs = Set<String>()
   @Namespace private var playerTransition
@@ -131,6 +132,9 @@ struct FolderView: View {
     .onDisappear { refreshTask?.cancel(); refreshTask = nil }
     .navigationTitle(title)
     .navigationBarTitleDisplayMode(folderID == appState.rootFolderID ? .large : .inline)
+    .navigationDestination(item: $selectedFolder) { item in
+      FolderView(folderID: item.id, title: item.name)
+    }
     .navigationDestination(for: CloudItem.self) { item in
       FolderView(folderID: item.id, title: item.name)
     }
@@ -333,35 +337,22 @@ struct FolderView: View {
   private var content: some View {
     switch appState.browserLayout {
     case .grid:
-      StableLibraryScrollView(itemIDs: Set(displayItems.map(\.id)),
-                              resetKey: "\(appState.mediaSourceRevision)|\(folderID)|\(sortMode.rawValue)") {
-        VStack(spacing: 14) {
-          if !displayedFolders.isEmpty {
-            LazyVGrid(columns: columns, spacing: 11) {
-              ForEach(displayedFolders) { item in
-                NavigationLink(value: item) { FolderCard(item: item) }
-                  .buttonStyle(FolderCardButtonStyle())
-                  .disabled(isSelecting)
-              }
-            }
-            .scrollTargetLayout()
-            .padding(.horizontal, 10)
-            .padding(.top, 10)
-          }
-          PinchMediaGrid(items: displayedMedia, columnCount: $mediaGridColumns, compact: compactGrid) { item in
-            VideoCard(item: item, transitionNamespace: playerTransition, compact: compactGrid,
-                      selectionMode: isSelecting, isSelected: selectedIDs.contains(item.id)) {
-              if isSelecting { toggleSelection(item); return }
-              if item.isPhoto { selectedPhoto = item }
-              else { selectedVideo = item }
-            }
-          } footer: {
-            paginationFooter.padding(.vertical, 20)
-          }
+      PhotoLibraryGrid(folders: displayedFolders, items: displayedMedia, columnCount: $mediaGridColumns,
+                       folderColumns: safeGridColumns, compact: compactGrid,
+                       resetKey: "\(appState.mediaSourceRevision)|\(folderID)|\(sortMode.rawValue)",
+                       onRefresh: { await refreshCurrentFolder() }) { item in
+        Button { selectedFolder = item } label: { FolderCard(item: item) }
+          .buttonStyle(FolderCardButtonStyle()).disabled(isSelecting)
+      } media: { item in
+        VideoCard(item: item, transitionNamespace: playerTransition, compact: compactGrid,
+                  selectionMode: isSelecting, isSelected: selectedIDs.contains(item.id)) {
+          if isSelecting { toggleSelection(item); return }
+          if item.isPhoto { selectedPhoto = item }
+          else { selectedVideo = item }
         }
+      } footer: {
+        paginationFooter.padding(.vertical, 20)
       }
-      .scrollDismissesKeyboard(.interactively)
-      .refreshable { await refreshCurrentFolder() }
 
     case .list:
       List {
@@ -1017,30 +1008,5 @@ private struct VideoListRow: View {
     let position = appState.libraryStore.resumePosition(for: item)
     guard position > 2, position < duration - 8 else { return 0 }
     return min(max(position / duration, 0), 1)
-  }
-}
-
-/// Scroll position changes must not re-evaluate the folder's menus, filters and
-/// media cell builder for every row crossed during a drag.
-private struct StableLibraryScrollView<Content: View>: View {
-  let itemIDs: Set<String>
-  let resetKey: String
-  let content: Content
-  @State private var position: String?
-
-  init(itemIDs: Set<String>, resetKey: String, @ViewBuilder content: () -> Content) {
-    self.itemIDs = itemIDs
-    self.resetKey = resetKey
-    self.content = content()
-  }
-
-  var body: some View {
-    ScrollView { content }
-      .clipped()
-      .scrollPosition(id: $position, anchor: .top)
-      .onChange(of: itemIDs) { _, ids in
-        if let position, !ids.contains(position) { self.position = nil }
-      }
-      .onChange(of: resetKey) { _, _ in position = nil }
   }
 }

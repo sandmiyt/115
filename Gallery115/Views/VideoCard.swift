@@ -431,51 +431,6 @@ struct PhotoPreviewScreen: View {
   }
 }
 
-/// Keep media identities alive while pinching; reflow only once the gesture ends.
-struct PinchMediaGrid<Cell: View, Footer: View>: View {
-  @Environment(\.accessibilityReduceMotion) private var reduceMotion
-  let items: [CloudItem]
-  @Binding var columnCount: Int
-  let compact: Bool
-  private let cell: (CloudItem) -> Cell
-  private let footer: () -> Footer
-  @State private var tapGate = MediaGridTapGate()
-
-  init(items: [CloudItem], columnCount: Binding<Int>, compact: Bool,
-       @ViewBuilder cell: @escaping (CloudItem) -> Cell,
-       @ViewBuilder footer: @escaping () -> Footer) {
-    self.items = items
-    self._columnCount = columnCount
-    self.compact = compact
-    self.cell = cell
-    self.footer = footer
-  }
-
-  private var safeColumns: Int { MediaGridZoomPolicy.normalized(columnCount) }
-
-  var body: some View {
-    LazyVGrid(columns: Array(repeating: GridItem(.flexible(minimum: 0),
-      spacing: compact ? 2 : 9, alignment: .top), count: safeColumns), spacing: compact ? 2 : 11) {
-      Section {
-        ForEach(items) { item in cell(item) }
-      } footer: {
-        footer()
-      }
-    }
-    .scrollTargetLayout()
-    .padding(.horizontal, compact ? 2 : 10)
-    .environment(\.mediaGridTapGate, tapGate)
-    .modifier(MediaGridPinchModifier(columnCount: $columnCount, tapGate: tapGate))
-    .sensoryFeedback(.selection, trigger: safeColumns)
-    .accessibilityAction(named: Text("放大缩略图")) {
-      columnCount = MediaGridZoomPolicy.targetColumns(from: safeColumns, magnification: 1.2)
-    }
-    .accessibilityAction(named: Text("缩小缩略图")) {
-      columnCount = MediaGridZoomPolicy.targetColumns(from: safeColumns, magnification: 0.8)
-    }
-  }
-}
-
 /// A reference gate avoids invalidating every card on each gesture sample.
 private final class MediaGridTapGate {
   var blockedUntil: TimeInterval = 0
@@ -491,74 +446,6 @@ private extension EnvironmentValues {
   var mediaGridTapGate: MediaGridTapGate? {
     get { self[MediaGridTapGateKey.self] }
     set { self[MediaGridTapGateKey.self] = newValue }
-  }
-}
-
-/// Gesture samples update the transform wrapper, not the grid's cell builder.
-private struct MediaGridPinchModifier: ViewModifier {
-  @Environment(\.accessibilityReduceMotion) private var reduceMotion
-  @Binding var columnCount: Int
-  let tapGate: MediaGridTapGate
-  @State private var scale: CGFloat = 1
-  @State private var anchor: UnitPoint = .center
-  @State private var startColumns = 3
-  @State private var tracking = false
-  @State private var settleTask: Task<Void, Never>?
-
-  func body(content: Content) -> some View {
-    content
-      .scaleEffect(max(scale, 1), anchor: UnitPoint(x: 0.5, y: min(max(anchor.y, 0), 1)))
-      .background(
-        LibraryPinchRecognizer(onChanged: { magnification, touchAnchor in
-          tapGate.suppressTap()
-          if !tracking {
-            settleTask?.cancel()
-            settleTask = nil
-            tracking = true
-            startColumns = MediaGridZoomPolicy.normalized(columnCount)
-            anchor = touchAnchor
-          }
-          var transaction = Transaction(animation: nil)
-          transaction.disablesAnimations = true
-          withTransaction(transaction) {
-            scale = CGFloat(MediaGridZoomPolicy.liveScale(Double(magnification)))
-          }
-        }, onEnded: { magnification, cancelled in
-          tapGate.suppressTap()
-          tracking = false
-          if !cancelled {
-            let target = MediaGridZoomPolicy.targetColumns(from: startColumns,
-              magnification: Double(magnification))
-            var transaction = Transaction(animation: nil)
-            transaction.disablesAnimations = true
-            withTransaction(transaction) {
-              scale = CGFloat(MediaGridZoomPolicy.handoffScale(Double(scale), from: startColumns, to: target))
-              columnCount = target
-            }
-          }
-          settle()
-        })
-      )
-      .onDisappear {
-        settleTask?.cancel()
-        settleTask = nil
-        tracking = false
-        scale = 1
-      }
-  }
-
-  private func settle() {
-    settleTask?.cancel()
-    settleTask = Task { @MainActor in
-      // Let SwiftUI install the compensated layout before starting the spring.
-      do { try await Task.sleep(nanoseconds: 16_000_000) }
-      catch { return }
-      guard !Task.isCancelled, !tracking else { return }
-      withAnimation(reduceMotion ? nil : .spring(response: 0.32, dampingFraction: 0.92)) {
-        scale = 1
-      }
-      settleTask = nil
-    }
   }
 }
 
@@ -589,97 +476,369 @@ struct MediaSelectionBar: View {
   }
 }
 
-/// Attach to the actual scroll view so two-finger pinch and one-finger pan have
-/// explicit ownership. Never leave scrolling disabled while a gesture is active.
-private struct LibraryPinchRecognizer: UIViewRepresentable {
-  let onChanged: (CGFloat, UnitPoint) -> Void
-  let onEnded: (CGFloat, Bool) -> Void
+
+enum PhotoGridSection: Int, CaseIterable { case folders, media, footer }
+enum PhotoGridID: Hashable { case folder(String), media(String), footer }
+
+/// The collection view owns scrolling, reuse and interactive layout transitions.
+/// There is no scaled scroll surface or second SwiftUI scroll-position controller.
+struct PhotoLibraryGrid<FolderCell: View, MediaCell: View, Footer: View>: UIViewRepresentable {
+  @Environment(AppState.self) private var appState
+  @Environment(\.artworkRefreshRevision) private var artworkRevision
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
+  let folders: [CloudItem]
+  let items: [CloudItem]
+  @Binding var columnCount: Int
+  let folderColumns: Int
+  let compact: Bool
+  let resetKey: String
+  let onRefresh: (() async -> Void)?
+  let folderCell: (CloudItem) -> FolderCell
+  let mediaCell: (CloudItem) -> MediaCell
+  let footer: () -> Footer
+
+  init(folders: [CloudItem], items: [CloudItem], columnCount: Binding<Int>, folderColumns: Int,
+       compact: Bool, resetKey: String, onRefresh: (() async -> Void)? = nil,
+       @ViewBuilder folder: @escaping (CloudItem) -> FolderCell,
+       @ViewBuilder media: @escaping (CloudItem) -> MediaCell,
+       @ViewBuilder footer: @escaping () -> Footer) {
+    self.folders = folders; self.items = items; self._columnCount = columnCount
+    self.folderColumns = folderColumns; self.compact = compact; self.resetKey = resetKey
+    self.onRefresh = onRefresh; self.folderCell = folder; self.mediaCell = media; self.footer = footer
+  }
 
   func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
-  func makeUIView(context: Context) -> ProbeView {
-    let view = ProbeView()
-    view.isUserInteractionEnabled = false
-    view.onHierarchyChange = { [weak coordinator = context.coordinator] view in coordinator?.attach(view) }
+  func makeUIView(context: Context) -> UICollectionView {
+    let view = UICollectionView(frame: .zero, collectionViewLayout: context.coordinator.newLayout())
+    view.backgroundColor = .clear
+    view.alwaysBounceVertical = true
+    view.keyboardDismissMode = .interactive
+    view.isPrefetchingEnabled = false
+    view.panGestureRecognizer.maximumNumberOfTouches = 1
+    context.coordinator.install(view)
     return view
   }
-  func updateUIView(_ uiView: ProbeView, context: Context) {
+  func updateUIView(_ uiView: UICollectionView, context: Context) {
+    let changedScope = context.coordinator.parent.resetKey != resetKey
     context.coordinator.parent = self
-    context.coordinator.attach(uiView)
+    if changedScope, context.coordinator.transition != nil {
+      context.coordinator.complete(finish: false)
+    }
+    context.coordinator.applyLatest()
   }
-  static func dismantleUIView(_ uiView: ProbeView, coordinator: Coordinator) { coordinator.detach() }
-
-  final class ProbeView: UIView {
-    var onHierarchyChange: ((UIView) -> Void)?
-    override func didMoveToWindow() { super.didMoveToWindow(); onHierarchyChange?(self) }
-    override func layoutSubviews() { super.layoutSubviews(); onHierarchyChange?(self) }
+  static func dismantleUIView(_ uiView: UICollectionView, coordinator: Coordinator) {
+    coordinator.active = false
+    coordinator.refreshTask?.cancel()
+    if coordinator.transition != nil, !coordinator.finishing { uiView.cancelInteractiveTransition() }
+    uiView.removeGestureRecognizer(coordinator.pinch)
   }
 
   @MainActor
-  final class Coordinator: NSObject, UIGestureRecognizerDelegate {
-    var parent: LibraryPinchRecognizer
-    weak var scrollView: UIScrollView?
-    weak var probe: UIView?
-    var originalMaximumTouches = 1
-    var startAnchor = UnitPoint.center
+  final class Coordinator: NSObject, UIGestureRecognizerDelegate, UICollectionViewDelegate {
+    var parent: PhotoLibraryGrid
+    weak var view: UICollectionView?
+    var dataSource: UICollectionViewDiffableDataSource<PhotoGridSection, PhotoGridID>!
+    var foldersByID: [String: CloudItem] = [:]
+    var mediaByID: [String: CloudItem] = [:]
+    private let tapGate = MediaGridTapGate()
+    var transition: UICollectionViewTransitionLayout?
+    var finishing = false
+    var active = true
+    var anchorIndex: IndexPath?
+    var anchorFraction: CGFloat = 0.5
+    var anchorScreenY: CGFloat = 0
+    var targetRatio: CGFloat = 1
+    var scope: String?
+    var refreshTask: Task<Void, Never>?
     lazy var pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
 
-    init(parent: LibraryPinchRecognizer) { self.parent = parent }
-
-    func attach(_ view: UIView) {
-      guard view.window != nil else { detach(); return }
-      var ancestor = view.superview
-      while let candidate = ancestor, !(candidate is UIScrollView) { ancestor = candidate.superview }
-      guard let scroll = ancestor as? UIScrollView else { return }
-      guard scrollView !== scroll else { return }
-      detach()
-      probe = view
-      scrollView = scroll
-      originalMaximumTouches = scroll.panGestureRecognizer.maximumNumberOfTouches
-      scroll.panGestureRecognizer.maximumNumberOfTouches = 1
+    init(parent: PhotoLibraryGrid) { self.parent = parent }
+    func newLayout(columns: Int? = nil) -> PhotoGridLayout {
+      PhotoGridLayout(mediaColumns: columns ?? MediaGridZoomPolicy.normalized(parent.columnCount),
+                      folderColumns: parent.folderColumns, compact: parent.compact)
+    }
+    func install(_ view: UICollectionView) {
+      self.view = view
+      view.delegate = self
+      view.register(UICollectionViewCell.self, forCellWithReuseIdentifier: "photo-cell")
+      dataSource = UICollectionViewDiffableDataSource(collectionView: view) { [weak self] view, path, id in
+        guard let self else { return nil }
+        let cell = view.dequeueReusableCell(withReuseIdentifier: "photo-cell", for: path)
+        switch id {
+        case .folder(let key):
+          guard let item = self.foldersByID[key] else { return cell }
+          let content = self.parent.folderCell(item).environment(self.parent.appState)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+          cell.contentConfiguration = UIHostingConfiguration { content }.margins(.all, 0)
+        case .media(let key):
+          guard let item = self.mediaByID[key] else { return cell }
+          let content = self.parent.mediaCell(item).environment(self.parent.appState)
+            .environment(\.artworkRefreshRevision, self.parent.artworkRevision)
+            .environment(\.mediaGridTapGate, self.tapGate)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+          cell.contentConfiguration = UIHostingConfiguration { content }.margins(.all, 0)
+        case .footer:
+          let content = self.parent.footer().environment(self.parent.appState)
+          cell.contentConfiguration = UIHostingConfiguration { content }.margins(.all, 0)
+        }
+        return cell
+      }
       pinch.delegate = self
       pinch.cancelsTouchesInView = true
-      scroll.addGestureRecognizer(pinch)
+      view.addGestureRecognizer(pinch)
+      if parent.onRefresh != nil {
+        let refresh = UIRefreshControl()
+        refresh.addTarget(self, action: #selector(refreshRequested), for: .valueChanged)
+        view.refreshControl = refresh
+      }
+      applyLatest()
     }
 
-    func detach() {
-      let scroll = scrollView
-      scrollView = nil
-      probe = nil
-      if let scroll {
-        scroll.removeGestureRecognizer(pinch)
-        scroll.panGestureRecognizer.maximumNumberOfTouches = originalMaximumTouches
+    func applyLatest() {
+      guard active, !finishing, transition == nil, let view else { return }
+      foldersByID = Dictionary(parent.folders.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+      mediaByID = Dictionary(parent.items.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+      var seen = Set<PhotoGridID>()
+      var snapshot = NSDiffableDataSourceSnapshot<PhotoGridSection, PhotoGridID>()
+      snapshot.appendSections(PhotoGridSection.allCases)
+      snapshot.appendItems(parent.folders.map { PhotoGridID.folder($0.id) }.filter { seen.insert($0).inserted }, toSection: .folders)
+      snapshot.appendItems(parent.items.map { PhotoGridID.media($0.id) }.filter { seen.insert($0).inserted }, toSection: .media)
+      snapshot.appendItems([.footer], toSection: .footer)
+      let old = Set(dataSource.snapshot().itemIdentifiers)
+      let visible = view.indexPathsForVisibleItems.compactMap { dataSource.itemIdentifier(for: $0) }
+      snapshot.reconfigureItems(visible.filter { old.contains($0) && seen.contains($0) || $0 == .footer && old.contains($0) })
+      dataSource.apply(snapshot, animatingDifferences: false)
+      if let layout = view.collectionViewLayout as? PhotoGridLayout,
+        layout.mediaColumns != MediaGridZoomPolicy.normalized(parent.columnCount)
+          || layout.folderColumns != parent.folderColumns || layout.compact != parent.compact {
+        view.setCollectionViewLayout(newLayout(), animated: false)
       }
+      if scope != parent.resetKey {
+        scope = parent.resetKey
+        view.setContentOffset(CGPoint(x: 0, y: -view.adjustedContentInset.top), animated: false)
+      }
+    }
+
+    @objc func refreshRequested() {
+      guard refreshTask == nil, let action = parent.onRefresh else { return }
+      refreshTask = Task { @MainActor [weak self] in
+        await action()
+        guard let self else { return }
+        self.view?.refreshControl?.endRefreshing()
+        self.refreshTask = nil
+      }
+    }
+
+    func collectionView(_ collectionView: UICollectionView,
+                        transitionLayoutForOldLayout fromLayout: UICollectionViewLayout,
+                        newLayout toLayout: UICollectionViewLayout) -> UICollectionViewTransitionLayout {
+      let layout = PhotoGridTransitionLayout(currentLayout: fromLayout, nextLayout: toLayout)
+      layout.anchorIndex = anchorIndex
+      layout.anchorFraction = anchorFraction
+      layout.anchorScreenY = anchorScreenY
+      return layout
     }
 
     func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-      guard let probe, probe.bounds.width > 0, probe.bounds.height > 0 else { return false }
-      return probe.bounds.contains(gestureRecognizer.location(in: probe))
+      guard !finishing, transition == nil, let view,
+        let layout = view.collectionViewLayout as? PhotoGridLayout else { return false }
+      let point = gestureRecognizer.location(in: view)
+      return layout.mediaRegion.contains(point) && view.numberOfItems(inSection: 1) > 0
     }
-
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
       shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
-      otherGestureRecognizer === scrollView?.panGestureRecognizer
+      otherGestureRecognizer === view?.panGestureRecognizer
     }
 
     @objc func handlePinch(_ recognizer: UIPinchGestureRecognizer) {
-      guard scrollView != nil, probe?.window != nil else { return }
+      guard active, let view else { return }
+      tapGate.suppressTap()
       switch recognizer.state {
       case .began:
-        if let probe {
-          let point = recognizer.location(in: probe)
-          startAnchor = UnitPoint(x: min(max(point.x / max(probe.bounds.width, 1), 0), 1),
-                                  y: min(max(point.y / max(probe.bounds.height, 1), 0), 1))
+        view.panGestureRecognizer.isEnabled = false
+        view.panGestureRecognizer.isEnabled = true
+        let point = recognizer.location(in: view)
+        anchorIndex = view.indexPathsForVisibleItems.filter { $0.section == 1 }.min {
+          let first = view.layoutAttributesForItem(at: $0)?.center ?? .zero
+          let second = view.layoutAttributesForItem(at: $1)?.center ?? .zero
+          return hypot(first.x - point.x, first.y - point.y) < hypot(second.x - point.x, second.y - point.y)
         }
-        if let pan = scrollView?.panGestureRecognizer {
-          pan.isEnabled = false
-          pan.isEnabled = true
+        if let anchorIndex, let frame = view.layoutAttributesForItem(at: anchorIndex)?.frame {
+          anchorFraction = min(max((point.y - frame.minY) / max(frame.height, 1), 0), 1)
         }
-        parent.onChanged(recognizer.scale, startAnchor)
-      case .changed: parent.onChanged(recognizer.scale, startAnchor)
-      case .ended: parent.onEnded(recognizer.scale, false)
-      case .cancelled, .failed: parent.onEnded(recognizer.scale, true)
+        anchorScreenY = point.y - view.contentOffset.y
+      case .changed:
+        guard !finishing else { return }
+        if transition == nil {
+          guard abs(recognizer.scale - 1) > 0.015,
+            let current = view.collectionViewLayout as? PhotoGridLayout,
+            let index = MediaGridZoomPolicy.levels.firstIndex(of: current.mediaColumns) else { return }
+          let next = min(max(index + (recognizer.scale > 1 ? -1 : 1), 0), MediaGridZoomPolicy.levels.count - 1)
+          guard next != index else { return }
+          let target = newLayout(columns: MediaGridZoomPolicy.levels[next])
+          targetRatio = target.mediaWidth(in: view.bounds.width) / current.mediaWidth(in: view.bounds.width)
+          current.focus = (anchorIndex, anchorFraction, anchorScreenY)
+          target.focus = (anchorIndex, anchorFraction, anchorScreenY)
+          transition = view.startInteractiveTransition(to: target) { [weak self] _, completed in
+            guard let self, self.active else { return }
+            self.transition = nil
+            if let view = self.view, let layout = view.collectionViewLayout as? PhotoGridLayout {
+              // UIKit can reset the offset when it installs the final layout.
+              view.setContentOffset(layout.targetContentOffset(forProposedContentOffset: view.contentOffset), animated: false)
+              layout.focus = nil
+            }
+            Task { @MainActor [weak self] in
+              await Task.yield()
+              guard let self, self.active else { return }
+              if completed { self.parent.columnCount = target.mediaColumns }
+              self.pinch.scale = 1
+              self.finishing = false
+              self.applyLatest()
+            }
+          }
+        }
+        guard let transition else { return }
+        anchorScreenY = recognizer.location(in: view).y - view.contentOffset.y
+        (transition.currentLayout as? PhotoGridLayout)?.focus = (anchorIndex, anchorFraction, anchorScreenY)
+        (transition.nextLayout as? PhotoGridLayout)?.focus = (anchorIndex, anchorFraction, anchorScreenY)
+        (transition as? PhotoGridTransitionLayout)?.anchorScreenY = anchorScreenY
+        transition.transitionProgress = CGFloat(PhotoGridTransitionPolicy.progress(
+          magnification: Double(recognizer.scale), targetRatio: Double(targetRatio)))
+        transition.invalidateLayout()
+        view.layoutIfNeeded()
+        if transition.transitionProgress >= 1 { complete(finish: true) }
+        else if (targetRatio > 1 && recognizer.scale < 0.985)
+          || (targetRatio < 1 && recognizer.scale > 1.015) {
+          complete(finish: false)
+        }
+      case .ended:
+        if let transition, !finishing {
+          let projected = PhotoGridTransitionPolicy.projectedProgress(
+            progress: Double(transition.transitionProgress), velocity: Double(recognizer.velocity),
+            targetRatio: Double(targetRatio))
+          complete(finish: projected >= 0.5)
+        }
+      case .cancelled, .failed:
+        if transition != nil, !finishing { complete(finish: false) }
       default: break
       }
     }
+
+    func complete(finish: Bool) {
+      guard let view, transition != nil, !finishing else { return }
+      finishing = true
+      if parent.reduceMotion { transition?.transitionProgress = finish ? 1 : 0 }
+      if finish { view.finishInteractiveTransition() }
+      else { view.cancelInteractiveTransition() }
+    }
+  }
+}
+
+/// Calculate only rows intersecting the viewport, even in very large directories.
+final class PhotoGridLayout: UICollectionViewLayout {
+  let mediaColumns: Int
+  let folderColumns: Int
+  let compact: Bool
+  var focus: (IndexPath?, CGFloat, CGFloat)?
+  init(mediaColumns: Int, folderColumns: Int, compact: Bool) {
+    self.mediaColumns = mediaColumns; self.folderColumns = max(1, folderColumns); self.compact = compact
+    super.init()
+  }
+  required init?(coder: NSCoder) { fatalError("Programmatic layout only") }
+  private var width: CGFloat { max(collectionView?.bounds.width ?? 1, 1) }
+  private func count(_ section: Int) -> Int {
+    guard let collectionView, collectionView.numberOfSections > section else { return 0 }
+    return collectionView.numberOfItems(inSection: section)
+  }
+  func mediaWidth(in width: CGFloat) -> CGFloat {
+    max(1, (width - (compact ? 4 : 20) - CGFloat(mediaColumns - 1) * (compact ? 2 : 9)) / CGFloat(mediaColumns))
+  }
+  private var folderWidth: CGFloat { max(1, (width - 20 - CGFloat(folderColumns - 1) * 9) / CGFloat(folderColumns)) }
+  private var folderHeight: CGFloat {
+    folderWidth * 9 / 16 + UIFont.preferredFont(forTextStyle: .subheadline).lineHeight * 2
+      + UIFont.preferredFont(forTextStyle: .caption2).lineHeight + 16
+  }
+  private var folderBottom: CGFloat {
+    count(0) == 0 ? 0 : 10 + CGFloat((count(0) + folderColumns - 1) / folderColumns) * (folderHeight + 11)
+  }
+  private var mediaHeight: CGFloat {
+    compact ? mediaWidth(in: width) : mediaWidth(in: width) * 9 / 16 + UIFont.preferredFont(forTextStyle: .caption1).lineHeight * 2 + 7
+  }
+  private var mediaTop: CGFloat { folderBottom + (count(0) == 0 ? 2 : 3) }
+  private var mediaBottom: CGFloat { mediaTop + CGFloat((count(1) + mediaColumns - 1) / mediaColumns) * (mediaHeight + (compact ? 2 : 11)) }
+  var mediaRegion: CGRect { CGRect(x: 0, y: mediaTop, width: width, height: max(0, mediaBottom - mediaTop)) }
+  override var collectionViewContentSize: CGSize { CGSize(width: width, height: mediaBottom + 88) }
+
+  override func layoutAttributesForItem(at path: IndexPath) -> UICollectionViewLayoutAttributes? {
+    guard path.item < count(path.section) else { return nil }
+    let attribute = UICollectionViewLayoutAttributes(forCellWith: path)
+    if path.section == 2 { attribute.frame = CGRect(x: 0, y: mediaBottom, width: width, height: 88); return attribute }
+    let folder = path.section == 0
+    let columns = folder ? folderColumns : mediaColumns
+    let gap: CGFloat = folder ? 9 : (compact ? 2 : 9)
+    let inset: CGFloat = folder ? 10 : (compact ? 2 : 10)
+    let itemWidth = folder ? folderWidth : mediaWidth(in: width)
+    let itemHeight = folder ? folderHeight : mediaHeight
+    let rowGap: CGFloat = folder ? 11 : (compact ? 2 : 11)
+    attribute.frame = CGRect(x: inset + CGFloat(path.item % columns) * (itemWidth + gap),
+      y: (folder ? 10 : mediaTop) + CGFloat(path.item / columns) * (itemHeight + rowGap), width: itemWidth, height: itemHeight)
+    return attribute
+  }
+  override func layoutAttributesForElements(in rect: CGRect) -> [UICollectionViewLayoutAttributes]? {
+    var attributes: [UICollectionViewLayoutAttributes] = []
+    for section in 0...1 {
+      let columns = section == 0 ? folderColumns : mediaColumns
+      let top: CGFloat = section == 0 ? 10 : mediaTop
+      let stride = section == 0 ? folderHeight + 11 : mediaHeight + (compact ? 2 : 11)
+      let first = max(0, Int(floor((rect.minY - top) / stride))) * columns
+      let last = min(count(section), max(0, Int(ceil((rect.maxY - top) / stride)) + 1) * columns)
+      if first < last {
+        for index in first..<last {
+          if let attribute = layoutAttributesForItem(at: IndexPath(item: index, section: section)), attribute.frame.intersects(rect) { attributes.append(attribute) }
+        }
+      }
+    }
+    if let footer = layoutAttributesForItem(at: IndexPath(item: 0, section: 2)), footer.frame.intersects(rect) { attributes.append(footer) }
+    return attributes
+  }
+  override func shouldInvalidateLayout(forBoundsChange newBounds: CGRect) -> Bool { newBounds.size != collectionView?.bounds.size }
+  override func targetContentOffset(forProposedContentOffset proposedContentOffset: CGPoint) -> CGPoint {
+    guard let collectionView, let (index, fraction, screenY) = focus, let index,
+      let frame = layoutAttributesForItem(at: index)?.frame else { return proposedContentOffset }
+    let minimum = -collectionView.adjustedContentInset.top
+    let maximum = max(minimum, collectionViewContentSize.height - collectionView.bounds.height + collectionView.adjustedContentInset.bottom)
+    return CGPoint(x: 0, y: min(max(frame.minY + frame.height * fraction - screenY, minimum), maximum))
+  }
+}
+
+/// Keeps the same content point under the fingers during BOTH dragging and UIKit's
+/// finish/cancel animation. Inspired by TLLayoutTransitioning's offset control;
+/// uses UIKit attributes directly instead of enumerating every item per frame.
+final class PhotoGridTransitionLayout: UICollectionViewTransitionLayout {
+  var anchorIndex: IndexPath?
+  var anchorFraction: CGFloat = 0.5
+  var anchorScreenY: CGFloat = 0
+
+  override var transitionProgress: CGFloat {
+    didSet {
+      guard let collectionView, let anchorIndex,
+        let start = currentLayout.layoutAttributesForItem(at: anchorIndex)?.frame,
+        let end = nextLayout.layoutAttributesForItem(at: anchorIndex)?.frame else { return }
+      let progress = min(max(transitionProgress, 0), 1)
+      let startY = start.minY + start.height * anchorFraction
+      let endY = end.minY + end.height * anchorFraction
+      let y = startY + (endY - startY) * progress - anchorScreenY
+      let minimum = -collectionView.adjustedContentInset.top
+      let maximum = max(minimum, collectionViewContentSize.height - collectionView.bounds.height + collectionView.adjustedContentInset.bottom)
+      collectionView.setContentOffset(CGPoint(x: 0, y: min(max(y, minimum), maximum)), animated: false)
+    }
+  }
+
+  override var collectionViewContentSize: CGSize {
+    let start = currentLayout.collectionViewContentSize
+    let end = nextLayout.collectionViewContentSize
+    let progress = min(max(transitionProgress, 0), 1)
+    return CGSize(width: start.width + (end.width - start.width) * progress,
+                  height: start.height + (end.height - start.height) * progress)
   }
 }

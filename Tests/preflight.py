@@ -171,17 +171,21 @@ check("boundedArtwork(seconds: 18)" in service and "boundedArtwork(seconds: fram
 check("UIPinchGestureRecognizer(target:" in card and "guard tapGate?.allowsTap != false" in card
       and ".simultaneousGesture(" not in card,
       "Pinch takes priority over taps and guards release-time video activation")
-check("struct MediaGridPinchModifier" in card and "transaction.disablesAnimations = true" in card,
-      "Pinch transform state is isolated and density changes avoid whole-grid interpolation")
-check("MediaGridZoomPolicy.handoffScale" in card and "spring(response: 0.32" in card,
-      "Density handoff compensates thumbnail size before a transform-only settle")
+check("struct PhotoLibraryGrid" in card and "startInteractiveTransition(to: target)" in card,
+      "Media cells use a native interactive collection layout")
+check("PhotoGridTransitionPolicy.progress" in card and "finishInteractiveTransition()" in card
+      and "cancelInteractiveTransition()" in card,
+      "Pinch progress supports native finish and cancellation")
+check("final class PhotoGridTransitionLayout: UICollectionViewTransitionLayout" in card
+      and "override var transitionProgress" in card and "layout.focus = nil" in card,
+      "Anchoring continues during native settling and clears after layout installation")
 check("loadFailed" not in card and "guard scenePhase == .active" in card,
       "Thumbnail retries keep a neutral placeholder and stop in background")
 check("loadedFolderScope == scope, !items.isEmpty { return }" in folder,
       "Returning to a loaded folder does not truncate its later pages")
-check("struct StableLibraryScrollView" in folder and "!ids.contains(position)" in folder
-      and "LazyVStack(spacing: 14)" not in folder,
-      "Scroll state is isolated, invalid anchors reset and nested lazy container is removed")
+check("PhotoLibraryGrid(folders: displayedFolders" in folder and "UICollectionViewDiffableDataSource" in card
+      and "for index in first..<last" in card,
+      "Stable identities and viewport row calculation replace nested scroll containers")
 check("CGSize(width: 640, height: 360)" in service and "item.isPhoto ? 960 : 640" in service,
       "Video artwork decode pressure is reduced while photo resolution is retained")
 check("FavoriteRelocationPolicy.reconciled" in (ROOT / "Gallery115/Services/LibraryStore.swift").read_text(encoding="utf-8")
@@ -189,8 +193,9 @@ check("FavoriteRelocationPolicy.reconciled" in (ROOT / "Gallery115/Services/Libr
       "Directory snapshots reconcile relocated favorites before favorite filtering")
 check("cachedThumbnail(for: item)" in card and "warmLocalThumbnails(page.items)" in folder,
       "First-frame artwork can use memory and prewarmed disk covers")
-check("scaleEffect(max(scale, 1)" in card and "reader.scrollTo" not in folder and "ScrollViewReader" not in folder,
-      "Pinch stays within the viewport and scrolling uses only one position mechanism")
+check("scaleEffect(max(scale, 1)" not in card and "ScrollViewReader" not in folder
+      and "CGPoint(x: 0, y: min(max(y, minimum), maximum))" in card,
+      "Pinch anchors clamp within the viewport without scaling the scroll surface")
 check("maximumNumberOfTouches = 1" in card and "MediaGridZoomPolicy" in card,
       "Media grids support pinch density changes with stable item identity")
 check("!endedPlaybackOwners.contains(owner)" in service
