@@ -21,7 +21,9 @@ struct FavoritesView: View {
       } else {
         PhotoLibraryGrid(folders: [], items: appState.libraryStore.favorites, columnCount: $mediaGridColumns,
                          folderColumns: 2, compact: compactGrid,
-                         resetKey: "favorites|\(appState.mediaSourceRevision)") { _ in
+                         resetKey: "favorites|\(appState.mediaSourceRevision)",
+                         selectionMode: isSelecting, selectedIDs: selectedIDs,
+                         onSelectionChange: { selectedIDs = $0 }) { _ in
           EmptyView()
         } media: { item in
           VideoCard(item: item, transitionNamespace: playerTransition, compact: compactGrid,

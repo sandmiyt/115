@@ -149,6 +149,8 @@ final class PlayerModel: PlaybackEngineControlling {
   private(set) var currentTime: Double = 0
   private(set) var duration: Double = 0
   private(set) var bufferedUntil: Double = 0
+  private(set) var bufferedRanges: [PlaybackBufferRange] = []
+  @ObservationIgnored private var scrubLoadingTask: Task<Void, Never>?
   private(set) var isPlaying = false
   private(set) var didReachEnd = false
   private(set) var isBuffering = false
@@ -336,6 +338,7 @@ final class PlayerModel: PlaybackEngineControlling {
   /// playback progression from fighting the seek chase while the thumb moves.
   @discardableResult
   func beginInteractiveScrub() -> Bool {
+    scrubLoadingTask?.cancel()
     interactiveScrubActive = true
     stallProbeTask?.cancel()
     // Preserve the user's playback intent, not just AVPlayer's instantaneous
@@ -423,18 +426,24 @@ final class PlayerModel: PlaybackEngineControlling {
     let target = scrubChaseTime
     let generation = scrubGeneration
     let isFinalPass = scrubFinalTarget.map { CMTimeCompare($0, target) == 0 } ?? false
-    let toleranceSeconds = isFinalPass ? (1.0 / 120.0) : scrubLiveToleranceSeconds
+    let toleranceSeconds = isFinalPass ? 0.10 : scrubLiveToleranceSeconds
     let tolerance = CMTime(seconds: toleranceSeconds, preferredTimescale: 600)
     scrubSeekInProgress = true
-    isInteractiveScrubLoading = true
+    scrubLoadingTask?.cancel()
+    scrubLoadingTask = Task { @MainActor [weak self] in
+      do { try await Task.sleep(for: .milliseconds(180)) } catch { return }
+      guard let self, self.scrubGeneration == generation, self.scrubSeekInProgress else { return }
+      self.isInteractiveScrubLoading = true
+    }
 
     player.seek(
       to: target,
       toleranceBefore: tolerance,
       toleranceAfter: tolerance
-    ) { [weak self] _ in
+    ) { [weak self] finished in
       Task { @MainActor in
-        guard let self, self.scrubGeneration == generation else { return }
+        guard let self, self.scrubGeneration == generation, self.player.currentItem === item else { return }
+        self.scrubLoadingTask?.cancel()
 
         // The finger moved while this seek was decoding. Skip all stale targets
         // and immediately chase the newest one.
@@ -447,7 +456,8 @@ final class PlayerModel: PlaybackEngineControlling {
         // flight, do one final tighter pass before resuming playback.
         if let final = self.scrubFinalTarget,
           CMTimeCompare(final, target) == 0,
-          !isFinalPass
+          finished, !isFinalPass,
+          abs(self.player.currentTime().seconds - final.seconds) > 0.12
         {
           self.performInteractiveScrubSeek()
           return
@@ -532,10 +542,16 @@ final class PlayerModel: PlaybackEngineControlling {
   }
 
   var bufferedDuration: Double {
-    max(bufferedUntil - currentTime, 0)
+    max(PlaybackBufferPolicy.contiguousEnd(at: currentTime, ranges: bufferedRanges) - currentTime, 0)
   }
 
   private func play(_ source: VideoSource, allowFallback: Bool) async {
+    scrubLoadingTask?.cancel()
+    scrubGeneration &+= 1
+    scrubSeekInProgress = false
+    isInteractiveScrubLoading = false
+    bufferedRanges = []
+    bufferedUntil = 0
     selectedSource = source
     errorMessage = nil
     didReachEnd = false
@@ -815,9 +831,11 @@ final class PlayerModel: PlaybackEngineControlling {
           }
         }
 
-        self.currentTime = seconds
-        self.isPlaying = self.player.timeControlStatus == .playing
-        self.isBuffering = self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate
+        if !self.interactiveScrubActive {
+          self.currentTime = seconds
+          self.isPlaying = self.player.timeControlStatus == .playing
+          self.isBuffering = self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate
+        }
 
         if self.networkAutoRecoveryEnabled,
           !self.didReachEnd,
@@ -829,10 +847,12 @@ final class PlayerModel: PlaybackEngineControlling {
           self.requestStallRecoveryIfNeeded()
         }
 
-        if let range = self.player.currentItem?.loadedTimeRanges.last?.timeRangeValue {
-          let end = CMTimeGetSeconds(CMTimeRangeGetEnd(range))
-          self.bufferedUntil = end.isFinite ? max(end, 0) : 0
-        }
+        let ranges = PlaybackBufferPolicy.normalized((self.player.currentItem?.loadedTimeRanges ?? []).map {
+          let range = $0.timeRangeValue
+          return PlaybackBufferRange(start: range.start.seconds, end: CMTimeRangeGetEnd(range).seconds)
+        })
+        if ranges != self.bufferedRanges { self.bufferedRanges = ranges }
+        self.bufferedUntil = PlaybackBufferPolicy.contiguousEnd(at: self.currentTime, ranges: ranges)
 
         if let event = self.player.currentItem?.accessLog()?.events.last {
           let observed = event.observedBitrate

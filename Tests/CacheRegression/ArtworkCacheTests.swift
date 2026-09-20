@@ -4,6 +4,66 @@ import XCTest
 @testable import CinevaCacheValidation
 
 final class ArtworkCacheTests: XCTestCase {
+  func testLibraryWalkFillsLaterPagesAndNestedFoldersWithoutVisibleCells() async throws {
+    let folder = CloudItem(id: "child", parentID: "root", name: "Child", isDirectory: true,
+      pickCode: "", sha1: "", size: 0, fileExtension: "", isVideo: false,
+      duration: 0, thumbnailURLString: nil, modifiedAt: Date())
+    let cached = item("cached")
+    let later = item("later")
+    let nested = item("nested")
+    try disk.write(XCTUnwrap(image().jpegData(compressionQuality: 0.8)), for: identity(cached))
+    let api = APIClient()
+    await api.setThumbnailPages([
+      "root": [ThumbnailLibraryPage(items: [cached, folder], nextOffset: 1),
+               ThumbnailLibraryPage(items: [later], nextOffset: nil)],
+      "child": [ThumbnailLibraryPage(items: [nested, folder], nextOffset: nil)]
+    ])
+    let probe = LoadProbe(image: image())
+    let cache = service(probe)
+    await cache.fillLibrary(rootID: "root", api: api)
+    let calls = await probe.calls
+    XCTAssertEqual(calls, 2)
+    XCTAssertNotNil(try disk.read(identity(later)))
+    XCTAssertNotNil(try disk.read(identity(nested)))
+    // Background scans must not fill the viewport's decoded-image cache with
+    // every previously cached cover in the library.
+    XCTAssertNil(cache.cachedThumbnail(for: cached))
+    await cache.retryMissingThumbnails()
+    await cache.fillLibrary(rootID: "root", api: api)
+    let afterReload = await probe.calls
+    XCTAssertEqual(afterReload, 2)
+  }
+
+  func testPrefetchGeneratesMissingFrameAndPersistsIt() async throws {
+    let ready = image()
+    let frames = LoadProbe(image: ready)
+    let cache = ThumbnailService(disk: disk, namespace: { "mount-a" }, loader: { _, _ in nil },
+      frameLoader: { _, _ in await frames.load() })
+    await cache.prefetch([item()], api: APIClient())
+    let calls = await frames.calls
+    XCTAssertEqual(calls, 1)
+    XCTAssertNotNil(try disk.read(identity(item())))
+  }
+
+  func testLibraryWalkWaitsForPlaybackAndCanBeCancelledWhileQueued() async {
+    let probe = LoadProbe(image: image())
+    let cache = service(probe)
+    let api = APIClient()
+    await api.setThumbnailPages(["root": [ThumbnailLibraryPage(items: [item()], nextOffset: nil)]])
+    let owner = UUID()
+    await cache.suspendNetwork(for: owner)
+    let scan = Task { await cache.fillLibrary(rootID: "root", api: api) }
+    await waitForQueue(cache, visible: 0, prefetch: 1)
+    let before = await probe.calls
+    XCTAssertEqual(before, 0)
+    scan.cancel()
+    await scan.value
+    await cache.resumeNetwork(for: owner)
+    await cache.fillLibrary(rootID: "root", api: api)
+    let after = await probe.calls
+    XCTAssertEqual(after, 1)
+  }
+
   func testDeadlineReturnsWithoutWaitingForUncooperativeLoader() async {
     let held = HeldLoader(image: image())
     let returned = expectation(description: "deadline returns while loader is held")

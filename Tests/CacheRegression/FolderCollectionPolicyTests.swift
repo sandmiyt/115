@@ -3,6 +3,33 @@ import XCTest
 @testable import CinevaCacheValidation
 
 final class FolderCollectionPolicyTests: XCTestCase {
+  func testBufferGapsAreNotReportedAsDownloaded() {
+    let ranges = PlaybackBufferPolicy.normalized([
+      PlaybackBufferRange(start: 90, end: 110), PlaybackBufferRange(start: 0, end: 15),
+      PlaybackBufferRange(start: 12, end: 20), PlaybackBufferRange(start: .nan, end: 100),
+      PlaybackBufferRange(start: 3, end: 2)
+    ])
+    XCTAssertEqual(ranges, [PlaybackBufferRange(start: 0, end: 20), PlaybackBufferRange(start: 90, end: 110)])
+    XCTAssertEqual(PlaybackBufferPolicy.contiguousEnd(at: 10, ranges: ranges), 20)
+    XCTAssertEqual(PlaybackBufferPolicy.contiguousEnd(at: 50, ranges: ranges), 50)
+    XCTAssertEqual(PlaybackBufferPolicy.contiguousEnd(at: 95, ranges: ranges), 110)
+    XCTAssertEqual(PlaybackBufferPolicy.contiguousEnd(at: 20, ranges: ranges), 20)
+    XCTAssertEqual(PlaybackBufferPolicy.contiguousEnd(at: 0, ranges: []), 0)
+  }
+
+  func testDragSelectionReversalRestoresBaselineAndSkipsPhotos() {
+    let items = (0..<5).map { index in
+      CloudItem(id: String(index), parentID: "root", name: String(index), isDirectory: false,
+        pickCode: "", sha1: "", size: 1, fileExtension: index == 2 ? "jpg" : "mp4",
+        isVideo: index != 2, duration: 0, thumbnailURLString: nil, modifiedAt: Date())
+    }
+    let base: Set<String> = ["4"]
+    XCTAssertEqual(MediaDragSelectionPolicy.selection(items: items, baseline: base, start: 0, end: 3, adding: true), ["0", "1", "3", "4"])
+    XCTAssertEqual(MediaDragSelectionPolicy.selection(items: items, baseline: base, start: 0, end: 1, adding: true), ["0", "1", "4"])
+    XCTAssertEqual(MediaDragSelectionPolicy.selection(items: items, baseline: base, start: 4, end: 0, adding: false), [])
+    XCTAssertEqual(MediaDragSelectionPolicy.selection(items: items, baseline: base, start: 5, end: 0, adding: true), base)
+  }
+
   func testZoomHandoffPreservesApparentCellSize() {
     for oldColumns in MediaGridZoomPolicy.levels {
       for newColumns in MediaGridZoomPolicy.levels {

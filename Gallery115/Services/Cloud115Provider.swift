@@ -82,8 +82,7 @@ actor Cloud115Provider: CloudProvider {
     if !forceRefresh,
       let cached = mountCache.page(
         folderID: id, offset: safeOffset, limit: safeLimit, sortKey: sortOrder.rawValue
-      ),
-      Date().timeIntervalSince(cached.savedAt) < 300
+      )
     {
       return cached.folderPage(servedFromCache: true)
     }

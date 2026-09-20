@@ -4,13 +4,12 @@ import UIKit.UIGestureRecognizerSubclass
 
 struct VideoCard: View {
   @Environment(AppState.self) private var appState
-  @Environment(\.artworkRefreshRevision) private var parentArtworkRevision
-  @State private var retryRevision = 0
   let item: CloudItem
   var transitionNamespace: Namespace.ID? = nil
   var compact = false
   var selectionMode = false
   var isSelected = false
+  var onLocate: (() -> Void)? = nil
   @Environment(\.mediaGridTapGate) private var tapGate
   let onOpen: () -> Void
 
@@ -25,7 +24,7 @@ struct VideoCard: View {
           .overlay(alignment: .topTrailing) {
             if selectionMode && item.isVideo {
               Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                .font(.system(size: 25, weight: .semibold))
+                .font(.system(size: 18, weight: .semibold))
                 .foregroundStyle(isSelected ? Color.accentColor : .white)
                 .background(.black.opacity(0.35), in: Circle())
                 .padding(7)
@@ -49,7 +48,6 @@ struct VideoCard: View {
       }
       .contentShape(Rectangle())
     }
-    .environment(\.artworkRefreshRevision, parentArtworkRevision &+ retryRevision)
     .buttonStyle(MediaCardButtonStyle())
     .disabled(selectionMode && !item.isVideo)
     .accessibilityLabel(item.name)
@@ -57,8 +55,8 @@ struct VideoCard: View {
     .accessibilityAddTraits(isSelected ? .isSelected : [])
     .contextMenu {
       if !selectionMode {
-        Button { retryRevision &+= 1 } label: {
-          Label("重试缩略图", systemImage: "arrow.clockwise")
+        if let onLocate {
+          Button("定位到位置", systemImage: "location") { onLocate() }
         }
         Button {
           appState.libraryStore.toggleFavorite(item)
@@ -188,7 +186,6 @@ struct VideoArtwork: View {
         if let image = (renderedItemIdentity == itemThumbnailIdentity ? cachedImage : nil)
           ?? appState.thumbnailService.cachedThumbnail(for: item) {
           artwork(Image(uiImage: image), in: proxy.size)
-            .transition(.opacity)
         } else {
           ZStack {
             placeholder
@@ -257,8 +254,9 @@ struct VideoArtwork: View {
       }
       guard !Task.isCancelled else { return }
       guard let image else { return }
-      let shouldFadeIn = cachedImage == nil && isLoading && !reduceMotion
-      withAnimation(shouldFadeIn ? .easeOut(duration: 0.16) : nil) {
+      var transaction = Transaction(animation: nil)
+      transaction.disablesAnimations = true
+      withTransaction(transaction) {
         cachedImage = image
         loadedIdentity = identity
         isLoading = false
@@ -495,18 +493,29 @@ struct PhotoLibraryGrid<FolderCell: View, MediaCell: View, Footer: View>: UIView
   let compact: Bool
   let resetKey: String
   let onRefresh: (() async -> Void)?
+  let scrollRequest: MediaScrollRequest?
+  let selectionMode: Bool
+  let selectedIDs: Set<String>
+  let onSelectionChange: ((Set<String>) -> Void)?
+  let contentRevision: String
   let folderCell: (CloudItem) -> FolderCell
   let mediaCell: (CloudItem) -> MediaCell
   let footer: () -> Footer
 
   init(folders: [CloudItem], items: [CloudItem], columnCount: Binding<Int>, folderColumns: Int,
        compact: Bool, resetKey: String, onRefresh: (() async -> Void)? = nil,
+       scrollRequest: MediaScrollRequest? = nil, selectionMode: Bool = false,
+       selectedIDs: Set<String> = [], onSelectionChange: ((Set<String>) -> Void)? = nil,
+       contentRevision: String = "",
        @ViewBuilder folder: @escaping (CloudItem) -> FolderCell,
        @ViewBuilder media: @escaping (CloudItem) -> MediaCell,
        @ViewBuilder footer: @escaping () -> Footer) {
     self.folders = folders; self.items = items; self._columnCount = columnCount
     self.folderColumns = folderColumns; self.compact = compact; self.resetKey = resetKey
     self.onRefresh = onRefresh; self.folderCell = folder; self.mediaCell = media; self.footer = footer
+    self.scrollRequest = scrollRequest; self.selectionMode = selectionMode
+    self.selectedIDs = selectedIDs; self.onSelectionChange = onSelectionChange
+    self.contentRevision = contentRevision
   }
 
   func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
@@ -515,7 +524,8 @@ struct PhotoLibraryGrid<FolderCell: View, MediaCell: View, Footer: View>: UIView
     view.backgroundColor = .clear
     view.alwaysBounceVertical = true
     view.keyboardDismissMode = .interactive
-    view.isPrefetchingEnabled = false
+    view.isPrefetchingEnabled = true
+    view.clipsToBounds = true
     view.panGestureRecognizer.maximumNumberOfTouches = 1
     context.coordinator.install(view)
     return view
@@ -531,13 +541,17 @@ struct PhotoLibraryGrid<FolderCell: View, MediaCell: View, Footer: View>: UIView
   static func dismantleUIView(_ uiView: UICollectionView, coordinator: Coordinator) {
     coordinator.active = false
     coordinator.refreshTask?.cancel()
+    coordinator.endDragSelection()
+    coordinator.cancelPrefetches()
     coordinator.releaseTouchOwnership()
     if coordinator.transition != nil, !coordinator.finishing { uiView.cancelInteractiveTransition() }
     uiView.removeGestureRecognizer(coordinator.pinch)
+    uiView.removeGestureRecognizer(coordinator.selectionDrag)
+    uiView.prefetchDataSource = nil
   }
 
   @MainActor
-  final class Coordinator: NSObject, UIGestureRecognizerDelegate, UICollectionViewDelegate {
+  final class Coordinator: NSObject, UIGestureRecognizerDelegate, UICollectionViewDelegate, UICollectionViewDataSourcePrefetching {
     var parent: PhotoLibraryGrid
     weak var view: UICollectionView?
     var dataSource: UICollectionViewDiffableDataSource<PhotoGridSection, PhotoGridID>!
@@ -553,7 +567,21 @@ struct PhotoLibraryGrid<FolderCell: View, MediaCell: View, Footer: View>: UIView
     var targetRatio: CGFloat = 1
     var scope: String?
     var refreshTask: Task<Void, Never>?
+    var prefetchTasks: [String: Task<Void, Never>] = [:]
+    var handledScrollRequest: UUID?
+    var lastSelectedIDs = Set<String>()
+    var lastSelectionMode = false
+    var lastArtworkRevision = -1
+    var lastContentRevision = ""
+    var lastCompact: Bool?
+    var dragStart: Int?
+    var dragEnd: Int?
+    var dragBase = Set<String>()
+    var dragAdds = true
+    var dragPoint = CGPoint.zero
+    var dragScrollLink: CADisplayLink?
     lazy var pinch = LibraryPriorityPinchRecognizer(target: self, action: #selector(handlePinch(_:)))
+    lazy var selectionDrag = LibrarySelectionRecognizer(target: self, action: #selector(handleSelectionDrag(_:)))
 
     init(parent: PhotoLibraryGrid) { self.parent = parent }
     func newLayout(columns: Int? = nil) -> PhotoGridLayout {
@@ -563,6 +591,7 @@ struct PhotoLibraryGrid<FolderCell: View, MediaCell: View, Footer: View>: UIView
     func install(_ view: UICollectionView) {
       self.view = view
       view.delegate = self
+      view.prefetchDataSource = self
       view.register(UICollectionViewCell.self, forCellWithReuseIdentifier: "photo-cell")
       dataSource = UICollectionViewDiffableDataSource(collectionView: view) { [weak self] view, path, id in
         guard let self else { return nil }
@@ -576,6 +605,7 @@ struct PhotoLibraryGrid<FolderCell: View, MediaCell: View, Footer: View>: UIView
         case .media(let key):
           guard let item = self.mediaByID[key] else { return cell }
           let content = self.parent.mediaCell(item).environment(self.parent.appState)
+            .id(item.id)
             .environment(\.artworkRefreshRevision, self.parent.artworkRevision)
             .environment(\.mediaGridTapGate, self.tapGate)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -594,6 +624,7 @@ struct PhotoLibraryGrid<FolderCell: View, MediaCell: View, Footer: View>: UIView
       }
       pinch.onClaim = { [weak self] in
         guard let self else { return }
+        self.endDragSelection()
         self.tapGate.hasMultipleTouches = true
         self.tapGate.suppressTap()
         self.view?.panGestureRecognizer.isEnabled = false
@@ -602,6 +633,11 @@ struct PhotoLibraryGrid<FolderCell: View, MediaCell: View, Footer: View>: UIView
       pinch.delegate = self
       pinch.cancelsTouchesInView = true
       view.addGestureRecognizer(pinch)
+      selectionDrag.minimumPressDuration = 0.25
+      selectionDrag.maximumNumberOfTouches = 1
+      selectionDrag.delegate = self
+      selectionDrag.isEnabled = parent.selectionMode
+      view.addGestureRecognizer(selectionDrag)
       if parent.onRefresh != nil {
         let refresh = UIRefreshControl()
         refresh.addTarget(self, action: #selector(refreshRequested), for: .valueChanged)
@@ -612,8 +648,15 @@ struct PhotoLibraryGrid<FolderCell: View, MediaCell: View, Footer: View>: UIView
 
     func applyLatest() {
       guard active, !tapGate.hasMultipleTouches, !finishing, transition == nil, let view else { return }
+      selectionDrag.isEnabled = parent.selectionMode
+      if scope != parent.resetKey { cancelPrefetches(); endDragSelection() }
+      let previousMedia = mediaByID
+      let previousFolders = foldersByID
       foldersByID = Dictionary(parent.folders.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
       mediaByID = Dictionary(parent.items.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+      for key in Array(prefetchTasks.keys) where previousMedia[key] != mediaByID[key] {
+        prefetchTasks.removeValue(forKey: key)?.cancel()
+      }
       var seen = Set<PhotoGridID>()
       var snapshot = NSDiffableDataSourceSnapshot<PhotoGridSection, PhotoGridID>()
       snapshot.appendSections(PhotoGridSection.allCases)
@@ -622,8 +665,24 @@ struct PhotoLibraryGrid<FolderCell: View, MediaCell: View, Footer: View>: UIView
       snapshot.appendItems([.footer], toSection: .footer)
       let old = Set(dataSource.snapshot().itemIdentifiers)
       let visible = view.indexPathsForVisibleItems.compactMap { dataSource.itemIdentifier(for: $0) }
-      snapshot.reconfigureItems(visible.filter { old.contains($0) && seen.contains($0) || $0 == .footer && old.contains($0) })
-      dataSource.apply(snapshot, animatingDifferences: false)
+      let allChanged = lastSelectionMode != parent.selectionMode || lastArtworkRevision != parent.artworkRevision
+        || lastCompact != parent.compact || lastContentRevision != parent.contentRevision
+      let selectionChanges = lastSelectedIDs.symmetricDifference(parent.selectedIDs)
+      snapshot.reconfigureItems(visible.filter { id in
+        guard old.contains(id) else { return false }
+        switch id {
+        case .footer: return true
+        case .folder(let key): return seen.contains(id) && (allChanged || previousFolders[key] != foldersByID[key])
+        case .media(let key):
+          return seen.contains(id) && (allChanged || selectionChanges.contains(key) || previousMedia[key] != mediaByID[key])
+        }
+      })
+      lastSelectedIDs = parent.selectedIDs
+      lastSelectionMode = parent.selectionMode
+      lastArtworkRevision = parent.artworkRevision
+      lastContentRevision = parent.contentRevision
+      lastCompact = parent.compact
+      dataSource.apply(snapshot, animatingDifferences: false) { [weak self] in self?.applyScrollRequest() }
       if let layout = view.collectionViewLayout as? PhotoGridLayout,
         layout.mediaColumns != MediaGridZoomPolicy.normalized(parent.columnCount)
           || layout.folderColumns != parent.folderColumns || layout.compact != parent.compact {
@@ -633,6 +692,99 @@ struct PhotoLibraryGrid<FolderCell: View, MediaCell: View, Footer: View>: UIView
         scope = parent.resetKey
         view.setContentOffset(CGPoint(x: 0, y: -view.adjustedContentInset.top), animated: false)
       }
+    }
+
+    func applyScrollRequest() {
+      guard active, let view, transition == nil, let request = parent.scrollRequest,
+        handledScrollRequest != request.id,
+        let path = dataSource.indexPath(for: .media(request.itemID)) else { return }
+      handledScrollRequest = request.id
+      view.layoutIfNeeded()
+      view.scrollToItem(at: path, at: .centeredVertically, animated: !parent.reduceMotion)
+    }
+
+    func cancelPrefetches() {
+      for task in prefetchTasks.values { task.cancel() }
+      prefetchTasks.removeAll()
+    }
+
+    func collectionView(_ collectionView: UICollectionView, prefetchItemsAt indexPaths: [IndexPath]) {
+      for path in indexPaths {
+        guard case .media(let id) = dataSource.itemIdentifier(for: path),
+          let item = mediaByID[id], prefetchTasks[id] == nil else { continue }
+        let service = parent.appState.thumbnailService
+        let api = parent.appState.api
+        prefetchTasks[id] = Task(priority: .utility) {
+          await service.warmLocalThumbnails([item], limit: 1)
+          guard !Task.isCancelled else { return }
+          _ = await service.thumbnail(for: item, api: api, isPrefetch: true)
+        }
+      }
+    }
+
+    func collectionView(_ collectionView: UICollectionView, cancelPrefetchingForItemsAt indexPaths: [IndexPath]) {
+      for path in indexPaths {
+        guard case .media(let id) = dataSource.itemIdentifier(for: path) else { continue }
+        prefetchTasks.removeValue(forKey: id)?.cancel()
+      }
+    }
+
+    func collectionView(_ collectionView: UICollectionView, didEndDisplaying cell: UICollectionViewCell, forItemAt indexPath: IndexPath) {
+      self.collectionView(collectionView, cancelPrefetchingForItemsAt: [indexPath])
+    }
+
+    @objc func handleSelectionDrag(_ recognizer: UILongPressGestureRecognizer) {
+      guard let view else { return }
+      dragPoint = recognizer.location(in: view)
+      switch recognizer.state {
+      case .began:
+        guard let path = view.indexPathForItem(at: dragPoint), path.section == 1,
+          path.item < parent.items.count, parent.items[path.item].isVideo else { return }
+        dragStart = path.item
+        dragBase = parent.selectedIDs
+        dragAdds = !dragBase.contains(parent.items[path.item].id)
+        view.panGestureRecognizer.isEnabled = false
+        tapGate.suppressTap()
+        let link = CADisplayLink(target: self, selector: #selector(scrollDuringSelection))
+        link.add(to: .main, forMode: .common)
+        dragScrollLink = link
+        updateDragSelection()
+      case .changed: updateDragSelection()
+      case .ended, .cancelled, .failed: endDragSelection()
+      default: break
+      }
+    }
+
+    func updateDragSelection() {
+      guard let view, let start = dragStart,
+        let path = view.indexPathForItem(at: dragPoint), path.section == 1 else { return }
+      guard dragEnd != path.item else { return }
+      dragEnd = path.item
+      let result = MediaDragSelectionPolicy.selection(items: parent.items, baseline: dragBase,
+        start: start, end: path.item, adding: dragAdds)
+      tapGate.suppressTap()
+      if result != parent.selectedIDs { parent.onSelectionChange?(result) }
+    }
+
+    @objc func scrollDuringSelection(_ link: CADisplayLink) {
+      guard let view, dragStart != nil else { return }
+      let top = view.contentOffset.y + view.adjustedContentInset.top
+      let bottom = view.contentOffset.y + view.bounds.height - view.adjustedContentInset.bottom
+      let speed: CGFloat = dragPoint.y < top + 48 ? -240 : (dragPoint.y > bottom - 48 ? 240 : 0)
+      let minimum = -view.adjustedContentInset.top
+      let maximum = max(minimum, view.contentSize.height - view.bounds.height + view.adjustedContentInset.bottom)
+      let offset = min(max(view.contentOffset.y + speed * CGFloat(link.targetTimestamp - link.timestamp), minimum), maximum)
+      dragPoint.y += offset - view.contentOffset.y
+      view.contentOffset.y = offset
+      updateDragSelection()
+    }
+
+    func endDragSelection() {
+      dragScrollLink?.invalidate(); dragScrollLink = nil
+      if dragStart != nil { tapGate.suppressTap() }
+      dragStart = nil
+      dragEnd = nil
+      view?.panGestureRecognizer.isEnabled = true
     }
 
     @objc func refreshRequested() {
@@ -663,6 +815,12 @@ struct PhotoLibraryGrid<FolderCell: View, MediaCell: View, Footer: View>: UIView
     }
 
     func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+      if gestureRecognizer === selectionDrag {
+        guard parent.selectionMode, let view, !tapGate.hasMultipleTouches,
+          let path = view.indexPathForItem(at: gestureRecognizer.location(in: view)), path.section == 1,
+          path.item < parent.items.count else { return false }
+        return parent.items[path.item].isVideo
+      }
       guard !finishing, transition == nil, let view,
         let layout = view.collectionViewLayout as? PhotoGridLayout else { return false }
       let point = gestureRecognizer.location(in: view)
@@ -753,6 +911,15 @@ struct PhotoLibraryGrid<FolderCell: View, MediaCell: View, Footer: View>: UIView
       if finish { view.finishInteractiveTransition() }
       else { view.cancelInteractiveTransition() }
     }
+  }
+}
+
+/// In selection mode a held card belongs to the grid, not its hosted button.
+final class LibrarySelectionRecognizer: UILongPressGestureRecognizer {
+  override func canBePrevented(by other: UIGestureRecognizer) -> Bool {
+    if other is UIPinchGestureRecognizer { return true }
+    if let view, let otherView = other.view, otherView.isDescendant(of: view), otherView !== view { return false }
+    return super.canBePrevented(by: other)
   }
 }
 

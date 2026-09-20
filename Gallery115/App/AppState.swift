@@ -109,6 +109,8 @@ final class AppState {
   let api = APIClient()
   let thumbnailService = ThumbnailService()
   let libraryStore = LibraryStore()
+  var thumbnailReloadRevision = 0
+  @ObservationIgnored var folderSnapshots: [String: LibraryFolderSnapshot] = [:]
 
   private(set) var mediaSourceRevision = UUID()
   private(set) var mediaSourceKind: MediaSourceKind

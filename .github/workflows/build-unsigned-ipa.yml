@@ -6,6 +6,39 @@ on:
     branches: [ main ]
 
 jobs:
+  regression:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select latest Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Run cache and collection regression tests on iOS Simulator
+        run: |
+          set -euo pipefail
+          VALIDATION_DIR="$RUNNER_TEMP/CinevaCacheValidation"
+          mkdir -p "$VALIDATION_DIR"
+          cp Package.swift "$VALIDATION_DIR/"
+          cp -R Gallery115 Tests "$VALIDATION_DIR/"
+          DEVICE_ID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(d["udid"] for runtime, devices in data["devices"].items() if "iOS" in runtime for d in devices if "iPhone" in d["name"]))')
+          cd "$VALIDATION_DIR"
+          xcodebuild -scheme CinevaCacheValidation \
+            -destination "platform=iOS Simulator,id=$DEVICE_ID" \
+            -derivedDataPath "$RUNNER_TEMP/CinevaTestBuild" \
+            -resultBundlePath "$GITHUB_WORKSPACE/CacheRegression.xcresult" \
+            -test-timeouts-enabled YES \
+            -maximum-test-execution-time-allowance 90 test
+
+      - name: Upload regression results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CacheRegression-results
+          path: CacheRegression.xcresult
+          if-no-files-found: ignore
+
   build:
     runs-on: macos-latest
     steps:

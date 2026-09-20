@@ -1,5 +1,50 @@
 import Foundation
 
+struct LibraryFolderSnapshot {
+  let items: [CloudItem]
+  let nextOffset: Int
+  let hasMore: Bool
+}
+
+struct MediaScrollRequest: Equatable {
+  let id = UUID()
+  let itemID: String
+}
+
+struct PlaybackBufferRange: Equatable, Sendable {
+  let start: Double
+  let end: Double
+}
+
+enum PlaybackBufferPolicy {
+  static func normalized(_ ranges: [PlaybackBufferRange]) -> [PlaybackBufferRange] {
+    let sorted = ranges.filter { $0.start.isFinite && $0.end.isFinite && $0.end > max(0, $0.start) }
+      .sorted { $0.start < $1.start }
+    var result: [PlaybackBufferRange] = []
+    for range in sorted {
+      let start = max(0, range.start)
+      if let last = result.last, start <= last.end {
+        result[result.count - 1] = PlaybackBufferRange(start: last.start, end: max(last.end, range.end))
+      } else {
+        result.append(PlaybackBufferRange(start: start, end: range.end))
+      }
+    }
+    return result
+  }
+
+  static func contiguousEnd(at time: Double, ranges: [PlaybackBufferRange]) -> Double {
+    ranges.first { $0.start <= time && time < $0.end }?.end ?? time
+  }
+}
+
+enum MediaDragSelectionPolicy {
+  static func selection(items: [CloudItem], baseline: Set<String>, start: Int, end: Int, adding: Bool) -> Set<String> {
+    guard items.indices.contains(start), items.indices.contains(end) else { return baseline }
+    let ids = Set(items[min(start, end)...max(start, end)].filter(\.isVideo).map(\.id))
+    return adding ? baseline.union(ids) : baseline.subtracting(ids)
+  }
+}
+
 struct CloudItem: Codable, Hashable, Identifiable, Sendable {
   let id: String
   let parentID: String

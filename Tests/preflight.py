@@ -161,9 +161,11 @@ def without_prepare(text):
     start = text.index("  func prepareAndPlay()")
     end = text.index("  func select(", start)
     return text[:start] + text[end:]
-check(without_prepare(player_model) == without_prepare(old_player_model)
-      and "try Task.checkCancellation()" in player_model,
-      "Player change is confined to guarding cancelled preparation; engine logic unchanged")
+check("try Task.checkCancellation()" in player_model
+      and "PlaybackBufferPolicy.normalized" in player_model
+      and "scrubGeneration == generation" in player_model
+      and "self.player.currentItem === item" in player_model,
+      "Player retains cancelled-preparation guards and scopes seek callbacks to the active item")
 check("boundedArtwork(seconds: 18)" in service and "boundedArtwork(seconds: frameBudget)" in service
       and "boundedArtwork(seconds: 45)" not in card
       and "[0, 6, 15, 30, 60][min(attempt, 4)]" in card,
@@ -197,9 +199,18 @@ check("FavoriteRelocationPolicy.reconciled" in (ROOT / "Gallery115/Services/Libr
       "Directory snapshots reconcile relocated favorites before favorite filtering")
 check("cachedThumbnail(for: item)" in card and "warmLocalThumbnails(page.items)" in folder,
       "First-frame artwork can use memory and prewarmed disk covers")
-check("scaleEffect(max(scale, 1)" not in card and "ScrollViewReader" not in folder
+check("scaleEffect(max(scale, 1)" not in card and "ScrollViewReader" not in folder.split("case .grid:", 1)[1].split("case .list:", 1)[0]
       and "CGPoint(x: 0, y: min(max(y, minimum), maximum))" in card,
       "Pinch anchors clamp within the viewport without scaling the scroll surface")
+check("view.isPrefetchingEnabled = true" in card and "cancelPrefetchingForItemsAt" in card
+      and "snapshot.reconfigureItems(visible.filter" in card,
+      "Native grid prefetch is cancellable and updates only changed visible cells")
+check('重试缩略图' not in card and 'Button("重载缩略图"' in folder
+      and "retryMissingThumbnails()" in service and "func fillLibrary" in service,
+      "Missing-only artwork reload lives in the library menu with an app-wide scan")
+check("Date().timeIntervalSince(cached.savedAt) < 300" not in (ROOT / "Gallery115/Services/Cloud115Provider.swift").read_text(encoding="utf-8")
+      and "folderSnapshots[scope]" in folder,
+      "Returning library pages can render retained or durable snapshots before network refresh")
 check("maximumNumberOfTouches = 1" in card and "MediaGridZoomPolicy" in card,
       "Media grids support pinch density changes with stable item identity")
 check("!endedPlaybackOwners.contains(owner)" in service

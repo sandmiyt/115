@@ -62,6 +62,11 @@ actor APIClient {
     }
   }
 
+  func thumbnailLibraryPage(id: String, offset: Int) async throws -> ThumbnailLibraryPage {
+    let page = try await listFolderPage(id: id, offset: offset)
+    return ThumbnailLibraryPage(items: page.items, nextOffset: page.hasMore ? page.offset + page.limit : nil)
+  }
+
   func localMetadata(for item: CloudItem) async -> LocalMediaMetadata? {
     switch source {
     case .webDAV: return await webDAV.localMetadata(for: item)

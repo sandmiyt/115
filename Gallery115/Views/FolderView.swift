@@ -93,9 +93,22 @@ struct FolderView: View {
   @State private var selectedFolder: CloudItem?
   @State private var isSelecting = false
   @State private var selectedIDs = Set<String>()
+  @State private var scrollRequest: MediaScrollRequest?
+  @State private var searchLoadedAll = false
   @Namespace private var playerTransition
 
   var body: some View {
+    VStack(spacing: 0) {
+      if appState.isConfigured {
+        Picker("媒体类型", selection: $mediaFilter) {
+          ForEach(MediaFilter.allCases) { filter in Text(filter.title).tag(filter) }
+        }
+        .pickerStyle(.segmented)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(.bar)
+        .zIndex(1)
+      }
     Group {
       if !appState.isConfigured {
         unconfiguredState
@@ -119,6 +132,9 @@ struct FolderView: View {
         content
       }
     }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .clipped()
+    }
     .safeAreaInset(edge: .bottom) {
       if isSelecting {
         MediaSelectionBar(count: selectedIDs.count, onSelectAll: {
@@ -129,18 +145,22 @@ struct FolderView: View {
       }
     }
     .environment(\.artworkRefreshRevision, artworkRefreshRevision)
-    .onDisappear { refreshTask?.cancel(); refreshTask = nil }
+    .onDisappear {
+      saveFolderSnapshot()
+      refreshTask?.cancel(); refreshTask = nil
+    }
     .navigationTitle(title)
-    .navigationBarTitleDisplayMode(folderID == appState.rootFolderID ? .large : .inline)
+    .navigationBarTitleDisplayMode(.inline)
     .navigationDestination(item: $selectedFolder) { item in
       FolderView(folderID: item.id, title: item.name)
     }
     .navigationDestination(for: CloudItem.self) { item in
       FolderView(folderID: item.id, title: item.name)
     }
-    .searchable(text: $query, prompt: "搜索当前目录")
+    .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "搜索当前目录")
     .onChange(of: query) { _, _ in
       searchItems = nil
+      searchLoadedAll = false
       isSearching = !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
       rebuildDisplayItems()
     }
@@ -179,6 +199,14 @@ struct FolderView: View {
           }
 
           Divider()
+
+          Button("重载缩略图", systemImage: "photo.badge.arrow.down") {
+            Task {
+              await appState.thumbnailService.retryMissingThumbnails()
+              artworkRefreshRevision &+= 1
+              appState.thumbnailReloadRevision &+= 1
+            }
+          }
 
           Menu {
             Toggle("相册式方形网格", isOn: $compactGrid)
@@ -250,17 +278,6 @@ struct FolderView: View {
         .disabled(isRefreshing)
         .accessibilityLabel(isRefreshing ? "正在刷新资料库" : "刷新资料库")
         .accessibilityHint("重新读取新增或删除的媒体")
-      }
-    }
-    .safeAreaInset(edge: .top, spacing: 0) {
-      if appState.isConfigured {
-        Picker("媒体类型", selection: $mediaFilter) {
-          ForEach(MediaFilter.allCases) { filter in Text(filter.title).tag(filter) }
-        }
-        .pickerStyle(.segmented)
-        .padding(.horizontal, 16)
-        .padding(.vertical, 8)
-        .background(.bar)
       }
     }
     .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -340,12 +357,16 @@ struct FolderView: View {
       PhotoLibraryGrid(folders: displayedFolders, items: displayedMedia, columnCount: $mediaGridColumns,
                        folderColumns: safeGridColumns, compact: compactGrid,
                        resetKey: "\(appState.mediaSourceRevision)|\(folderID)|\(sortMode.rawValue)",
-                       onRefresh: { await refreshCurrentFolder() }) { item in
+                       onRefresh: { await refreshCurrentFolder() },
+                       scrollRequest: scrollRequest, selectionMode: isSelecting,
+                       selectedIDs: selectedIDs, onSelectionChange: { selectedIDs = $0 },
+                       contentRevision: query) { item in
         Button { selectedFolder = item } label: { FolderCard(item: item) }
           .buttonStyle(FolderCardButtonStyle()).disabled(isSelecting)
       } media: { item in
         VideoCard(item: item, transitionNamespace: playerTransition, compact: compactGrid,
-                  selectionMode: isSelecting, isSelected: selectedIDs.contains(item.id)) {
+                  selectionMode: isSelecting, isSelected: selectedIDs.contains(item.id),
+                  onLocate: query.isEmpty ? nil : { locate(item) }) {
           if isSelecting { toggleSelection(item); return }
           if item.isPhoto { selectedPhoto = item }
           else { selectedVideo = item }
@@ -355,6 +376,7 @@ struct FolderView: View {
       }
 
     case .list:
+      ScrollViewReader { proxy in
       List {
         ForEach(displayItems) { item in
           if item.isDirectory {
@@ -364,7 +386,7 @@ struct FolderView: View {
             .disabled(isSelecting)
           } else if item.isPhoto {
             Button { if !isSelecting { selectedPhoto = item } } label: {
-              PhotoListRow(item: item)
+              PhotoListRow(item: item, onLocate: query.isEmpty ? nil : { locate(item) })
                 .cinevaPlayerTransitionSource(id: item.id, in: playerTransition)
             }
             .buttonStyle(.plain)
@@ -384,6 +406,9 @@ struct FolderView: View {
             }
             .buttonStyle(.plain)
             .contextMenu {
+              if !query.isEmpty {
+                Button("定位到位置", systemImage: "location") { locate(item) }
+              }
               favoriteMenuButton(for: item)
             }
           }
@@ -395,6 +420,14 @@ struct FolderView: View {
       .listStyle(.plain)
       .scrollDismissesKeyboard(.interactively)
       .refreshable { await refreshCurrentFolder() }
+      .onChange(of: scrollRequest) { _, request in
+        guard let request else { return }
+        Task { @MainActor in
+          await Task.yield()
+          withAnimation { proxy.scrollTo(request.itemID, anchor: .center) }
+        }
+      }
+      }
     }
   }
 
@@ -556,6 +589,31 @@ struct FolderView: View {
     if !selectedIDs.insert(item.id).inserted { selectedIDs.remove(item.id) }
   }
 
+  private func locate(_ item: CloudItem) {
+    pagingRevision &+= 1
+    isLoadingMore = false
+    isRefreshing = false
+    refreshTask?.cancel()
+    if let searchItems {
+      items = CloudItemCollectionPolicy.ordered(searchItems, by: collectionSortOrder)
+      if searchLoadedAll { hasMore = false }
+    }
+    query = ""
+    searchItems = nil
+    isSearching = false
+    mediaFilter = item.isPhoto ? .photos : .all
+    rebuildDisplayItems()
+    rebuildPlaylistItems()
+    UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+    scrollRequest = MediaScrollRequest(itemID: item.id)
+  }
+
+  private func saveFolderSnapshot() {
+    guard let scope = loadedFolderScope, !items.isEmpty else { return }
+    if appState.folderSnapshots.count >= 12 { appState.folderSnapshots.removeAll() }
+    appState.folderSnapshots[scope] = LibraryFolderSnapshot(items: items, nextOffset: nextOffset, hasMore: hasMore)
+  }
+
   private func applySelectedFavorites(_ enabled: Bool) {
     let selected = displayItems.filter { selectedIDs.contains($0.id) && $0.isVideo }
     appState.libraryStore.setFavorites(selected, enabled: enabled)
@@ -645,6 +703,17 @@ struct FolderView: View {
     // SwiftUI restarts screen tasks on tab/navigation return. Do not truncate a
     // populated directory while its scroll position still points at a later page.
     if !forceRefresh, loadedFolderScope == scope, !items.isEmpty { return }
+    if !forceRefresh, let snapshot = appState.folderSnapshots[scope] {
+      items = snapshot.items
+      nextOffset = snapshot.nextOffset
+      hasMore = snapshot.hasMore
+      loadedFolderScope = scope
+      isInitialLoading = false
+      rebuildDisplayItems()
+      rebuildPlaylistItems()
+      await refreshFirstPageSilently()
+      return
+    }
     if loadedFolderScope != scope {
       isSelecting = false
       selectedIDs.removeAll()
@@ -672,8 +741,6 @@ struct FolderView: View {
         sortOrder: collectionSortOrder
       )
       guard revision == pagingRevision, !Task.isCancelled else { return }
-      await appState.thumbnailService.warmLocalThumbnails(page.items)
-      guard revision == pagingRevision, !Task.isCancelled else { return }
       loadedFolderScope = scope
       isInitialLoading = false
       items = CloudItemCollectionPolicy.ordered(page.items, by: collectionSortOrder)
@@ -683,6 +750,10 @@ struct FolderView: View {
       nextOffset = page.limit
       hasMore = page.hasMore
       errorMessage = nil
+      // Publish the directory before disk decoding; never hold the whole screen
+      // behind a thumbnail actor busy with another folder.
+      await appState.thumbnailService.warmLocalThumbnails(page.items)
+      guard revision == pagingRevision, !Task.isCancelled else { return }
       if page.servedFromCache {
         appState.markMediaUsingCache()
         transientMessage = forceRefresh ? "媒体服务器暂时不可用，已继续使用本地资料库缓存。" : nil
@@ -775,6 +846,7 @@ struct FolderView: View {
       guard !Task.isCancelled, revision == pagingRevision,
         trimmed == query.trimmingCharacters(in: .whitespacesAndNewlines) else { return }
       searchItems = CloudItemCollectionPolicy.ordered(all, by: collectionSortOrder)
+      searchLoadedAll = true
       rebuildDisplayItems()
     } catch {
       guard !Task.isCancelled, revision == pagingRevision,
@@ -906,6 +978,7 @@ private struct FolderListRow: View {
 private struct PhotoListRow: View {
   @Environment(AppState.self) private var appState
   let item: CloudItem
+  var onLocate: (() -> Void)? = nil
 
   var body: some View {
     HStack(spacing: 13) {
@@ -936,6 +1009,9 @@ private struct PhotoListRow: View {
     }
     .padding(.vertical, 4)
     .contextMenu {
+      if let onLocate {
+        Button("定位到位置", systemImage: "location", action: onLocate)
+      }
       let isFavorite = appState.libraryStore.isFavorite(item)
       Button {
         appState.libraryStore.toggleFavorite(item)

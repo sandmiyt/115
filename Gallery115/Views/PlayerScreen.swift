@@ -1750,13 +1750,10 @@ struct PlayerScreen: View {
         let width = max(proxy.size.width, 1)
         let duration = max(activeDuration, 1)
         let current = min(max(isScrubbing ? scrubValue : activeCurrentTime, 0), duration)
-        let buffered = min(max(activeBufferedUntil, 0), duration)
         let playedProgress = CGFloat(current / duration)
-        let bufferedProgress = CGFloat(buffered / duration)
         let trackInset: CGFloat = isScrubbing ? scrubTrackInset : 42
         let trackWidth = max(width - trackInset * 2, 1)
         let playedX = trackWidth * playedProgress
-        let bufferedX = trackWidth * bufferedProgress
         let trackHeight: CGFloat = isScrubbing ? 6 : 4
 
         ZStack(alignment: .leading) {
@@ -1765,11 +1762,15 @@ struct PlayerScreen: View {
             .frame(width: trackWidth, height: trackHeight)
             .offset(x: trackInset)
 
-          if !isScrubbing, !useVLC {
-            Capsule()
-              .fill(.white.opacity(0.48))
-              .frame(width: bufferedX, height: trackHeight)
-              .offset(x: trackInset)
+          if !useVLC {
+            ForEach(model?.bufferedRanges ?? [], id: \.start) { range in
+              let start = min(max(range.start / duration, 0), 1)
+              let end = min(max(range.end / duration, start), 1)
+              Capsule()
+                .fill(.white.opacity(0.48))
+                .frame(width: trackWidth * CGFloat(end - start), height: trackHeight)
+                .offset(x: trackInset + trackWidth * CGFloat(start))
+            }
           }
 
           Capsule()

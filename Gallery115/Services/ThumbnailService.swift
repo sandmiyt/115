@@ -4,6 +4,11 @@ import ImageIO
 import OSLog
 import UIKit
 
+struct ThumbnailLibraryPage: Sendable {
+  let items: [CloudItem]
+  let nextOffset: Int?
+}
+
 /// Local-first artwork; a small bounded pool fills visible rows while playback has priority.
 actor ThumbnailService {
   typealias Loader = @Sendable (CloudItem, APIClient) async -> UIImage?
@@ -35,6 +40,8 @@ actor ThumbnailService {
   private var playbackOwners: Set<UUID> = []
   private var endedPlaybackOwners: Set<UUID> = []
   private var cacheGeneration = UUID()
+  private var directoryWork: (id: UUID, task: Task<ThumbnailLibraryPage?, Never>)?
+  private var backgroundFailedUntil: [String: Date] = [:]
   private let maximumNetworkJobs = 3
   private let maximumFrameJobs = 2
   private let imageSession: URLSession = {
@@ -156,10 +163,76 @@ actor ThumbnailService {
     }
   }
 
+  /// One app-owned walk, independent of scrolling. Cached covers are inspected
+  /// without decoding them into the viewport's bounded memory cache.
+  func fillLibrary(rootID: String, api: APIClient) async {
+    let generation = cacheGeneration
+    var folders = [rootID]
+    var visited = Set([rootID])
+    var cursor = 0
+    while cursor < folders.count, !Task.isCancelled, generation == cacheGeneration {
+      let folder = folders[cursor]
+      cursor += 1
+      var offset = 0
+      while !Task.isCancelled, generation == cacheGeneration {
+        let workID = UUID()
+        guard await acquireSlot(workID, isPrefetch: true) else { return }
+        guard !Task.isCancelled, generation == cacheGeneration else {
+          releaseSlot(workID); return
+        }
+        let requestedOffset = offset
+        let task = Task { try? await api.thumbnailLibraryPage(id: folder, offset: requestedOffset) }
+        directoryWork = (workID, task)
+        let page = await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
+        if directoryWork?.id == workID { directoryWork = nil }
+        releaseSlot(workID)
+        guard !Task.isCancelled, generation == cacheGeneration else { return }
+        if task.isCancelled { continue } // Playback preempted this page; resume later.
+        guard let page else { break }
+        for item in page.items {
+          await Task.yield()
+          guard !Task.isCancelled, generation == cacheGeneration else { return }
+          if !playbackOwners.isEmpty {
+            let pauseID = UUID()
+            guard await acquireSlot(pauseID, isPrefetch: true) else { return }
+            releaseSlot(pauseID)
+            guard !Task.isCancelled, generation == cacheGeneration else { return }
+          }
+          if item.isDirectory {
+            if visited.insert(item.id).inserted { folders.append(item.id) }
+            continue
+          }
+          guard item.isVideo || item.isPhoto else { continue }
+          let identity = identity(for: item)
+          if cachedThumbnail(for: item) != nil { continue }
+          if let data = try? disk.read(identity),
+             let source = CGImageSourceCreateWithData(data as CFData, nil),
+             CGImageSourceGetCount(source) > 0 { continue }
+          if let until = backgroundFailedUntil[identity.key], until > Date() { continue }
+          if await thumbnail(for: item, api: api, isPrefetch: true) == nil, !Task.isCancelled {
+            backgroundFailedUntil[identity.key] = Date().addingTimeInterval(300)
+          }
+          // Let visible cards and user-initiated directory requests run first.
+          do { try await Task.sleep(for: .milliseconds(120)) } catch { return }
+        }
+        guard let next = page.nextOffset, next > offset else { break }
+        offset = next
+      }
+    }
+    backgroundFailedUntil = backgroundFailedUntil.filter { $0.value > Date() }
+  }
+
+  func retryMissingThumbnails() {
+    failedUntil.removeAll()
+    backgroundFailedUntil.removeAll()
+    frameAttempts.removeAll()
+  }
+
   func suspendNetwork(for owner: UUID) {
     guard !Task.isCancelled, !endedPlaybackOwners.contains(owner), playbackOwners.insert(owner).inserted else { return }
     for work in inFlight.values { work.task.cancel() }
     inFlight.removeAll()
+    directoryWork?.task.cancel()
   }
 
   func queuedRequestCounts() -> (visible: Int, prefetch: Int) {
@@ -185,6 +258,8 @@ actor ThumbnailService {
   @discardableResult
   func clearCache() -> Bool {
     cacheGeneration = UUID()
+    directoryWork?.task.cancel()
+    backgroundFailedUntil.removeAll()
     for work in inFlight.values { work.task.cancel() }
     inFlight.removeAll()
     failedUntil.removeAll()
@@ -203,6 +278,8 @@ actor ThumbnailService {
   /// A provider-specific namespace prevents the next source from reading it.
   func resetForSourceChange() {
     cacheGeneration = UUID()
+    directoryWork?.task.cancel()
+    backgroundFailedUntil.removeAll()
     for work in inFlight.values { work.task.cancel() }
     inFlight.removeAll()
     failedUntil.removeAll()
@@ -258,10 +335,9 @@ actor ThumbnailService {
     // Independent frame lanes cannot hold up ready image downloads.
     releaseSlot(workID)
     holdsNetworkSlot = false
-    if image == nil, item.isVideo, !item.isDiscImage,
-       !(inFlight[identity.key]?.isPrefetch ?? isPrefetch), (loader == nil || frameLoader != nil) {
+    if image == nil, item.isVideo, !item.isDiscImage, (loader == nil || frameLoader != nil) {
       guard !Task.isCancelled, generation == cacheGeneration,
-        await acquireSlot(workID, isPrefetch: false, isFrame: true) else { return nil }
+        await acquireSlot(workID, isPrefetch: inFlight[identity.key]?.isPrefetch ?? isPrefetch, isFrame: true) else { return nil }
       defer { releaseSlot(workID, isFrame: true) }
       guard !Task.isCancelled, generation == cacheGeneration else { return nil }
       let frameLoader = self.frameLoader
