@@ -51,6 +51,11 @@ jobs:
       - name: Install CocoaPods dependencies
         run: |
           set -euo pipefail
+          # Avoid a stalled IPv6 route and retry transient upstream connection
+          # errors as well as HTTP failures when downloading the VLC binary.
+          export CURL_HOME="$RUNNER_TEMP/cineva-curl"
+          mkdir -p "$CURL_HOME"
+          printf 'ipv4\nconnect-timeout = 20\nretry-all-errors\n' > "$CURL_HOME/.curlrc"
           pod install
 
       - name: Build iPhone app without signing

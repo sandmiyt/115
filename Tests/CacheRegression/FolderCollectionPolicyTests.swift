@@ -18,10 +18,13 @@ final class FolderCollectionPolicyTests: XCTestCase {
   }
 
   func testDragSelectionReversalRestoresBaselineAndSkipsPhotos() {
-    let items = (0..<5).map { index in
-      CloudItem(id: String(index), parentID: "root", name: String(index), isDirectory: false,
-        pickCode: "", sha1: "", size: 1, fileExtension: index == 2 ? "jpg" : "mp4",
-        isVideo: index != 2, duration: 0, thumbnailURLString: nil, modifiedAt: Date())
+    let items: [CloudItem] = (0..<5).map { (index: Int) -> CloudItem in
+      let id = String(index)
+      let isVideo = index != 2
+      let ext = isVideo ? "mp4" : "jpg"
+      return CloudItem(id: id, parentID: "root", name: id, isDirectory: false,
+        pickCode: "", sha1: "", size: 1, fileExtension: ext,
+        isVideo: isVideo, duration: 0, thumbnailURLString: nil, modifiedAt: Date())
     }
     let base: Set<String> = ["4"]
     XCTAssertEqual(MediaDragSelectionPolicy.selection(items: items, baseline: base, start: 0, end: 3, adding: true), ["0", "1", "3", "4"])
