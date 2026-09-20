@@ -25,6 +25,7 @@ let package = Package(
                 "Tests/CacheSupport.swift"],
       swiftSettings: [.define("CACHE_VALIDATION")]
     ),
-    .testTarget(name: "CacheRegression", dependencies: ["CinevaCacheValidation"], path: "Tests/CacheRegression"),
+    .testTarget(name: "CacheRegression", dependencies: ["CinevaCacheValidation"], path: "Tests/CacheRegression",
+                exclude: ["Fixtures/README.md"], resources: [.copy("Fixtures/near-start.mp4")]),
   ]
 )
