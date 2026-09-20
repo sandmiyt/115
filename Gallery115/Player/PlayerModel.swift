@@ -150,7 +150,6 @@ final class PlayerModel: PlaybackEngineControlling {
   private(set) var duration: Double = 0
   private(set) var bufferedUntil: Double = 0
   private(set) var bufferedRanges: [PlaybackBufferRange] = []
-  @ObservationIgnored private var scrubLoadingTask: Task<Void, Never>?
   private(set) var isPlaying = false
   private(set) var didReachEnd = false
   private(set) var isBuffering = false
@@ -211,7 +210,8 @@ final class PlayerModel: PlaybackEngineControlling {
   private var scrubChaseTime: CMTime = .invalid
   private var scrubFinalTarget: CMTime?
   private var scrubResumeAfterFinish = false
-  private var scrubLiveToleranceSeconds: Double = 0.10
+  @ObservationIgnored private var scrubDispatchTask: Task<Void, Never>?
+  private var scrubInFlightTarget: CMTime = .invalid
   private var scrubGeneration = 0
 
   init(
@@ -293,6 +293,7 @@ final class PlayerModel: PlaybackEngineControlling {
   }
 
   func pause() {
+    cancelInteractiveScrub()
     player.pause()
     isPlaying = false
     isBuffering = false
@@ -308,6 +309,7 @@ final class PlayerModel: PlaybackEngineControlling {
   }
 
   func replayFromStart() {
+    cancelInteractiveScrub()
     didReachEnd = false
     currentTime = 0
     bufferedUntil = max(bufferedUntil, 0)
@@ -328,158 +330,149 @@ final class PlayerModel: PlaybackEngineControlling {
   }
 
   func seek(to seconds: Double) {
+    cancelInteractiveScrub()
     let target = clampedSeekTarget(seconds)
     currentTime = target
     player.seek(to: CMTime(seconds: target, preferredTimescale: 600))
   }
 
-  /// Starts a photo-style interactive scrub and returns whether playback should
-  /// resume when the user's finger leaves the timeline. Pausing here prevents
-  /// playback progression from fighting the seek chase while the thumb moves.
+  /// Keep the existing player's cache/decoder. Live previews use its fast seek
+  /// path; only the release position needs near-frame accuracy.
   @discardableResult
   func beginInteractiveScrub() -> Bool {
-    scrubLoadingTask?.cancel()
+    let shouldResume = scrubResumeAfterFinish || isPlaying || player.timeControlStatus != .paused || player.rate > 0
+    cancelInteractiveScrub()
     interactiveScrubActive = true
     stallProbeTask?.cancel()
-    // Preserve the user's playback intent, not just AVPlayer's instantaneous
-    // timeControlStatus. A normally-playing network item can briefly report
-    // `.waitingToPlayAtSpecifiedRate` exactly when the finger lands.
-    let shouldResume = isPlaying || player.timeControlStatus != .paused || player.rate > 0
-    if shouldResume { player.pause() }
+    player.pause()
     isPlaying = false
     isBuffering = false
-    isInteractiveScrubLoading = false
-    scrubFinalTarget = nil
-    scrubResumeAfterFinish = false
-    scrubLiveToleranceSeconds = 0.08
-    scrubGeneration &+= 1
-    player.currentItem?.cancelPendingSeeks()
-    scrubSeekInProgress = false
-    scrubChaseTime = .invalid
+    scrubChaseTime = player.currentTime()
     return shouldResume
   }
 
-  /// Updates the visible video frame while the timeline is being dragged. Only
-  /// one AVPlayer seek is allowed to be in flight; fast finger motion simply
-  /// replaces the chase target. A small tolerance lets streamed media snap to a
-  /// nearby decodable sample instead of doing an expensive exact-frame decode
-  /// for every pixel of movement.
   func interactiveScrub(to seconds: Double) {
-    let target = clampedSeekTarget(seconds)
-    currentTime = target
-
-    // Adapt tolerance to finger speed in timeline-space. Large jumps should
-    // land on a nearby decodable frame immediately; fine movements tighten the
-    // tolerance so slow scrubbing still feels precise. The release pass below
-    // always performs a near-frame-accurate commit.
-    if scrubChaseTime.isValid {
-      let previous = scrubChaseTime.seconds
-      if previous.isFinite {
-        let delta = abs(target - previous)
-        switch delta {
-        case 12...: scrubLiveToleranceSeconds = 0.42
-        case 4..<12: scrubLiveToleranceSeconds = 0.24
-        case 1..<4: scrubLiveToleranceSeconds = 0.12
-        case 0.25..<1: scrubLiveToleranceSeconds = 0.065
-        default: scrubLiveToleranceSeconds = 0.035
-        }
-      }
-    } else {
-      scrubLiveToleranceSeconds = 0.08
-    }
-
-    scrubChaseTime = CMTime(seconds: target, preferredTimescale: 600)
-    scrubFinalTarget = nil
-    if !scrubSeekInProgress { performInteractiveScrubSeek() }
+    guard interactiveScrubActive, scrubFinalTarget == nil else { return }
+    let target = CMTime(seconds: clampedSeekTarget(seconds), preferredTimescale: 600)
+    currentTime = target.seconds
+    guard CMTimeCompare(scrubChaseTime, target) != 0 else { return }
+    scrubChaseTime = target
+    scheduleInteractiveScrubSeek()
   }
 
-  /// Commits the final scrub position with near-frame precision, then restores
-  /// the previous play/pause state only after that final seek has landed.
+  private func scheduleInteractiveScrubSeek(delay: Duration = .milliseconds(33)) {
+    guard !scrubSeekInProgress, scrubDispatchTask == nil else { return }
+    let generation = scrubGeneration
+    // Coalesce finger events and leave a display refresh between decoded frames.
+    // Never cancel/restart a decoder seek on every touch event (Apple QA1820).
+    scrubDispatchTask = Task { @MainActor [weak self] in
+      do { try await Task.sleep(for: delay) } catch { return }
+      guard let self, self.scrubGeneration == generation else { return }
+      self.scrubDispatchTask = nil
+      self.performInteractiveScrubSeek()
+    }
+  }
+
   func endInteractiveScrub(to seconds: Double, resumeAfter: Bool) {
-    let target = clampedSeekTarget(seconds)
-    currentTime = target
-    let time = CMTime(seconds: target, preferredTimescale: 600)
-    scrubChaseTime = time
-    scrubFinalTarget = time
+    let target = CMTime(seconds: clampedSeekTarget(seconds), preferredTimescale: 600)
+    currentTime = target.seconds
+    scrubChaseTime = target
+    scrubFinalTarget = target
     scrubResumeAfterFinish = resumeAfter
-    if !scrubSeekInProgress { performInteractiveScrubSeek() }
+    scrubDispatchTask?.cancel()
+    scrubDispatchTask = nil
+
+    if scrubSeekInProgress {
+      if CMTimeCompare(scrubInFlightTarget, target) == 0 {
+        // Let the matching preview finish; refine only if it lands too far away.
+        isInteractiveScrubLoading = true
+        return
+      }
+      // Once on release, abandon an obsolete network seek so it cannot hold up
+      // the committed target. Its completion must not restart the old chase.
+      scrubGeneration &+= 1
+      player.currentItem?.cancelPendingSeeks()
+      scrubSeekInProgress = false
+    } else if abs(player.currentTime().seconds - target.seconds) <= 0.12 {
+      finishInteractiveScrub()
+      return
+    }
+    performInteractiveScrubSeek()
   }
 
   private func performInteractiveScrubSeek() {
-    guard scrubChaseTime.isValid, let item = player.currentItem, item.status == .readyToPlay else {
-      scrubSeekInProgress = false
-      isInteractiveScrubLoading = false
-      interactiveScrubActive = false
-      scrubFinalTarget = nil
-      let shouldResume = scrubResumeAfterFinish
-      scrubResumeAfterFinish = false
-      if shouldResume {
-        // AVPlayer may still be preparing; playImmediately records the intent
-        // and playback begins as soon as the item can render again.
-        player.playImmediately(atRate: player.defaultRate)
-        isPlaying = true
-        isBuffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
+    guard interactiveScrubActive, scrubChaseTime.isValid else { return }
+    guard let item = player.currentItem else {
+      finishInteractiveScrub()
+      return
+    }
+    guard item.status == .readyToPlay else {
+      if item.status == .unknown {
+        scheduleInteractiveScrubSeek(delay: .milliseconds(100))
+      } else {
+        finishInteractiveScrub()
       }
       return
     }
-
     let target = scrubChaseTime
     let generation = scrubGeneration
-    let isFinalPass = scrubFinalTarget.map { CMTimeCompare($0, target) == 0 } ?? false
-    let toleranceSeconds = isFinalPass ? 0.10 : scrubLiveToleranceSeconds
-    let tolerance = CMTime(seconds: toleranceSeconds, preferredTimescale: 600)
+    let isFinalPass = scrubFinalTarget != nil
+    // Tiny tolerances force a GOP decode even for already-buffered data.
+    // AVPlayer's fast path finds a nearby decodable frame while dragging.
+    let tolerance = isFinalPass ? CMTime(seconds: 0.10, preferredTimescale: 600) : .positiveInfinity
     scrubSeekInProgress = true
-    scrubLoadingTask?.cancel()
-    scrubLoadingTask = Task { @MainActor [weak self] in
-      do { try await Task.sleep(for: .milliseconds(180)) } catch { return }
-      guard let self, self.scrubGeneration == generation, self.scrubSeekInProgress else { return }
-      self.isInteractiveScrubLoading = true
-    }
-
-    player.seek(
-      to: target,
-      toleranceBefore: tolerance,
-      toleranceAfter: tolerance
-    ) { [weak self] finished in
+    scrubInFlightTarget = target
+    isInteractiveScrubLoading = isFinalPass
+    player.seek(to: target, toleranceBefore: tolerance, toleranceAfter: tolerance) { [weak self] finished in
       Task { @MainActor in
         guard let self, self.scrubGeneration == generation, self.player.currentItem === item else { return }
-        self.scrubLoadingTask?.cancel()
-
-        // The finger moved while this seek was decoding. Skip all stale targets
-        // and immediately chase the newest one.
-        if CMTimeCompare(self.scrubChaseTime, target) != 0 {
-          self.performInteractiveScrubSeek()
-          return
-        }
-
-        // If the drag ended while a loose live seek to the same target was in
-        // flight, do one final tighter pass before resuming playback.
-        if let final = self.scrubFinalTarget,
-          CMTimeCompare(final, target) == 0,
-          finished, !isFinalPass,
-          abs(self.player.currentTime().seconds - final.seconds) > 0.12
-        {
-          self.performInteractiveScrubSeek()
-          return
-        }
-
         self.scrubSeekInProgress = false
-        self.isInteractiveScrubLoading = false
-        if let final = self.scrubFinalTarget, CMTimeCompare(final, target) == 0 {
-          self.scrubFinalTarget = nil
-          self.interactiveScrubActive = false
-          self.lastPlaybackProgressAt = Date()
-          self.lastPlaybackProgressTime = self.currentTime
-          let shouldResume = self.scrubResumeAfterFinish
-          self.scrubResumeAfterFinish = false
-          if shouldResume {
-            self.player.playImmediately(atRate: self.player.defaultRate)
-            self.isPlaying = true
-            self.isBuffering = self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate
+        if CMTimeCompare(self.scrubChaseTime, target) != 0 {
+          if self.scrubFinalTarget != nil { self.performInteractiveScrubSeek() }
+          else { self.scheduleInteractiveScrubSeek() }
+          return
+        }
+        if let final = self.scrubFinalTarget {
+          if finished, !isFinalPass, abs(self.player.currentTime().seconds - final.seconds) > 0.12 {
+            self.performInteractiveScrubSeek()
+          } else {
+            self.finishInteractiveScrub()
           }
+        } else {
+          self.isInteractiveScrubLoading = false
         }
       }
     }
+  }
+
+  private func finishInteractiveScrub() {
+    scrubSeekInProgress = false
+    scrubFinalTarget = nil
+    interactiveScrubActive = false
+    isInteractiveScrubLoading = false
+    let landed = player.currentTime().seconds
+    if landed.isFinite { currentTime = max(landed, 0) }
+    lastPlaybackProgressAt = Date()
+    lastPlaybackProgressTime = currentTime
+    let shouldResume = scrubResumeAfterFinish
+    scrubResumeAfterFinish = false
+    if shouldResume {
+      player.playImmediately(atRate: player.defaultRate)
+      isPlaying = true
+      isBuffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
+    }
+  }
+
+  private func cancelInteractiveScrub() {
+    scrubGeneration &+= 1
+    scrubDispatchTask?.cancel()
+    scrubDispatchTask = nil
+    if scrubSeekInProgress { player.currentItem?.cancelPendingSeeks() }
+    scrubSeekInProgress = false
+    scrubFinalTarget = nil
+    scrubResumeAfterFinish = false
+    interactiveScrubActive = false
+    isInteractiveScrubLoading = false
   }
 
   private func clampedSeekTarget(_ seconds: Double) -> Double {
@@ -546,10 +539,7 @@ final class PlayerModel: PlaybackEngineControlling {
   }
 
   private func play(_ source: VideoSource, allowFallback: Bool) async {
-    scrubLoadingTask?.cancel()
-    scrubGeneration &+= 1
-    scrubSeekInProgress = false
-    isInteractiveScrubLoading = false
+    cancelInteractiveScrub()
     bufferedRanges = []
     bufferedUntil = 0
     selectedSource = source
@@ -826,7 +816,7 @@ final class PlayerModel: PlaybackEngineControlling {
         if progressed {
           self.lastPlaybackProgressTime = seconds
           self.lastPlaybackProgressAt = now
-          if seconds > 0.15 {
+          if seconds > 0.15, !self.interactiveScrubActive {
             self.enableSteadyPlaybackModeIfNeeded()
           }
         }

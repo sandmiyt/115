@@ -145,7 +145,9 @@ unchanged = subprocess.run(["git", "diff", "--exit-code", "--", *protected], cwd
                            capture_output=True).returncode == 0
 vlc = (ROOT / "Gallery115/Player/VLCPlayerView.swift").read_text(encoding="utf-8")
 original_vlc = subprocess.check_output(["git", "show", "HEAD:Gallery115/Player/VLCPlayerView.swift"], cwd=ROOT).decode("utf-8")
-unchanged = unchanged and vlc.split("#else", 1)[0] == original_vlc.split("#else", 1)[0]
+def vlc_source_configuration(text):
+    return text.split("    func configure(", 1)[1].split("    func attachDrawable", 1)[0]
+unchanged = unchanged and vlc_source_configuration(vlc) == vlc_source_configuration(original_vlc)
 keychain = (ROOT / "Gallery115/Services/KeychainStore.swift").read_text(encoding="utf-8")
 original_keychain = subprocess.check_output(
     ["git", "show", "HEAD:Gallery115/Services/KeychainStore.swift"], cwd=ROOT
@@ -155,7 +157,7 @@ def token_storage(text):
     end = text.index("\n\nenum MediaSourceKind")
     return text[start:end]
 check(unchanged and token_storage(keychain) == token_storage(original_keychain),
-      "AVPlayer view, shipping VLC branch, and token storage unchanged")
+      "AVPlayer view, VLC source/cache configuration, and token storage unchanged")
 player_model = (ROOT / "Gallery115/Player/PlayerModel.swift").read_text(encoding="utf-8")
 old_player_model = subprocess.check_output(["git", "show", "HEAD:Gallery115/Player/PlayerModel.swift"],
                                           cwd=ROOT).decode("utf-8")

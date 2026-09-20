@@ -92,3 +92,19 @@ Windows 源码预检与 git diff --check 通过；这不等于 Xcode 编译或�
 真机重点检查：离开资料库超过 5 分钟后返回、下拉搜索区域、快速来回滚动、搜索定位到后续分页、拖选及边缘滚动、双指缩放、后台补图时起播、拖到实际缓存区间/空洞、AVPlayer/VLC/画中画。网络缓存并不保证任意帧可瞬时解码，实际首帧和拖动耗时仍需同源同网对比。
 
 参考：Apple [预取接口](https://developer.apple.com/documentation/uikit/uicollectionviewdatasourceprefetching)、[不连续缓冲区间](https://developer.apple.com/documentation/avfoundation/avplayeritem/loadedtimeranges)。
+
+
+## 2026-09-20 拖动预览和构建任务（2.2.4 / 28）
+
+- 按要求移除 GitHub `regression` 作业及其结果上传；推送仅构建完整 VLC IPA。保留已有测试源码，便于本地按需执行。
+- AVPlayer 拖动时使用快速邻近关键帧定位，合并手势事件、每次只保留一个执行中的 seek；完成后留出一帧显示时间。松手后才按 0.1 秒容差精确定位，已落点直接恢复，过期请求仅在松手时取消一次。
+- 暂停、退出、换源会取消未执行的拖动任务，旧回调不能抢回播放或跳回旧位置。准备中的项目等到 ready 再执行最新拖动目标。
+- 拖动期间保留视频画面，移除 180ms 人工加载提示；松手后实际等待持续 350ms 才显示加载圈。
+- VLC 将 20 次/秒的触点触发改为最多 8 次/秒的最新目标合并，并补交最后一次移动；移除松手固定转圈和相同目标的重复提交。
+- 不新增 AVAssetImageGenerator 抽帧下载、第二个播放器、额外解码器或全片预取。原有播放码率、HDR、音频、网络缓存参数保持不变。
+
+Windows 只能进行源码预检；最终类型检查以完整 Xcode Release 构建为准。这里的快速预览是播放器显示邻近可解码帧，并非保证网络视频逐帧实时预览。已缓冲的时间段也可能需要关键帧解码，跨出缓冲区仍需网络请求。
+
+真机检查：同一视频在已缓冲段慢拖、快速来回拖、连续多次拖动、未缓冲段松手、暂停时拖动、拖动后立即退出/换源；确认画面有更新、最终时间正确、暂停状态不被恢复、加载圈只在实际等待时出现。分别检查系统播放器与 VLC。
+
+依据：[Apple seek 容差与解码延迟](https://developer.apple.com/documentation/avfoundation/avplayer/seek(to:tolerancebefore:toleranceafter:))、[Apple QA1820 合并拖动定位](https://developer.apple.com/library/archive/qa/qa1820/_index.html)。

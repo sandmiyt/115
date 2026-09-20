@@ -52,6 +52,7 @@ struct PlayerScreen: View {
   @State private var scrubStartValue: Double = 0
   @State private var isScrubbing = false
   @State private var scrubWasPlaying = false
+  @State private var showPlaybackLoading = false
   @State private var isGestureInteracting = false
   @State private var isControlsInteractionActive = false
   @State private var gestureStartBrightness: CGFloat?
@@ -170,7 +171,7 @@ struct PlayerScreen: View {
             .zIndex(15)
         }
 
-        if (activeIsBuffering || activeIsScrubLoading), !isDismissMotionActive {
+        if showPlaybackLoading, wantsPlaybackLoading, !isDismissMotionActive {
           ProgressView()
             .controlSize(activeIsScrubLoading ? .regular : .large)
             .tint(.white)
@@ -320,6 +321,13 @@ struct PlayerScreen: View {
     playerPresentationView
     .task(id: currentItem.id) {
       await prepareCurrentItem()
+    }
+    .task(id: wantsPlaybackLoading) {
+      showPlaybackLoading = false
+      guard wantsPlaybackLoading else { return }
+      do { try await Task.sleep(for: .milliseconds(350)) } catch { return }
+      guard !Task.isCancelled, wantsPlaybackLoading else { return }
+      showPlaybackLoading = true
     }
     .onChange(of: model?.requiresVLC ?? false) { _, requiresVLC in
       guard requiresVLC, !useVLC, let model else { return }
@@ -2242,6 +2250,10 @@ struct PlayerScreen: View {
 
   private var activeIsBuffering: Bool {
     useVLC ? vlcController.isBuffering : (model?.isBuffering ?? false)
+  }
+
+  private var wantsPlaybackLoading: Bool {
+    !isScrubbing && (activeIsBuffering || activeIsScrubLoading)
   }
 
   private var activeIsScrubLoading: Bool {

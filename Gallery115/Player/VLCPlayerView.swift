@@ -31,6 +31,9 @@ import SwiftUI
     private var playbackGeneration = UUID()
     private var lastInteractiveSeekAt: TimeInterval = 0
     private var pendingInteractiveSeek: Double?
+    private var interactiveScrubActive = false
+    private var lastAppliedScrubTarget: Double?
+    @ObservationIgnored private var interactiveSeekTask: Task<Void, Never>?
 
     func configure(
       source: VideoSource,
@@ -100,6 +103,7 @@ import SwiftUI
     }
 
     func pause() {
+      cancelInteractiveScrub()
       player.pause()
       isPlaying = false
       isBuffering = false
@@ -117,6 +121,7 @@ import SwiftUI
     }
 
     func seek(to seconds: Double) {
+      cancelInteractiveScrub()
       let target = clampedSeekTarget(seconds)
       currentTime = target
       applySeek(target)
@@ -125,48 +130,59 @@ import SwiftUI
     @discardableResult
     func beginInteractiveScrub() -> Bool {
       let shouldResume = isPlaying || player.state == .playing || player.state == .buffering
-      if shouldResume {
-        player.pause()
-        isPlaying = false
-        isBuffering = false
-      }
-      pendingInteractiveSeek = nil
+      cancelInteractiveScrub()
+      interactiveScrubActive = true
+      player.pause()
+      isPlaying = false
+      isBuffering = false
       lastInteractiveSeekAt = 0
-      isInteractiveScrubLoading = false
+      lastAppliedScrubTarget = nil
       return shouldResume
     }
 
-    /// MobileVLCKit has no seek-completion callback equivalent to AVPlayer's,
-    /// so cap decoder jumps to ~20 fps while still updating the timeline value
-    /// every finger event. This avoids queueing dozens of expensive VLC seeks.
+    /// VLC has no seek-completion callback. Use a trailing, latest-target task
+    /// capped at 8 fps so a touch burst cannot continually restart the decoder.
     func interactiveScrub(to seconds: Double) {
+      guard interactiveScrubActive else { return }
       let target = clampedSeekTarget(seconds)
       currentTime = target
       pendingInteractiveSeek = target
-      let now = ProcessInfo.processInfo.systemUptime
-      guard now - lastInteractiveSeekAt >= 0.05 else { return }
-      lastInteractiveSeekAt = now
-      pendingInteractiveSeek = nil
-      applySeek(target)
+      guard interactiveSeekTask == nil else { return }
+      let generation = playbackGeneration
+      let delay = max(0.125 - (ProcessInfo.processInfo.systemUptime - lastInteractiveSeekAt), 0)
+      interactiveSeekTask = Task { @MainActor [weak self] in
+        do { try await Task.sleep(for: .seconds(delay)) } catch { return }
+        guard let self, self.playbackGeneration == generation, self.interactiveScrubActive else { return }
+        self.interactiveSeekTask = nil
+        guard let latest = self.pendingInteractiveSeek else { return }
+        self.pendingInteractiveSeek = nil
+        guard self.lastAppliedScrubTarget != latest else { return }
+        self.lastInteractiveSeekAt = ProcessInfo.processInfo.systemUptime
+        self.lastAppliedScrubTarget = latest
+        self.applySeek(latest)
+      }
     }
 
     func endInteractiveScrub(to seconds: Double, resumeAfter: Bool) {
       let target = clampedSeekTarget(seconds)
+      let alreadyRequested = lastAppliedScrubTarget == target
+      cancelInteractiveScrub()
       currentTime = target
-      pendingInteractiveSeek = nil
-      isInteractiveScrubLoading = true
-      applySeek(target)
-      // MobileVLCKit does not expose an AVPlayer-style seek completion. Resume
-      // immediately if playback was active before scrubbing, then let polling
-      // clear the loading indicator once VLC reports a stable playing/paused state.
+      if !alreadyRequested { applySeek(target) }
+      // Do not manufacture a 180 ms loading flash on every release. The screen
+      // debounces actual buffering; a cached seek needs no loading overlay.
       if resumeAfter {
         player.play()
         isPlaying = true
       }
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
-        guard let self else { return }
-        self.isInteractiveScrubLoading = false
-      }
+    }
+
+    private func cancelInteractiveScrub() {
+      interactiveSeekTask?.cancel()
+      interactiveSeekTask = nil
+      pendingInteractiveSeek = nil
+      interactiveScrubActive = false
+      isInteractiveScrubLoading = false
     }
 
     private func clampedSeekTarget(_ seconds: Double) -> Double {
@@ -203,6 +219,7 @@ import SwiftUI
     func replayFromStart() { replay() }
 
     func stop(saveProgress: Bool = true) {
+      cancelInteractiveScrub()
       if saveProgress { self.saveProgress(force: true) }
       // Invalidate delayed work (for example resume seeking) from the previous
       // media item before the controller is reused for another episode.
@@ -229,15 +246,17 @@ import SwiftUI
     private func poll() {
       let state = player.state
       let milliseconds = max(player.time.intValue, 0)
-      currentTime = Double(milliseconds) / 1000
-      maxObservedTime = max(maxObservedTime, currentTime)
+      if !interactiveScrubActive {
+        currentTime = Double(milliseconds) / 1000
+        maxObservedTime = max(maxObservedTime, currentTime)
+      }
 
       if let mediaLength = player.media?.length.intValue, mediaLength > 0 {
         duration = Double(mediaLength) / 1000
       }
 
-      isPlaying = state == .playing
-      isBuffering = state == .opening
+      isPlaying = !interactiveScrubActive && state == .playing
+      isBuffering = !interactiveScrubActive && state == .opening
       if let audio = player.audio {
         volume = Float(audio.volume) / 100
       }
@@ -258,7 +277,7 @@ import SwiftUI
     }
 
     private func saveProgress(force: Bool) {
-      guard let item, let libraryStore else { return }
+      guard !interactiveScrubActive, let item, let libraryStore else { return }
       let second = max(0, Int(currentTime.rounded(.down)))
       if force || second >= lastSavedSecond + 5 {
         lastSavedSecond = second
