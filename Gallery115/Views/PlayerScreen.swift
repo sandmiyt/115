@@ -1763,7 +1763,7 @@ struct PlayerScreen: View {
             .offset(x: trackInset)
 
           if !useVLC {
-            ForEach(model?.bufferedRanges ?? [], id: \.start) { range in
+            ForEach(model.bufferedRanges, id: \.start) { range in
               let start = min(max(range.start / duration, 0), 1)
               let end = min(max(range.end / duration, start), 1)
               Capsule()

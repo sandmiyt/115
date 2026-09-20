@@ -634,7 +634,7 @@ struct PhotoLibraryGrid<FolderCell: View, MediaCell: View, Footer: View>: UIView
       pinch.cancelsTouchesInView = true
       view.addGestureRecognizer(pinch)
       selectionDrag.minimumPressDuration = 0.25
-      selectionDrag.maximumNumberOfTouches = 1
+      selectionDrag.numberOfTouchesRequired = 1
       selectionDrag.delegate = self
       selectionDrag.isEnabled = parent.selectionMode
       view.addGestureRecognizer(selectionDrag)

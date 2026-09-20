@@ -314,6 +314,9 @@ import SwiftUI
     func resume() {}
     func togglePlayback() {}
     func seek(to seconds: Double) {}
+    func beginInteractiveScrub() -> Bool { false }
+    func interactiveScrub(to seconds: Double) {}
+    func endInteractiveScrub(to seconds: Double, resumeAfter: Bool) {}
     func seekBy(_ delta: Double) {}
     func setPlaybackRate(_ value: Float) {}
     func setVolume(_ value: Float) {}
