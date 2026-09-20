@@ -51,12 +51,23 @@ jobs:
 
   build:
     runs-on: macos-latest
+    env:
+      # The VideoLAN binary host can be unreachable from hosted runners.
+      # Use the same version repackaged on GitHub, with a pinned SHA-256.
+      CINEVA_VLC_MIRROR: github
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Select latest Xcode
         run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Restore CocoaPods download cache
+        id: pods-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/Library/Caches/CocoaPods
+          key: ${{ runner.os }}-vlc-3.7.3-${{ hashFiles('Podfile', 'Dependencies/MobileVLCKit.podspec.json') }}
 
       - name: Install CocoaPods dependencies
         run: |
@@ -67,6 +78,13 @@ jobs:
           mkdir -p "$CURL_HOME"
           printf 'ipv4\nconnect-timeout = 20\nretry-all-errors\n' > "$CURL_HOME/.curlrc"
           pod install
+
+      - name: Save verified CocoaPods download cache
+        if: steps.pods-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/Library/Caches/CocoaPods
+          key: ${{ steps.pods-cache.outputs.cache-primary-key }}
 
       - name: Build iPhone app without signing
         run: |

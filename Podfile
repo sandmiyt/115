@@ -4,5 +4,9 @@ use_frameworks!
 target 'Gallery115' do
   # Required fallback engine for MKV / AVI / TS / WebM / ISO and originals
   # that AVPlayer cannot decode directly.
-  pod 'MobileVLCKit', '~> 3.3'
+  if ENV['CINEVA_VLC_MIRROR'] == 'github'
+    pod 'MobileVLCKit', :podspec => 'Dependencies/MobileVLCKit.podspec.json'
+  else
+    pod 'MobileVLCKit', '3.7.3'
+  end
 end
