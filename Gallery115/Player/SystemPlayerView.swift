@@ -101,6 +101,12 @@ final class SystemPlayerPresentationController: NSObject, AVPictureInPictureCont
     return UIImage(cgImage: cgImage)
   }
 
+  func cacheDisplayedFrame(in previews: TimelinePreviewController, at seconds: Double) {
+    guard previews.shouldCapture(at: seconds),
+      let buffer = attachedLayer?.displayedPixelBuffer() else { return }
+    previews.capture(buffer, at: seconds)
+  }
+
   func pictureInPictureControllerDidStartPictureInPicture(
     _ pictureInPictureController: AVPictureInPictureController
   ) {
@@ -118,6 +124,255 @@ final class SystemPlayerPresentationController: NSObject, AVPictureInPictureCont
     failedToStartPictureInPictureWithError error: Error
   ) {
     isPictureInPictureActive = false
+  }
+}
+
+/// Preview decoding never seeks the primary player. Cached frames are looked up
+/// synchronously on touch; only a cache miss starts a single coalesced request.
+@MainActor
+@Observable
+final class TimelinePreviewController {
+  private(set) var image: UIImage?
+  private(set) var imageTime: Double = 0
+  private(set) var isActive = false
+  @ObservationIgnored private var frames: [Int: Frame] = [:]
+  @ObservationIgnored private var order: [Int] = []
+  @ObservationIgnored private var cacheBytes = 0
+  @ObservationIgnored private var generator: AVAssetImageGenerator?
+  @ObservationIgnored private var fallbackGenerator: AVAssetImageGenerator?
+  @ObservationIgnored private var sourceIdentity: String?
+  @ObservationIgnored private var generation = 0
+  @ObservationIgnored private var requestedTime: Double = 0
+  @ObservationIgnored private var requestTask: Task<Void, Never>?
+  @ObservationIgnored private var warmRequest = false
+  @ObservationIgnored private var allowsWarmup = false
+  @ObservationIgnored private var warmSlot = 0
+  @ObservationIgnored private var lastWarmAt = Date.distantPast
+  @ObservationIgnored private var captureInProgress = false
+  @ObservationIgnored private var lastCaptureTime = -Double.infinity
+  @ObservationIgnored private var warmFailures = 0
+
+  private struct Frame {
+    let image: UIImage
+    let time: Double
+    let bytes: Int
+  }
+
+  func configure(asset: AVAsset, identity: String, allowsWarmup: Bool, fallbackAsset: AVAsset? = nil) {
+    guard sourceIdentity != identity else { return }
+    cancelRequest()
+    sourceIdentity = identity
+    self.allowsWarmup = allowsWarmup
+    warmFailures = 0
+    generator = makeGenerator(asset: asset)
+    fallbackGenerator = fallbackAsset.map { makeGenerator(asset: $0) }
+  }
+
+  private func makeGenerator(asset: AVAsset) -> AVAssetImageGenerator {
+    let generator = AVAssetImageGenerator(asset: asset)
+    generator.appliesPreferredTrackTransform = true
+    generator.maximumSize = CGSize(width: 480, height: 480)
+    generator.requestedTimeToleranceBefore = CMTime(seconds: 0.5, preferredTimescale: 600)
+    generator.requestedTimeToleranceAfter = CMTime(seconds: 0.5, preferredTimescale: 600)
+    return generator
+  }
+
+  func reset() {
+    end()
+    generator = nil
+    fallbackGenerator = nil
+    sourceIdentity = nil
+    frames.removeAll()
+    order.removeAll()
+    cacheBytes = 0
+    warmSlot = 0
+    lastWarmAt = .distantPast
+    lastCaptureTime = -Double.infinity
+  }
+
+  func begin(at seconds: Double) {
+    cancelRequest()
+    isActive = true
+    show(at: seconds)
+  }
+
+  func show(at seconds: Double) {
+    guard isActive, seconds.isFinite else { return }
+    requestedTime = max(seconds, 0)
+    let frame = nearest(to: requestedTime)
+    // A sparse storyboard is explicitly labelled with its actual timestamp.
+    // Never hold a completely unrelated frame while waiting on a remote miss.
+    image = frame?.image
+    imageTime = frame?.time ?? requestedTime
+    if let frame, abs(frame.time - requestedTime) <= 0.5 { return }
+    guard requestTask == nil else { return }
+    requestFrame(warming: false)
+  }
+
+  func end(keepImageUntilSeekCompletes: Bool = false) {
+    cancelRequest()
+    if !keepImageUntilSeekCompletes {
+      isActive = false
+      image = nil
+    }
+  }
+
+  private func nearest(to seconds: Double) -> Frame? {
+    guard let frame = frames.values.min(by: { abs($0.time - seconds) < abs($1.time - seconds) }),
+      abs(frame.time - seconds) <= 30 else { return nil }
+    return frame
+  }
+
+  private func store(_ image: UIImage, at seconds: Double) {
+    guard seconds.isFinite, let cgImage = image.cgImage else { return }
+    let key = Int((seconds * 2).rounded())
+    let bytes = cgImage.bytesPerRow * cgImage.height
+    if let old = frames[key] { cacheBytes -= old.bytes }
+    order.removeAll { $0 == key }
+    frames[key] = Frame(image: image, time: seconds, bytes: bytes)
+    order.append(key)
+    cacheBytes += bytes
+    while cacheBytes > 32 * 1_024 * 1_024 || order.count > 160 {
+      let removed = order.removeFirst()
+      if let frame = frames.removeValue(forKey: removed) { cacheBytes -= frame.bytes }
+    }
+  }
+
+  func shouldCapture(at seconds: Double) -> Bool {
+    !isActive && !captureInProgress && seconds.isFinite && abs(seconds - lastCaptureTime) >= 0.5
+      && ProcessInfo.processInfo.thermalState == .nominal
+      && !ProcessInfo.processInfo.isLowPowerModeEnabled
+  }
+
+  func capture(_ buffer: CVPixelBuffer, at seconds: Double) {
+    guard shouldCapture(at: seconds) else { return }
+    captureInProgress = true
+    lastCaptureTime = seconds
+    let token = sourceIdentity
+    // Reuse an already decoded frame. No second video download, and no image
+    // conversion on the main thread. At most one conversion can be in flight.
+    Task { @MainActor [weak self] in
+      let cgImage = await Task.detached(priority: .utility) {
+        let input = CIImage(cvPixelBuffer: buffer)
+        let longestSide = max(input.extent.width, input.extent.height)
+        guard longestSide > 0 else { return Optional<CGImage>.none }
+        let scale = min(480 / longestSide, 1)
+        let small = input.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        return PreviewFrameRenderer.context.createCGImage(small, from: small.extent)
+      }.value
+      guard let self else { return }
+      self.captureInProgress = false
+      guard self.sourceIdentity == token, let cgImage else { return }
+      self.store(UIImage(cgImage: cgImage), at: seconds)
+    }
+  }
+
+  func maintain(duration: Double, mayWarm: Bool) {
+    guard !isActive else { return }
+    let permitted = mayWarm && allowsWarmup && duration > 0
+      && ProcessInfo.processInfo.thermalState == .nominal
+      && !ProcessInfo.processInfo.isLowPowerModeEnabled
+    if !permitted {
+      if warmRequest { cancelRequest() }
+      return
+    }
+    guard warmSlot < 48, warmFailures < 2, requestTask == nil,
+      Date().timeIntervalSince(lastWarmAt) >= 8 else { return }
+    // A small, bounded storyboard on a low-resolution source only. Playback
+    // takes priority; maintain() cancels it as soon as the runway drops.
+    requestedTime = min(duration * (Double(warmSlot) + 0.5) / 48, max(duration - 0.1, 0))
+    warmSlot += 1
+    lastWarmAt = Date()
+    requestFrame(warming: true)
+  }
+
+  private func cancelRequest() {
+    generation &+= 1
+    requestTask?.cancel()
+    requestTask = nil
+    generator?.cancelAllCGImageGeneration()
+    warmRequest = false
+  }
+
+  private func requestFrame(warming: Bool) {
+    guard let generator else { return }
+    warmRequest = warming
+    let generation = self.generation
+    requestTask = Task { @MainActor [weak self] in
+      // Coalesce touch events without ever queuing multiple image decoders.
+      do { try await Task.sleep(for: .milliseconds(warming ? 0 : 35)) } catch { return }
+      guard let self, self.generation == generation else { return }
+      let target = self.requestedTime
+      let timeout = Task { @MainActor in
+        do { try await Task.sleep(for: .milliseconds(warming ? 1000 : 1500)) } catch { return }
+        generator.cancelAllCGImageGeneration()
+      }
+      let result = try? await generator.image(at: CMTime(seconds: target, preferredTimescale: 600))
+      timeout.cancel()
+      guard self.generation == generation, !Task.isCancelled else { return }
+      self.requestTask = nil
+      self.warmRequest = false
+      if let result {
+        self.store(UIImage(cgImage: result.image), at: result.actualTime.seconds)
+      } else if warming {
+        self.warmFailures += 1
+      } else if let fallback = self.fallbackGenerator {
+        // Some HLS streams have no usable image/I-frame track. Fall back once
+        // to on-demand extraction from the original, only while playback is paused.
+        self.generator = fallback
+        self.fallbackGenerator = nil
+        self.allowsWarmup = false
+        self.requestFrame(warming: false)
+        return
+      }
+      if !warming, self.isActive {
+        let frame = self.nearest(to: self.requestedTime)
+        self.image = frame?.image
+        self.imageTime = frame?.time ?? self.requestedTime
+        // Finish the newest request, never an obsolete queue of finger positions.
+        if abs(self.requestedTime - target) > 0.5 { self.requestFrame(warming: false) }
+      }
+    }
+  }
+}
+
+private enum PreviewFrameRenderer {
+  static let context = CIContext(options: [.cacheIntermediates: false])
+}
+
+struct TimelinePreviewOverlay: View {
+  let previews: TimelinePreviewController
+  let layout: PlayerVideoLayout
+
+  var body: some View {
+    if previews.isActive, let image = previews.image {
+      Image(uiImage: image)
+        .resizable()
+        .aspectRatio(contentMode: layout == .fit ? .fit : .fill)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(.black)
+        .clipped()
+        .overlay(alignment: .topLeading) {
+          let seconds = max(Int(previews.imageTime), 0)
+          Text(String(format: "预览 %02d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60))
+            .font(.caption.monospacedDigit())
+            .padding(6)
+            .background(.black.opacity(0.55), in: Capsule())
+            .padding(12)
+        }
+        .allowsHitTesting(false)
+        .transaction { $0.animation = nil }
+    } else if previews.isActive {
+      VStack {
+        Spacer()
+        Text("正在读取预览…")
+          .font(.caption)
+          .padding(8)
+          .background(.black.opacity(0.55), in: Capsule())
+        Spacer().frame(height: 100)
+      }
+      .allowsHitTesting(false)
+    }
   }
 }
 

@@ -343,6 +343,9 @@ struct PlayerScreen: View {
     }
     .onChange(of: activeCurrentTime) { _, _ in
       updateRemotePlaybackInfo()
+      if !useVLC, !isScrubbing, activeIsPlaying, let model {
+        systemPresentationController.cacheDisplayedFrame(in: model.timelinePreview, at: activeCurrentTime)
+      }
     }
     .onChange(of: activeIsPlaying) { _, playing in
       updateRemotePlaybackInfo()
@@ -406,6 +409,7 @@ struct PlayerScreen: View {
           presentationController: systemPresentationController,
           videoLayout: videoLayout
         )
+        .overlay { TimelinePreviewOverlay(previews: model.timelinePreview, layout: videoLayout) }
       }
     } else {
       ZStack {
@@ -1826,9 +1830,8 @@ struct PlayerScreen: View {
               let delta = Double(value.translation.width / width) * duration
               scrubValue = min(max(startValue + delta, 0), duration)
 
-              // The timeline value follows the finger immediately, while the
-              // decoder uses a coalesced chase seek so stale intermediate
-              // positions never build up behind the user's gesture.
+              // Cached previews follow the finger; AVPlayer commits a single
+              // seek on release instead of restarting its network read here.
               if useVLC {
                 vlcController.interactiveScrub(to: scrubValue)
               } else {

@@ -17,6 +17,15 @@ struct PlaybackBufferRange: Equatable, Sendable {
 }
 
 enum PlaybackBufferPolicy {
+  /// A compressed-data estimate, not a hard AVFoundation memory limit.
+  /// Keep a longer runway on bursty connections without requesting minutes of
+  /// a very high bitrate original. Decoded frames are managed by AVFoundation.
+  static func forwardDuration(bitrate: Double, stalls: Int, rate: Double) -> Double {
+    let desired = min(90, 30 + Double(min(max(stalls, 0), 3)) * 20) * max(rate, 1)
+    let budgetSeconds = bitrate.isFinite && bitrate > 0 ? 64 * 1_048_576 * 8 / bitrate : 60
+    return min(desired, max(8, budgetSeconds))
+  }
+
   static func normalized(_ ranges: [PlaybackBufferRange]) -> [PlaybackBufferRange] {
     let sorted = ranges.filter { $0.start.isFinite && $0.end.isFinite && $0.end > max(0, $0.start) }
       .sorted { $0.start < $1.start }

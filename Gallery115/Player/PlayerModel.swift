@@ -175,6 +175,7 @@ final class PlayerModel: PlaybackEngineControlling {
   var allowsAutomaticEngineSwitch = true
 
   let player = AVPlayer()
+  let timelinePreview = TimelinePreviewController()
   var volume: Float { player.volume }
 
   private let item: CloudItem
@@ -185,7 +186,6 @@ final class PlayerModel: PlaybackEngineControlling {
   private let fastStartEnabled: Bool
   private let networkAutoRecoveryEnabled: Bool
   private var activeAsset: AVURLAsset?
-  private var previewCache: [Int: UIImage] = [:]
   private var mediaInfoGeneration = UUID()
   private var audioGroup: AVMediaSelectionGroup?
   private var subtitleGroup: AVMediaSelectionGroup?
@@ -210,13 +210,13 @@ final class PlayerModel: PlaybackEngineControlling {
   private var bufferingStartedAt: Date?
   private var countedCurrentStall = false
   private var sustainedStalls: [Date] = []
+  private var bufferStallCount = 0
+  private var preferredBufferSeconds: Double = 0
   private var interactiveScrubActive = false
   private var stallProbeTask: Task<Void, Never>?
 
-  // Interactive timeline scrubbing uses a single in-flight AVPlayer seek. While
-  // that seek is running, finger movement only updates `scrubChaseTime`; when
-  // the current seek completes we immediately chase the newest target. This
-  // avoids flooding AVPlayer / a remote Range source with overlapping seeks.
+  // The main player seeks only on release. A generation guard also handles a
+  // new drag beginning before the preceding release seek has completed.
   private var scrubSeekInProgress = false
   private var scrubChaseTime: CMTime = .invalid
   private var scrubFinalTarget: CMTime?
@@ -313,6 +313,7 @@ final class PlayerModel: PlaybackEngineControlling {
         guard let self, !Task.isCancelled else { return }
         let existingIDs = Set(self.sources.map(\.id))
         self.sources.append(contentsOf: remaining.filter { !existingIDs.contains($0.id) })
+        self.configureTimelinePreviewSource()
       } catch { /* Original playback continues even when other qualities are unavailable. */ }
     }
   }
@@ -380,8 +381,8 @@ final class PlayerModel: PlaybackEngineControlling {
     player.seek(to: CMTime(seconds: target, preferredTimescale: 600))
   }
 
-  /// Keep the existing player's cache/decoder. Live previews use its fast seek
-  /// path; only the release position needs near-frame accuracy.
+  /// Keep the primary decoder and its forward buffer untouched while dragging.
+  /// Preview frames have their own bounded cache; commit only on release.
   @discardableResult
   func beginInteractiveScrub() -> Bool {
     let shouldResume = scrubResumeAfterFinish || isPlaying || player.timeControlStatus != .paused || player.rate > 0
@@ -395,6 +396,7 @@ final class PlayerModel: PlaybackEngineControlling {
     isPlaying = false
     isBuffering = false
     scrubChaseTime = player.currentTime()
+    timelinePreview.begin(at: currentTime)
     return shouldResume
   }
 
@@ -404,7 +406,7 @@ final class PlayerModel: PlaybackEngineControlling {
     currentTime = target.seconds
     guard CMTimeCompare(scrubChaseTime, target) != 0 else { return }
     scrubChaseTime = target
-    scheduleInteractiveScrubSeek()
+    timelinePreview.show(at: target.seconds)
   }
 
   private func scheduleInteractiveScrubSeek(delay: Duration = .milliseconds(33)) {
@@ -421,6 +423,7 @@ final class PlayerModel: PlaybackEngineControlling {
   }
 
   func endInteractiveScrub(to seconds: Double, resumeAfter: Bool) {
+    timelinePreview.end(keepImageUntilSeekCompletes: true)
     let target = CMTime(seconds: clampedSeekTarget(seconds), preferredTimescale: 600)
     currentTime = target.seconds
     scrubChaseTime = target
@@ -493,6 +496,7 @@ final class PlayerModel: PlaybackEngineControlling {
   }
 
   private func finishInteractiveScrub() {
+    timelinePreview.end()
     scrubSeekInProgress = false
     scrubFinalTarget = nil
     interactiveScrubActive = false
@@ -511,6 +515,7 @@ final class PlayerModel: PlaybackEngineControlling {
   }
 
   private func cancelInteractiveScrub() {
+    timelinePreview.end()
     scrubGeneration &+= 1
     scrubDispatchTask?.cancel()
     scrubDispatchTask = nil
@@ -597,6 +602,8 @@ final class PlayerModel: PlaybackEngineControlling {
     bufferingStartedAt = nil
     countedCurrentStall = false
     sustainedStalls = []
+    bufferStallCount = 0
+    preferredBufferSeconds = 0
     wantsPlayback = true
     errorMessage = nil
     didReachEnd = false
@@ -607,7 +614,7 @@ final class PlayerModel: PlaybackEngineControlling {
     hdrFormat = "SDR"
     nominalFrameRate = 0
     chapters = []
-    previewCache.removeAll(keepingCapacity: true)
+    timelinePreview.reset()
     mediaInfoGeneration = UUID()
     activeAsset = nil
     audioOptions = []
@@ -653,10 +660,9 @@ final class PlayerModel: PlaybackEngineControlling {
     // loads duration/tracks asynchronously after playback starts, so avoid
     // duplicating that work on the critical startup path.
     let playerItem = AVPlayerItem(asset: asset, automaticallyLoadedAssetKeys: [])
-    // A 1.5-second target can starve high-bitrate originals on bursty links.
-    // Zero lets AVFoundation size its buffer for the actual stream/device.
-    // Fast start bypasses the initial wait once, never subsequent rebuffering.
-    playerItem.preferredForwardBufferDuration = fastStartEnabled ? 0 : 20
+    // Startup uses a small runway; once frames advance we grow it using the
+    // stream bitrate. Do not force an almost-empty buffer to play immediately.
+    playerItem.preferredForwardBufferDuration = fastStartEnabled ? 4 : 8
 
     // Maximum-fidelity policy with no extra decode/filter stage. A zero bit-rate
     // or resolution value means "no cap" for adaptive/HLS assets, including on
@@ -684,11 +690,8 @@ final class PlayerModel: PlaybackEngineControlling {
     } else {
       currentTime = 0
     }
-    if fastStartEnabled {
-      player.playImmediately(atRate: player.defaultRate)
-    } else {
-      player.play()
-    }
+    player.play()
+    configureTimelinePreviewSource()
     isPlaying = true
     isBuffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
 
@@ -722,24 +725,21 @@ final class PlayerModel: PlaybackEngineControlling {
     }
   }
 
-  func previewImage(at seconds: Double) async -> UIImage? {
-    guard let asset = activeAsset, seconds.isFinite, seconds >= 0 else { return nil }
-    let bucket = Int(seconds / 10)
-    if let cached = previewCache[bucket] { return cached }
-    let generator = AVAssetImageGenerator(asset: asset)
-    generator.appliesPreferredTrackTransform = true
-    generator.maximumSize = CGSize(width: 480, height: 270)
-    generator.requestedTimeToleranceBefore = CMTime(seconds: 1, preferredTimescale: 600)
-    generator.requestedTimeToleranceAfter = CMTime(seconds: 1, preferredTimescale: 600)
-    guard let result = try? await generator.image(at: CMTime(seconds: seconds, preferredTimescale: 600)) else { return nil }
-    let uiImage = UIImage(cgImage: result.image)
-    previewCache[bucket] = uiImage
-    if previewCache.count > 24 { previewCache.removeValue(forKey: previewCache.keys.min() ?? bucket) }
-    return uiImage
-  }
-
-  func timelinePreview(at seconds: Double) async -> UIImage? {
-    await previewImage(at: seconds)
+  private func configureTimelinePreviewSource() {
+    guard !requiresVLC, let activeAsset else { return }
+    // Small transcodes are previews only; the selected playback quality stays
+    // original. Never scan the entire remote original to prepare thumbnails.
+    let lightSource = sources.filter { !$0.isOriginal && (1...3).contains($0.definition) }
+      .min { $0.definition < $1.definition }
+    if let source = lightSource {
+      var options: [String: Any] = [AVURLAssetPreferPreciseDurationAndTimingKey: false]
+      if !source.headers.isEmpty { options["AVURLAssetHTTPHeaderFieldsKey"] = source.headers }
+      timelinePreview.configure(asset: AVURLAsset(url: source.url, options: options),
+        identity: source.id, allowsWarmup: true, fallbackAsset: activeAsset)
+    } else {
+      timelinePreview.configure(asset: activeAsset, identity: selectedSource?.id ?? "",
+        allowsWarmup: activeAsset.url.isFileURL)
+    }
   }
 
   private func loadChapters(asset: AVAsset) async -> [PlayerChapter] {
@@ -920,6 +920,10 @@ final class PlayerModel: PlaybackEngineControlling {
     })
     if ranges != bufferedRanges { bufferedRanges = ranges }
     bufferedUntil = PlaybackBufferPolicy.contiguousEnd(at: currentTime, ranges: ranges)
+    updateForwardBuffer()
+    timelinePreview.maintain(duration: duration,
+      mayWarm: wantsPlayback && isPlaying && !isBuffering && !interactiveScrubActive
+        && bufferedDuration >= 20 && !player.isExternalPlaybackActive)
 
     if let log = player.currentItem?.accessLog() {
       let bytes = log.events.reduce(Int64(0)) { $0 + max($1.numberOfBytesTransferred, 0) }
@@ -942,6 +946,19 @@ final class PlayerModel: PlaybackEngineControlling {
       lastSavedSecond = second
       saveProgress(force: false)
     }
+  }
+
+  private func updateForwardBuffer() {
+    guard hasPlayedCurrentItem, let playerItem = player.currentItem else { return }
+    let indicated = playerItem.accessLog()?.events.last?.indicatedBitrate ?? 0
+    let originalEstimate = selectedSource?.isOriginal == true && duration > 0
+      ? Double(item.size) * 8 / duration : 0
+    let bitrate = max(indicated.isFinite ? indicated : 0, originalEstimate)
+    let target = PlaybackBufferPolicy.forwardDuration(bitrate: bitrate,
+      stalls: bufferStallCount, rate: Double(player.defaultRate))
+    guard abs(target - preferredBufferSeconds) >= 2 else { return }
+    preferredBufferSeconds = target
+    playerItem.preferredForwardBufferDuration = target
   }
 
   private func updateWaitingStatusAndFallback(now: Date) {
@@ -968,8 +985,14 @@ final class PlayerModel: PlaybackEngineControlling {
     if bufferingStartedAt == nil { bufferingStartedAt = now }
     let wait = now.timeIntervalSince(bufferingStartedAt ?? now)
     sustainedStalls.removeAll { now.timeIntervalSince($0) > 60 }
-    if wait >= 3, !countedCurrentStall {
+    if wait >= 1, !countedCurrentStall {
       countedCurrentStall = true
+      bufferStallCount = min(bufferStallCount + 1, 3)
+      updateForwardBuffer()
+    }
+    // Short refills grow the buffer too, but only sustained stalls trigger an
+    // engine handoff. Count a continuous stall once at the three-second mark.
+    if wait >= 3, sustainedStalls.last.map({ $0 < (bufferingStartedAt ?? now) }) ?? true {
       sustainedStalls.append(now)
     }
     // A single normal refill must not change engines. Recover only a long

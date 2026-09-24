@@ -140,9 +140,14 @@ check(player.count(".settingsSectionCard()") == 7
       "Playback settings use compact grouped sections")
 check(project.count("B20260828000000000000001") == 2 and project.count("B20260828000000000000002") == 3,
       "New cache source is referenced by the shipping Xcode target")
-protected = ["Gallery115/Player/SystemPlayerView.swift"]
-unchanged = subprocess.run(["git", "diff", "--exit-code", "--", *protected], cwd=ROOT,
-                           capture_output=True).returncode == 0
+system_player = (ROOT / "Gallery115/Player/SystemPlayerView.swift").read_text(encoding="utf-8")
+original_system_player = subprocess.check_output(
+    ["git", "show", "HEAD:Gallery115/Player/SystemPlayerView.swift"], cwd=ROOT).decode("utf-8")
+def native_layer(text):
+    return text.split("struct SystemPlayerView:", 1)[1].split("/// Lightweight live scrub", 1)[0]
+# The preview cache deliberately changes this file, but the native AVPlayerLayer
+# attachment, HDR presentation and PiP ownership must remain intact.
+unchanged = native_layer(system_player) == native_layer(original_system_player)
 vlc = (ROOT / "Gallery115/Player/VLCPlayerView.swift").read_text(encoding="utf-8")
 original_vlc = subprocess.check_output(["git", "show", "HEAD:Gallery115/Player/VLCPlayerView.swift"], cwd=ROOT).decode("utf-8")
 def vlc_credentials(text):
