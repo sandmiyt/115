@@ -19,6 +19,13 @@ import SwiftUI
     private(set) var transferredMegabytes: Double = 0
     private(set) var volume: Float = 1
     private(set) var errorMessage: String?
+    private(set) var firstPlaybackSeconds: Double?
+    private(set) var playbackStallCount = 0
+    private var diagnosticStartedAt: TimeInterval = 0
+    private var diagnosticSampleAt: TimeInterval = 0
+    private var diagnosticMediaTime: Double = 0
+    private var diagnosticWaitAt: TimeInterval?
+    private var diagnosticWaitCounted = false
     var bufferedUntil: Double { currentTime }
     var bufferedDuration: Double { 0 }
 
@@ -67,6 +74,13 @@ import SwiftUI
       sampledBytes = 0
       sampledAt = Date()
       lastMediaProgressAt = Date()
+      firstPlaybackSeconds = nil
+      playbackStallCount = 0
+      diagnosticStartedAt = ProcessInfo.processInfo.systemUptime
+      diagnosticSampleAt = diagnosticStartedAt
+      diagnosticMediaTime = 0
+      diagnosticWaitAt = nil
+      diagnosticWaitCounted = false
 
       let media = VLCMedia(url: source.url)
       // Originals often arrive in bursts. 650 ms exhausts almost immediately
@@ -282,6 +296,26 @@ import SwiftUI
       isPlaying = !interactiveScrubActive && state == .playing
       isBuffering = !interactiveScrubActive && (state == .opening
         || (state == .buffering && now.timeIntervalSince(lastMediaProgressAt) > 0.75))
+      let uptime = ProcessInfo.processInfo.systemUptime
+      let step = mediaTime - diagnosticMediaTime
+      let elapsed = uptime - diagnosticSampleAt
+      if firstPlaybackSeconds == nil, pendingResumePosition == nil,
+        !interactiveScrubActive, state == .playing, lastState == .playing,
+        step > 0.08, step <= elapsed * Double(max(player.rate, 1)) + 0.5 {
+        firstPlaybackSeconds = uptime - diagnosticStartedAt
+      }
+      diagnosticSampleAt = uptime
+      diagnosticMediaTime = mediaTime
+      if firstPlaybackSeconds != nil, isBuffering, pendingResumePosition == nil {
+        if diagnosticWaitAt == nil { diagnosticWaitAt = uptime }
+        if uptime - (diagnosticWaitAt ?? uptime) >= 1, !diagnosticWaitCounted {
+          playbackStallCount += 1
+          diagnosticWaitCounted = true
+        }
+      } else {
+        diagnosticWaitAt = nil
+        diagnosticWaitCounted = false
+      }
       if state == .error { errorMessage = "VLC 无法读取此原画，请检查网络或在设置中切换系统内核。" }
       if let audio = player.audio {
         volume = Float(audio.volume) / 100
@@ -313,6 +347,21 @@ import SwiftUI
         libraryStore.recordPlayback(item, position: currentTime, duration: duration)
       }
     }
+
+    var playbackDiagnosticText: String {
+      let version = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "?"
+      let build = (Bundle.main.infoDictionary?["CFBundleVersion"] as? String) ?? "?"
+      let startup = firstPlaybackSeconds.map { String(format: "%.2f s", $0) } ?? "未起播"
+      return """
+        Cineva \(version) (\(build)) · VLC · 直连
+        画质：同一原文件
+        实际起播（VLC 创建后，采样）：\(startup)
+        状态：\(isBuffering ? "缓冲中" : (isPlaying ? "播放中" : "已暂停或停止"))
+        读取速率（采样）：\(String(format: "%.2f Mbps", networkMbps))
+        缓冲事件（含定位等待）：\(playbackStallCount) 次
+        连续缓冲：VLC 未提供
+        """
+    }
   }
 
   struct VLCPlayerView: UIViewRepresentable {
@@ -339,6 +388,9 @@ import SwiftUI
   @MainActor
   @Observable
   final class VLCPlaybackController: PlaybackEngineControlling {
+    var firstPlaybackSeconds: Double? { nil }
+    var playbackStallCount: Int { 0 }
+    var playbackDiagnosticText: String { "VLC 内核未安装" }
     private(set) var currentTime: Double = 0
     private(set) var duration: Double = 0
     private(set) var isPlaying = false

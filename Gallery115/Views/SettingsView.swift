@@ -360,7 +360,7 @@ private struct PlaybackSettingsView: View {
             Text(engine.title).tag(engine)
           }
         }
-        Text("自动模式在原画持续卡顿时切换 VLC，并保留进度。VLC 播放同一原文件；系统内核支持原生 HDR、画中画和 AirPlay。")
+        Text("自动模式在原画起播过慢或反复缓冲时切换 VLC，并保留进度。VLC 播放同一原文件；系统内核支持原生 HDR、画中画和 AirPlay。")
           .font(.caption)
           .foregroundStyle(.secondary)
 

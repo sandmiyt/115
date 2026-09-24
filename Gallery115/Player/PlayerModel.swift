@@ -227,7 +227,7 @@ final class PlayerModel: PlaybackEngineControlling {
   private var pendingInitialPosition: Double = 0
   private var bufferingStartedAt: Date?
   private var countedCurrentStall = false
-  private var sustainedStalls: [Date] = []
+  private var recoveryPolicy = PlaybackRecoveryPolicy()
   private var bufferStallCount = 0
   private var preferredBufferSeconds: Double = 0
   private var interactiveScrubActive = false
@@ -671,7 +671,7 @@ final class PlayerModel: PlaybackEngineControlling {
     engineSwitchResumePosition = nil
     bufferingStartedAt = nil
     countedCurrentStall = false
-    sustainedStalls = []
+    recoveryPolicy = PlaybackRecoveryPolicy()
     bufferStallCount = 0
     preferredBufferSeconds = 0
     wantsPlayback = true
@@ -1074,26 +1074,38 @@ final class PlayerModel: PlaybackEngineControlling {
     if bufferingStartedAt == nil { bufferingStartedAt = now }
     let wait = now.timeIntervalSince(bufferingStartedAt ?? now)
     resumeWithBufferedRunwayIfNeeded(wait: wait)
-    sustainedStalls.removeAll { now.timeIntervalSince($0) > 60 }
+    let uptime = ProcessInfo.processInfo.systemUptime
     if hasPlayedCurrentItem, !awaitingSeekPlayback, wait >= 1, !countedCurrentStall {
       countedCurrentStall = true
       playbackStallCount += 1
+      recoveryPolicy.recordRefill(at: uptime)
       bufferStallCount = min(bufferStallCount + 1, 3)
       updateForwardBuffer()
     }
-    // Short refills grow the buffer too, but only sustained stalls trigger an
-    // engine handoff. Count a continuous stall once at the three-second mark.
-    if hasPlayedCurrentItem, !awaitingSeekPlayback, wait >= 3,
-      sustainedStalls.last.map({ $0 < (bufferingStartedAt ?? now) }) ?? true {
-      sustainedStalls.append(now)
-    }
-    // A single normal refill must not change engines. Recover only a long
-    // interruption or repeated sustained stalls, and never downgrade quality.
+    // Two separate >=1 s refills in a minute are disruptive too. Previously
+    // only >=3 s waits counted, so repeated short freezes never recovered.
     guard networkAutoRecoveryEnabled, allowsAutomaticEngineSwitch, originalPlaybackEngine == .automatic,
       selectedSource?.isOriginal == true, !player.isExternalPlaybackActive,
       now.timeIntervalSince(lastControlledResumeAt) >= 3,
-      wait >= 15 || sustainedStalls.count >= 3 else { return }
-    switchOriginalToVLC(reason: "原画持续缓冲，已切换 VLC 续播")
+      let reason = recoveryPolicy.reason(now: uptime, wait: wait,
+        hasStarted: hasPlayedCurrentItem, seeking: awaitingSeekPlayback,
+        fastStart: fastStartEnabled) else { return }
+    switch reason {
+    case .slowStart: switchOriginalToVLC(reason: "系统内核起播超过 10 秒，已切换 VLC 原画")
+    case .repeatedRefills: switchOriginalToVLC(reason: "一分钟内反复缓冲，已切换 VLC 原画续播")
+    case .prolongedWait: switchOriginalToVLC(reason: "原画持续缓冲，已切换 VLC 续播")
+    }
+  }
+
+  var canSwitchToVLC: Bool {
+    selectedSource?.isOriginal == true && !requiresVLC && VLCAvailability.isAvailable
+      && allowsAutomaticEngineSwitch && !player.isExternalPlaybackActive
+      && wantsPlayback && !interactiveScrubActive && !positionSeekPending
+  }
+
+  func useVLCForCurrentOriginal() {
+    guard canSwitchToVLC else { return }
+    switchOriginalToVLC(reason: "手动切换 VLC，继续播放同一原文件")
   }
 
   private func resumeWithBufferedRunwayIfNeeded(wait: Double) {
@@ -1140,8 +1152,9 @@ final class PlayerModel: PlaybackEngineControlling {
       播放器就绪：\(seconds(readySeconds))
       实际起播（播放器创建后）：\(seconds(firstPlaybackSeconds))
       状态：\(waitingStatus)
+      内核设置：\(originalPlaybackEngine.title) · 自动恢复：\(networkAutoRecoveryEnabled ? "开" : "关")
       连续缓冲：\(String(format: "%.2f s", bufferedDuration))
-      平均下载带宽（系统日志）：\(mbps(observedMbps))
+      历史下载吞吐（非当前网速）：\(mbps(observedMbps))
       媒体码率（估算）：\(mbps(requiredMbps))
       倍速：\(player.defaultRate)
       播放中缓冲：\(playbackStallCount) 次 / \(seconds(playbackStallSeconds))
@@ -1162,6 +1175,10 @@ final class PlayerModel: PlaybackEngineControlling {
     player.pause()
     player.replaceCurrentItem(with: nil)
     mediaInfoTask?.cancel()
+    deferredSourcesTask?.cancel()
+    timelinePreview.reset()
+    playbackTimer?.invalidate()
+    playbackTimer = nil
     // Invalidate metadata tasks from the old AVPlayerItem.
     mediaInfoGeneration = UUID()
     activeAsset = nil

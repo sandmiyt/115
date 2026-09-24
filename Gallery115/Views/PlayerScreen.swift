@@ -256,6 +256,7 @@ struct PlayerScreen: View {
       PlayerInfoSheet(
         item: currentItem,
         model: model,
+        vlcController: vlcController,
         videoLayout: videoLayout,
         playbackRate: playbackRate,
         playlistCount: playlist.count,
@@ -339,7 +340,7 @@ struct PlayerScreen: View {
       if let message, useVLC { model?.errorMessage = message }
     }
     .onChange(of: systemPresentationController.isPictureInPictureActive) { _, active in
-      model?.allowsAutomaticEngineSwitch = !active
+      model?.allowsAutomaticEngineSwitch = !active && !isRoutePickerPresented
     }
     .onChange(of: activeCurrentTime) { _, _ in
       updateRemotePlaybackInfo()
@@ -1609,6 +1610,7 @@ struct PlayerScreen: View {
   private func settingsAirPlayButton() -> some View {
     AirPlayRoutePickerButton { presented in
       isRoutePickerPresented = presented
+      model?.allowsAutomaticEngineSwitch = !presented && !systemPresentationController.isPictureInPictureActive
       if presented {
         keepControlsDuringInteraction()
       } else {
@@ -2930,6 +2932,7 @@ private struct PlayerInfoSheet: View {
   @Environment(AppState.self) private var appState
   let item: CloudItem
   let model: PlayerModel?
+  let vlcController: VLCPlaybackController
   let videoLayout: PlayerVideoLayout
   let playbackRate: Float
   let playlistCount: Int
@@ -2987,6 +2990,12 @@ private struct PlayerInfoSheet: View {
 
         Section("播放") {
           LabeledContent("播放内核", value: playbackEngine)
+          if playbackEngine == "AVPlayer", let model, model.selectedSource?.isOriginal == true {
+            Button("用 VLC 播放同一原文件") { model.useVLCForCurrentOriginal() }
+              .disabled(!model.canSwitchToVLC)
+            Text("保留画质和进度。VLC 不提供此处的画中画和 AirPlay 功能。")
+              .font(.caption).foregroundStyle(.secondary)
+          }
           LabeledContent("当前清晰度", value: model?.selectedSource?.title ?? "原画")
           if let reason = model?.engineSwitchReason {
             Text(reason).font(.caption).foregroundStyle(.secondary)
@@ -3029,7 +3038,7 @@ private struct PlayerInfoSheet: View {
               LabeledContent("实际起播耗时（采样）", value: String(format: "%.2f 秒", seconds))
             }
             if let mbps = model.observedMbps {
-              LabeledContent("平均下载带宽", value: String(format: "%.1f Mbps", mbps))
+              LabeledContent("历史下载吞吐", value: String(format: "%.1f Mbps", mbps))
             }
             if let mbps = model.requiredMbps {
               LabeledContent("媒体码率（估算）", value: String(format: "%.1f Mbps", mbps))
@@ -3040,8 +3049,19 @@ private struct PlayerInfoSheet: View {
             } label: {
               Label("复制播放诊断", systemImage: "doc.on.doc")
             }
-            Text("就绪和起播耗时从交给播放器时算起，每 0.5 秒采样；平均带宽由系统日志提供。诊断不含文件名、播放地址或账号信息。")
+            Text("就绪和起播耗时从交给播放器时算起，每 0.5 秒采样；历史吞吐不代表当前网速，无法排除请求等待。诊断不含文件名、播放地址或账号信息。")
               .font(.caption).foregroundStyle(.secondary)
+          }
+          if playbackEngine == "VLC" {
+            if let seconds = vlcController.firstPlaybackSeconds {
+              LabeledContent("VLC 起播耗时（采样）", value: String(format: "%.2f 秒", seconds))
+            }
+            LabeledContent("VLC 缓冲次数（含定位）", value: "\(vlcController.playbackStallCount)")
+            Button {
+              UIPasteboard.general.string = vlcController.playbackDiagnosticText
+            } label: {
+              Label("复制播放诊断", systemImage: "doc.on.doc")
+            }
           }
         }
 
