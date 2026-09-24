@@ -48,7 +48,7 @@ KSPlayer 公开 GitHub 版本不包含全部付费能力。作者当前公开方
 - 存在低清转码源时，在连续缓冲至少 20 秒且设备温度、电量模式允许的情况下，每 8 秒最多预取一张，最多 48 张；缓冲不足取消。不会为全片预览扫描远端原画。低清源不支持抽帧时，拖动中可回退到原画按需取帧。
 - 缓存命中可直接显示，但没有真机毫秒耗时测量；首次访问未下载位置仍受网络及关键帧解码限制。VLC 拖动路径保留现状。
 - 本地只执行静态 preflight 与 diff 检查；Xcode 编译结果另以 GitHub Actions 为准。未增加 regression job/artifact。
-# Long-video transport update — 2.2.10 (34)
+# Long-video transport update — 2.2.10 (35)
 
 SenPlayer's published 6.2.0 notes describe segmented disk caching and scrub
 previews. This update follows those ideas; it does not contain SenPlayer code
@@ -60,7 +60,8 @@ https://apps.apple.com/cn/app/senplayer-media-player/id6443975850
   bounded by a 96–256 MiB estimate scaled to physical memory. This is a preference,
   not an enforced AVFoundation memory allocation or a promise of actual runway.
 - PlaybackRangeCache serves signed 115 MP4/MOV/M4V originals through
-  AVAssetResourceLoader. A single URLSession connection downloads bounded 8 MiB
+  AVAssetResourceLoader. A single URLSession connection downloads a 512 KiB
+  initial probe followed by bounded 32 MiB
   ranges, immediately delivers incoming bytes, and retains partial/completed
   fragments on disk. Cache hits do not make another network request. No preview
   downloader runs ahead in parallel. Other formats, HLS, WebDAV and VLC keep
@@ -78,6 +79,11 @@ https://apps.apple.com/cn/app/senplayer-media-player/id6443975850
 - Remote preview storyboard scans are disabled, including low-resolution
   transcodes. Existing displayed-frame capture and on-demand paused scrub
   previews remain. Deferred quality discovery waits for ten seconds of runway.
+- Preview generation allows a nearby frame within three seconds and labels its
+  actual time. Release seeks allow half a second instead of demanding a 100 ms
+  window. Continuous disk reads reuse a file descriptor; large HTTP windows
+  reduce request round trips. None of these changes claim millisecond decoding
+  for uncached remote positions.
 - Playback details distinguish contiguous time buffer from retained video bytes;
   download telemetry for the cache path counts upstream URLSession bytes.
 

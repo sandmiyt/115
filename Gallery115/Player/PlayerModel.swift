@@ -486,7 +486,7 @@ final class PlayerModel: PlaybackEngineControlling {
     let isFinalPass = scrubFinalTarget != nil
     // Tiny tolerances force a GOP decode even for already-buffered data.
     // AVPlayer's fast path finds a nearby decodable frame while dragging.
-    let tolerance = isFinalPass ? CMTime(seconds: 0.10, preferredTimescale: 600) : .positiveInfinity
+    let tolerance = isFinalPass ? CMTime(seconds: 0.5, preferredTimescale: 600) : .positiveInfinity
     scrubSeekInProgress = true
     scrubInFlightTarget = target
     isInteractiveScrubLoading = isFinalPass

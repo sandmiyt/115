@@ -8,7 +8,8 @@ import UniformTypeIdentifiers
 final class PlaybackRangeCache: NSObject, AVAssetResourceLoaderDelegate, URLSessionDataDelegate, @unchecked Sendable {
   private static let queue = DispatchQueue(label: "Cineva.playback-ranges", qos: .userInitiated)
   private static var cleanedOrphans = false // Access only on queue.
-  private static let chunkSize: Int64 = 8 * 1_024 * 1_024
+  private static let chunkSize: Int64 = 32 * 1_024 * 1_024
+  private static let probeSize: Int64 = 512 * 1_024
   private let originalURL: URL
   private let headers: [String: String]
   private let contentType: String
@@ -19,6 +20,8 @@ final class PlaybackRangeCache: NSObject, AVAssetResourceLoaderDelegate, URLSess
   private var fragments: [Fragment] = []
   private var activeTask: URLSessionDataTask?
   private var writer: FileHandle?
+  private var reader: FileHandle?
+  private var readerURL: URL?
   private var activeFile: URL?
   private var activeStart: Int64 = 0
   private var activeEnd: Int64 = 0 // Exclusive requested end.
@@ -170,8 +173,14 @@ final class PlaybackRangeCache: NSObject, AVAssetResourceLoaderDelegate, URLSess
       let fragment = fragments[index]
       file = fragment.url; start = fragment.start; available = fragment.end - offset
     } else { return nil }
-    let reader = try FileHandle(forReadingFrom: file)
-    defer { try? reader.close() }
+    // Keep the file descriptor across streamed reads. Opening/closing it for
+    // every network callback adds avoidable work on high-bitrate originals.
+    if readerURL != file {
+      try? reader?.close()
+      reader = try FileHandle(forReadingFrom: file)
+      readerURL = file
+    }
+    guard let reader else { throw transportError() }
     try reader.seek(toOffset: UInt64(offset - start))
     guard let bytes = try reader.read(upToCount: min(count, Int(available))), !bytes.isEmpty else { throw transportError() }
     return bytes
@@ -182,7 +191,11 @@ final class PlaybackRangeCache: NSObject, AVAssetResourceLoaderDelegate, URLSess
     do {
       let total = length ?? Int64.max
       guard offset >= 0, offset < total else { throw transportError() }
-      let end = offset + min(Self.chunkSize, total - offset)
+      // A small first request discovers length/moov without overfetching.
+      // Sustained playback then uses larger windows on the same URLSession,
+      // reducing HTTP request boundaries while still streaming the first byte.
+      let window = length == nil ? Self.probeSize : Self.chunkSize
+      let end = offset + min(window, total - offset)
       guard end > offset else { throw transportError() }
       evict(reserving: end - offset)
       let url = directory.appendingPathComponent(UUID().uuidString)
@@ -235,7 +248,7 @@ final class PlaybackRangeCache: NSObject, AVAssetResourceLoaderDelegate, URLSess
       try writer.write(contentsOf: data)
       received += Int64(data.count)
       counterLock.lock(); transferred += Int64(data.count); counterLock.unlock()
-      pump() // Deliver arriving bytes immediately, not after an 8 MB download.
+      pump() // Deliver arriving bytes immediately, not after a full window.
     } catch { finish(error: transportError()) }
   }
 
@@ -271,6 +284,9 @@ final class PlaybackRangeCache: NSObject, AVAssetResourceLoaderDelegate, URLSess
     var total = fragments.reduce(Int64(0)) { $0 + $1.count }
     while total + bytes > budget, let oldest = fragments.indices.min(by: { fragments[$0].touched < fragments[$1].touched }) {
       let removed = fragments.remove(at: oldest)
+      if readerURL == removed.url {
+        try? reader?.close(); reader = nil; readerURL = nil
+      }
       try? FileManager.default.removeItem(at: removed.url)
       total -= removed.count
     }
@@ -291,6 +307,7 @@ final class PlaybackRangeCache: NSObject, AVAssetResourceLoaderDelegate, URLSess
     guard !stopped else { return }
     stopped = true
     sealActiveFragment(cancel: true)
+    try? reader?.close(); reader = nil; readerURL = nil
     session.invalidateAndCancel() // Break URLSession's strong delegate ownership.
     for request in requests where !request.isCancelled && !request.isFinished {
       request.finishLoading(with: error ?? URLError(.cancelled))
