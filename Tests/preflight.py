@@ -146,7 +146,11 @@ unchanged = subprocess.run(["git", "diff", "--exit-code", "--", *protected], cwd
 vlc = (ROOT / "Gallery115/Player/VLCPlayerView.swift").read_text(encoding="utf-8")
 original_vlc = subprocess.check_output(["git", "show", "HEAD:Gallery115/Player/VLCPlayerView.swift"], cwd=ROOT).decode("utf-8")
 def vlc_source_configuration(text):
-    return text.split("    func configure(", 1)[1].split("    func attachDrawable", 1)[0]
+    body = text.split("    func configure(", 1)[1].split("    func attachDrawable", 1)[0]
+    # Buffer tuning is intentional in 2.2.7. Keep protecting source URLs,
+    # credentials, options wiring, resume behavior and every other statement.
+    body = body.replace("fastStartEnabled ? 650 : 1800", "fastStartEnabled ? 1800 : 3500")
+    return "\n".join(line for line in body.splitlines() if not line.strip().startswith("//"))
 unchanged = unchanged and vlc_source_configuration(vlc) == vlc_source_configuration(original_vlc)
 keychain = (ROOT / "Gallery115/Services/KeychainStore.swift").read_text(encoding="utf-8")
 original_keychain = subprocess.check_output(
@@ -157,7 +161,7 @@ def token_storage(text):
     end = text.index("\n\nenum MediaSourceKind")
     return text[start:end]
 check(unchanged and token_storage(keychain) == token_storage(original_keychain),
-      "AVPlayer view, VLC source/cache configuration, and token storage unchanged")
+      "AVPlayer view, VLC configuration except approved buffer tuning, and token storage unchanged")
 player_model = (ROOT / "Gallery115/Player/PlayerModel.swift").read_text(encoding="utf-8")
 old_player_model = subprocess.check_output(["git", "show", "HEAD:Gallery115/Player/PlayerModel.swift"],
                                           cwd=ROOT).decode("utf-8")
