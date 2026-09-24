@@ -344,6 +344,12 @@ private struct PlaybackSettingsView: View {
           }
         }
 
+        if appState.defaultQuality == .fullHD {
+          Text("优先播放 115 的 1080P 转码；没有时优先选择较低清晰度。实际画质以播放器显示为准。")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+
         Toggle("快速起播", isOn: $appState.fastStartEnabled)
         Text("优先尽快开始播放并减少起播等待；网络较差时关闭可增加初始缓冲。")
           .font(.caption)

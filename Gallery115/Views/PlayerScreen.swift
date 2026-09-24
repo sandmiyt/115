@@ -1308,15 +1308,21 @@ struct PlayerScreen: View {
     VStack(alignment: .leading, spacing: 8) {
       settingsSectionTitle("清晰度")
       VStack(spacing: 6) {
+        if !model.sources.contains(where: \.is1080p) {
+          settingsUnavailableRow("1080P（当前视频暂无转码源）", systemName: "play.rectangle")
+        }
         ForEach(model.sources) { source in
           settingsRow(
-            title: source.title,
+            title: source.qualityTitle,
             systemName: source.isOriginal ? "sparkles.tv" : "play.rectangle",
             selected: model.selectedSource?.id == source.id
           ) {
+            guard model.selectedSource?.id != source.id else { return }
             keepControlsDuringInteraction()
+            let position = activeCurrentTime
+            pauseActivePlayer()
             Task { @MainActor in
-              await model.select(source)
+              await model.select(source, resumeAt: position)
               activatePlaybackEngine(for: model)
               applyPlaybackRate(playbackRate, persist: false)
               applyAutomaticOrientation(for: model.videoDisplaySize)
@@ -2973,7 +2979,7 @@ private struct PlayerInfoSheet: View {
 
         Section("播放") {
           LabeledContent("播放内核", value: playbackEngine)
-          LabeledContent("当前清晰度", value: model?.selectedSource?.title ?? "原画")
+          LabeledContent("当前清晰度", value: model?.selectedSource?.qualityTitle ?? "原画")
           LabeledContent("画面模式", value: videoLayout.title)
           LabeledContent("播放速度", value: playbackRate == 1 ? "1x" : String(format: "%gx", playbackRate))
           LabeledContent("同目录队列", value: "\(playlistCount) 个视频")

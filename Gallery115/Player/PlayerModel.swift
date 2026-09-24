@@ -274,6 +274,8 @@ final class PlayerModel: PlaybackEngineControlling {
       switch defaultQuality {
       case .highestTranscode:
         preferred = bestTranscode ?? original ?? sources.first
+      case .fullHD:
+        preferred = VideoSource.preferred1080p(in: sources)
       case .original:
         preferred = original ?? bestTranscode ?? sources.first
       }
@@ -287,9 +289,9 @@ final class PlayerModel: PlaybackEngineControlling {
     }
   }
 
-  func select(_ source: VideoSource) async {
+  func select(_ source: VideoSource, resumeAt seconds: Double? = nil) async {
     didFallbackFromOriginal = false
-    await play(source, allowFallback: true)
+    await play(source, allowFallback: true, resumeAt: seconds)
   }
 
   func pause() {
@@ -538,7 +540,7 @@ final class PlayerModel: PlaybackEngineControlling {
     max(PlaybackBufferPolicy.contiguousEnd(at: currentTime, ranges: bufferedRanges) - currentTime, 0)
   }
 
-  private func play(_ source: VideoSource, allowFallback: Bool) async {
+  private func play(_ source: VideoSource, allowFallback: Bool, resumeAt seconds: Double? = nil) async {
     cancelInteractiveScrub()
     bufferedRanges = []
     bufferedUntil = 0
@@ -617,8 +619,11 @@ final class PlayerModel: PlaybackEngineControlling {
     installItemObservers(for: playerItem)
     player.replaceCurrentItem(with: playerItem)
 
-    let resumePosition = libraryStore.resumePosition(for: item)
-    if resumePosition > 2, duration <= 0 || resumePosition < duration - 15 {
+    let resumePosition = seconds ?? libraryStore.resumePosition(for: item)
+    let shouldResume = seconds != nil
+      ? resumePosition.isFinite && resumePosition > 0 && (duration <= 0 || resumePosition < duration)
+      : resumePosition > 2 && (duration <= 0 || resumePosition < duration - 15)
+    if shouldResume {
       currentTime = resumePosition
       player.seek(
         to: CMTime(seconds: resumePosition, preferredTimescale: 600),

@@ -69,6 +69,7 @@ final class AppState {
 
   enum DefaultQuality: String, CaseIterable, Identifiable {
     case highestTranscode
+    case fullHD
     case original
 
     var id: String { rawValue }
@@ -76,6 +77,7 @@ final class AppState {
     var title: String {
       switch self {
       case .highestTranscode: return "最高转码（推荐）"
+      case .fullHD: return "1080P 优先"
       case .original: return "原画优先"
       }
     }
