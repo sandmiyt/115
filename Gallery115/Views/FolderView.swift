@@ -203,8 +203,7 @@ struct FolderView: View {
           Button("重载缩略图", systemImage: "photo.badge.arrow.down") {
             Task {
               await appState.thumbnailService.retryMissingThumbnails()
-              artworkRefreshRevision &+= 1
-              appState.thumbnailReloadRevision &+= 1
+              transientMessage = "已开始补齐整个资料库的缩略图，已有缓存会跳过；播放时暂停，退出播放后继续。"
             }
           }
 

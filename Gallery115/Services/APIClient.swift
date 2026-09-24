@@ -62,8 +62,8 @@ actor APIClient {
     }
   }
 
-  func thumbnailLibraryPage(id: String, offset: Int) async throws -> ThumbnailLibraryPage {
-    let page = try await listFolderPage(id: id, offset: offset)
+  func thumbnailLibraryPage(id: String, offset: Int, forceRefresh: Bool = false) async throws -> ThumbnailLibraryPage {
+    let page = try await listFolderPage(id: id, offset: offset, forceRefresh: forceRefresh)
     return ThumbnailLibraryPage(items: page.items, nextOffset: page.hasMore ? page.offset + page.limit : nil)
   }
 

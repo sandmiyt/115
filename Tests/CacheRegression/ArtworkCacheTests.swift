@@ -34,6 +34,96 @@ final class ArtworkCacheTests: XCTestCase {
     XCTAssertEqual(afterReload, 2)
   }
 
+  func testSlowLibraryItemDoesNotBlockOtherMissingCovers() async throws {
+    let slow = item("slow")
+    let fast = item("fast")
+    let held = FrameGate(image: image())
+    let ready = image()
+    let completed = expectation(description: "later cover finishes before slow frame")
+    let cache = ThumbnailService(disk: disk, namespace: { "mount-a" }, loader: { item, _ in
+      if item.id == slow.id { return await held.load() }
+      completed.fulfill()
+      return ready
+    })
+    let api = APIClient()
+    await api.setThumbnailPages(["root": [ThumbnailLibraryPage(items: [slow, fast], nextOffset: nil)]])
+    let scan = Task { await cache.fillLibrary(rootID: "root", api: api) }
+    await fulfillment(of: [completed], timeout: 2)
+    await held.release()
+    await scan.value
+    XCTAssertNotNil(try disk.read(identity(fast)))
+  }
+
+  func testRepeatedReloadDoesNotCancelOrDuplicateActiveThumbnail() async {
+    let probe = LoadProbe(image: image(), delay: 300_000_000)
+    let cache = service(probe)
+    let api = APIClient()
+    await api.setThumbnailPages(["root": [ThumbnailLibraryPage(items: [item()], nextOffset: nil)]])
+    let scan = Task { await cache.fillLibrary(rootID: "root", api: api) }
+    await waitForCalls(probe, count: 1)
+    await cache.retryMissingThumbnails()
+    await cache.retryMissingThumbnails()
+    await scan.value
+    await cache.fillLibrary(rootID: "root", api: api)
+    let calls = await probe.calls
+    XCTAssertEqual(calls, 1)
+  }
+
+  func testReloadWakesIdleScanIncludingWakeBeforeWaitRace() async {
+    let cache = service(LoadProbe(image: image()))
+    let revision = await cache.libraryReloadRevision
+    let woke = expectation(description: "manual reload bypasses five minute idle wait")
+    let wait = Task {
+      await cache.waitForLibraryRescan(after: revision)
+      woke.fulfill()
+    }
+    await cache.retryMissingThumbnails()
+    await fulfillment(of: [woke], timeout: 2)
+    wait.cancel()
+    await wait.value
+    // Reload arriving before the waiter must also not be lost.
+    await cache.waitForLibraryRescan(after: revision)
+  }
+
+  func testDirectoryDeadlineReturnsWithoutBlockingFollowingFolders() async {
+    let returned = expectation(description: "directory timeout")
+    let task = Task {
+      let page = await ThumbnailService.boundedLibraryPage(seconds: 0.05) {
+        do { try await Task.sleep(for: .seconds(20)) } catch { return nil }
+        return ThumbnailLibraryPage(items: [], nextOffset: nil)
+      }
+      XCTAssertNil(page)
+      returned.fulfill()
+    }
+    await fulfillment(of: [returned], timeout: 2)
+    task.cancel()
+    await task.value
+  }
+
+  func testCancelledSharedWaiterReturnsBeforeOtherClientFinishes() async {
+    let held = FrameGate(image: image())
+    let cache = ThumbnailService(disk: disk, namespace: { "mount-a" }, loader: { _, _ in await held.load() })
+    let target = item("shared")
+    let api = APIClient()
+    let survivor = Task { await cache.thumbnail(for: target, api: api) }
+    let cancelledReturned = expectation(description: "cancelled client does not await shared loader")
+    let cancelled = Task {
+      _ = await cache.thumbnail(for: target, api: api)
+      cancelledReturned.fulfill()
+    }
+    for _ in 0..<200 {
+      let started = await held.peak
+      if started > 0 { break }
+      try? await Task.sleep(for: .milliseconds(5))
+    }
+    cancelled.cancel()
+    await fulfillment(of: [cancelledReturned], timeout: 2)
+    await held.release()
+    let image = await survivor.value
+    XCTAssertNotNil(image)
+    await cancelled.value
+  }
+
   func testPrefetchGeneratesMissingFrameAndPersistsIt() async throws {
     let ready = image()
     let frames = LoadProbe(image: ready)

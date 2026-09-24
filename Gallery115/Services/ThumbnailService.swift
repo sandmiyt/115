@@ -42,6 +42,10 @@ actor ThumbnailService {
   private var cacheGeneration = UUID()
   private var directoryWork: (id: UUID, task: Task<ThumbnailLibraryPage?, Never>)?
   private var backgroundFailedUntil: [String: Date] = [:]
+  private(set) var libraryReloadRevision = 0
+  private var completedLibraryReloadRevision = 0
+  private var libraryIdleWait: (id: UUID, task: Task<Void, Never>)?
+  private var libraryScanID = UUID()
   private let maximumNetworkJobs = 3
   private let maximumFrameJobs = 2
   private let imageSession: URLSession = {
@@ -129,11 +133,20 @@ actor ThumbnailService {
         inFlight[identity.key] = work
       }
 
+      let completion = ArtworkCompletion<UIImage>()
       let result = await withTaskCancellationHandler {
-        await work.task.value
+        await withCheckedContinuation { continuation in
+          completion.install(continuation)
+          let observer = Task { completion.finish(await work.task.value) }
+          completion.attach([observer])
+        }
       } onCancel: {
+        // Stop THIS waiter immediately, even when another card still needs the
+        // shared request. Old scans must not keep waiting behind visible cells.
+        completion.finish(nil)
         Task { await self.cancelClient(clientID, key: identity.key, workID: work.id) }
       }
+      guard !Task.isCancelled else { return nil }
       if inFlight[identity.key]?.id == work.id {
         inFlight[identity.key] = nil
         if result == nil, !isPrefetch, !work.task.isCancelled, generation == cacheGeneration {
@@ -163,69 +176,135 @@ actor ThumbnailService {
     }
   }
 
-  /// One app-owned walk, independent of scrolling. Cached covers are inspected
-  /// without decoding them into the viewport's bounded memory cache.
+  /// One app-owned walk, independent of scrolling. Keep at most three missing
+  /// covers in flight; existing network/frame gates still give playback priority.
   func fillLibrary(rootID: String, api: APIClient) async {
+    let scanID = UUID()
+    libraryScanID = scanID
+    directoryWork?.task.cancel()
     let generation = cacheGeneration
+    let reloadRevision = libraryReloadRevision
+    let refreshDirectory = reloadRevision != completedLibraryReloadRevision
     var folders = [rootID]
     var visited = Set([rootID])
     var cursor = 0
-    while cursor < folders.count, !Task.isCancelled, generation == cacheGeneration {
-      let folder = folders[cursor]
-      cursor += 1
-      var offset = 0
-      while !Task.isCancelled, generation == cacheGeneration {
-        let workID = UUID()
-        guard await acquireSlot(workID, isPrefetch: true) else { return }
-        guard !Task.isCancelled, generation == cacheGeneration else {
-          releaseSlot(workID); return
+    await withTaskGroup(of: Void.self) { group in
+      var pending = 0
+      while cursor < folders.count, !Task.isCancelled,
+        generation == cacheGeneration, libraryScanID == scanID {
+        let folder = folders[cursor]
+        cursor += 1
+        var offset = 0
+        while !Task.isCancelled, generation == cacheGeneration, libraryScanID == scanID {
+          let workID = UUID()
+          guard await acquireSlot(workID, isPrefetch: true) else { group.cancelAll(); return }
+          guard !Task.isCancelled, generation == cacheGeneration, libraryScanID == scanID else {
+            releaseSlot(workID); group.cancelAll(); return
+          }
+          let requestedOffset = offset
+          let task = Task {
+            await Self.boundedLibraryPage(seconds: 30) {
+              try? await api.thumbnailLibraryPage(id: folder, offset: requestedOffset, forceRefresh: refreshDirectory)
+            }
+          }
+          directoryWork = (workID, task)
+          let page = await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
+          if directoryWork?.id == workID { directoryWork = nil }
+          releaseSlot(workID)
+          guard !Task.isCancelled, generation == cacheGeneration, libraryScanID == scanID else {
+            group.cancelAll(); return
+          }
+          if task.isCancelled { continue } // Playback preempted this page.
+          guard let page else { break } // A bad folder cannot hold all later folders.
+          for item in page.items {
+            await Task.yield()
+            guard !Task.isCancelled, generation == cacheGeneration, libraryScanID == scanID else {
+              group.cancelAll(); return
+            }
+            if item.isDirectory {
+              if visited.insert(item.id).inserted { folders.append(item.id) }
+              continue
+            }
+            guard item.isVideo || item.isPhoto else { continue }
+            if pending >= 3 {
+              await group.next()
+              pending -= 1
+            }
+            guard !Task.isCancelled, generation == cacheGeneration, libraryScanID == scanID else {
+              group.cancelAll(); return
+            }
+            group.addTask { [self] in
+              await fillMissingThumbnail(item, api: api, generation: generation, scanID: scanID)
+            }
+            pending += 1
+          }
+          guard let next = page.nextOffset, next > offset else { break }
+          offset = next
         }
-        let requestedOffset = offset
-        let task = Task { try? await api.thumbnailLibraryPage(id: folder, offset: requestedOffset) }
-        directoryWork = (workID, task)
-        let page = await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
-        if directoryWork?.id == workID { directoryWork = nil }
-        releaseSlot(workID)
-        guard !Task.isCancelled, generation == cacheGeneration else { return }
-        if task.isCancelled { continue } // Playback preempted this page; resume later.
-        guard let page else { break }
-        for item in page.items {
-          await Task.yield()
-          guard !Task.isCancelled, generation == cacheGeneration else { return }
-          if !playbackOwners.isEmpty {
-            let pauseID = UUID()
-            guard await acquireSlot(pauseID, isPrefetch: true) else { return }
-            releaseSlot(pauseID)
-            guard !Task.isCancelled, generation == cacheGeneration else { return }
-          }
-          if item.isDirectory {
-            if visited.insert(item.id).inserted { folders.append(item.id) }
-            continue
-          }
-          guard item.isVideo || item.isPhoto else { continue }
-          let identity = identity(for: item)
-          if cachedThumbnail(for: item) != nil { continue }
-          if let data = try? disk.read(identity),
-             let source = CGImageSourceCreateWithData(data as CFData, nil),
-             CGImageSourceGetCount(source) > 0 { continue }
-          if let until = backgroundFailedUntil[identity.key], until > Date() { continue }
-          if await thumbnail(for: item, api: api, isPrefetch: true) == nil, !Task.isCancelled {
-            backgroundFailedUntil[identity.key] = Date().addingTimeInterval(300)
-          }
-          // Let visible cards and user-initiated directory requests run first.
-          do { try await Task.sleep(for: .milliseconds(120)) } catch { return }
-        }
-        guard let next = page.nextOffset, next > offset else { break }
-        offset = next
       }
+      if Task.isCancelled || generation != cacheGeneration || libraryScanID != scanID { group.cancelAll() }
+    }
+    if !Task.isCancelled, generation == cacheGeneration, libraryScanID == scanID {
+      completedLibraryReloadRevision = reloadRevision
     }
     backgroundFailedUntil = backgroundFailedUntil.filter { $0.value > Date() }
   }
 
+  private func fillMissingThumbnail(_ item: CloudItem, api: APIClient, generation: UUID, scanID: UUID) async {
+    guard !Task.isCancelled, generation == cacheGeneration, libraryScanID == scanID else { return }
+    let identity = identity(for: item)
+    if cachedThumbnail(for: item) != nil { return }
+    // Inspect disk metadata without decoding every cached cover into memory.
+    if let data = try? disk.read(identity),
+      let source = CGImageSourceCreateWithData(data as CFData, nil),
+      CGImageSourceGetCount(source) > 0 { return }
+    if let until = backgroundFailedUntil[identity.key], until > Date() { return }
+    let revision = libraryReloadRevision
+    if await thumbnail(for: item, api: api, isPrefetch: true) == nil,
+      !Task.isCancelled, generation == cacheGeneration, libraryScanID == scanID,
+      revision == libraryReloadRevision {
+      backgroundFailedUntil[identity.key] = Date().addingTimeInterval(300)
+    }
+  }
+
+  /// Reload wakes an idle walk without cancelling active/shared card requests.
+  /// During a walk, finish the current traversal and then check missing items again.
   func retryMissingThumbnails() {
+    libraryReloadRevision &+= 1
+    libraryIdleWait?.task.cancel()
     failedUntil.removeAll()
     backgroundFailedUntil.removeAll()
     frameAttempts.removeAll()
+  }
+
+  func waitForLibraryRescan(after revision: Int) async {
+    guard !Task.isCancelled, revision == libraryReloadRevision else { return }
+    let id = UUID()
+    let task = Task { do { try await Task.sleep(for: .seconds(300)) } catch {} }
+    libraryIdleWait?.task.cancel()
+    libraryIdleWait = (id, task)
+    await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
+    if libraryIdleWait?.id == id { libraryIdleWait = nil }
+  }
+
+  nonisolated static func boundedLibraryPage(
+    seconds: Double, operation: @escaping @Sendable () async -> ThumbnailLibraryPage?
+  ) async -> ThumbnailLibraryPage? {
+    let completion = ArtworkCompletion<ThumbnailLibraryPage>()
+    return await withTaskCancellationHandler {
+      await withCheckedContinuation { continuation in
+        completion.install(continuation)
+        let worker = Task {
+          guard !Task.isCancelled else { completion.finish(nil); return }
+          completion.finish(await operation())
+        }
+        let timeout = Task {
+          do { try await Task.sleep(for: .seconds(seconds)) } catch { return }
+          completion.finish(nil)
+        }
+        completion.attach([worker, timeout])
+      }
+    } onCancel: { completion.finish(nil) }
   }
 
   func suspendNetwork(for owner: UUID) {
@@ -258,6 +337,8 @@ actor ThumbnailService {
   @discardableResult
   func clearCache() -> Bool {
     cacheGeneration = UUID()
+    libraryScanID = UUID()
+    libraryIdleWait?.task.cancel()
     directoryWork?.task.cancel()
     backgroundFailedUntil.removeAll()
     for work in inFlight.values { work.task.cancel() }
@@ -278,6 +359,8 @@ actor ThumbnailService {
   /// A provider-specific namespace prevents the next source from reading it.
   func resetForSourceChange() {
     cacheGeneration = UUID()
+    libraryScanID = UUID()
+    libraryIdleWait?.task.cancel()
     directoryWork?.task.cancel()
     backgroundFailedUntil.removeAll()
     for work in inFlight.values { work.task.cancel() }
@@ -387,7 +470,7 @@ actor ThumbnailService {
 
   nonisolated static func firstAvailableArtwork(_ operations: [ArtworkOperation]) async -> UIImage? {
     guard !operations.isEmpty else { return nil }
-    let completion = ArtworkCompletion(remaining: operations.count)
+    let completion = ArtworkCompletion<UIImage>(remaining: operations.count)
     return await withTaskCancellationHandler {
       await withCheckedContinuation { continuation in
         completion.install(continuation)
@@ -406,7 +489,7 @@ actor ThumbnailService {
   nonisolated static func boundedArtwork(
     seconds: Double, operation: @escaping @Sendable () async -> UIImage?
   ) async -> UIImage? {
-    let completion = ArtworkCompletion()
+    let completion = ArtworkCompletion<UIImage>()
     return await withTaskCancellationHandler {
       await withCheckedContinuation { continuation in
         completion.install(continuation)
@@ -570,17 +653,17 @@ private final class ThumbnailFrameProbe: @unchecked Sendable {
 }
 
 /// Exactly-once completion, including cancellation before continuation installation.
-private final class ArtworkCompletion: @unchecked Sendable {
+private final class ArtworkCompletion<Value>: @unchecked Sendable {
   private let lock = NSLock()
   private var finished = false
-  private var result: UIImage?
-  private var continuation: CheckedContinuation<UIImage?, Never>?
+  private var result: Value?
+  private var continuation: CheckedContinuation<Value?, Never>?
   private var tasks: [Task<Void, Never>] = []
   private var remaining: Int
 
   init(remaining: Int = 1) { self.remaining = remaining }
 
-  func candidateFinished(_ image: UIImage?) {
+  func candidateFinished(_ image: Value?) {
     if let image { finish(image); return }
     lock.lock()
     remaining -= 1
@@ -589,7 +672,7 @@ private final class ArtworkCompletion: @unchecked Sendable {
     if exhausted { finish(nil) }
   }
 
-  func install(_ continuation: CheckedContinuation<UIImage?, Never>) {
+  func install(_ continuation: CheckedContinuation<Value?, Never>) {
     lock.lock()
     if finished {
       let result = result
@@ -609,7 +692,7 @@ private final class ArtworkCompletion: @unchecked Sendable {
     if shouldCancel { tasks.forEach { $0.cancel() } }
   }
 
-  func finish(_ image: UIImage?) {
+  func finish(_ image: Value?) {
     lock.lock()
     guard !finished else { lock.unlock(); return }
     finished = true

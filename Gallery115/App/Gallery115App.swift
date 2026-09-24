@@ -14,12 +14,13 @@ struct Gallery115App: App {
         .environment(appState)
         .preferredColorScheme(appState.colorSchemePreference.colorScheme)
         .tint(CinevaTheme.accent)
-        .task(id: "\(scenePhase)|\(appState.isAppUnlocked)|\(appState.isConfigured)|\(appState.mediaSourceRevision)|\(appState.thumbnailReloadRevision)", priority: .utility) {
+        .task(id: "\(scenePhase)|\(appState.isAppUnlocked)|\(appState.isConfigured)|\(appState.mediaSourceRevision)|\(appState.rootFolderID)", priority: .utility) {
           guard scenePhase == .active, appState.isAppUnlocked, appState.isConfigured else { return }
           // The app owns this walk so changing tabs/folders doesn't restart it.
           while !Task.isCancelled {
+            let revision = await appState.thumbnailService.libraryReloadRevision
             await appState.thumbnailService.fillLibrary(rootID: appState.rootFolderID, api: appState.api)
-            do { try await Task.sleep(for: .seconds(300)) } catch { return }
+            await appState.thumbnailService.waitForLibraryRescan(after: revision)
           }
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in

@@ -5,7 +5,7 @@ import Foundation
 actor APIClient {
   var thumbnailPages: [String: [ThumbnailLibraryPage]] = [:]
   func setThumbnailPages(_ pages: [String: [ThumbnailLibraryPage]]) { thumbnailPages = pages }
-  func thumbnailLibraryPage(id: String, offset: Int) async throws -> ThumbnailLibraryPage {
+  func thumbnailLibraryPage(id: String, offset: Int, forceRefresh: Bool = false) async throws -> ThumbnailLibraryPage {
     guard let pages = thumbnailPages[id], pages.indices.contains(offset) else {
       return ThumbnailLibraryPage(items: [], nextOffset: nil)
     }
