@@ -194,6 +194,17 @@ actor Cloud115Provider: CloudProvider {
     throw CloudProviderError.noPlayableSource
   }
 
+  /// Fetch the requested original without making transcoding lookup delay startup.
+  func playbackOriginalSource(for item: CloudItem) async throws -> VideoSource {
+    guard !item.pickCode.isEmpty else { throw CloudProviderError.noPlayableSource }
+    return try await originalSource(pickCode: item.pickCode)
+  }
+
+  func playbackTranscodedSources(for item: CloudItem) async throws -> [VideoSource] {
+    guard !item.pickCode.isEmpty else { throw CloudProviderError.noPlayableSource }
+    return try await transcodedSources(pickCode: item.pickCode)
+  }
+
   /// Small artwork needs the cheapest available transcode, not playback quality.
   func thumbnailSource(for item: CloudItem) async throws -> VideoSource? {
     guard !item.pickCode.isEmpty else { return nil }

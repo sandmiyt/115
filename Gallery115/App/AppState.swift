@@ -83,6 +83,18 @@ final class AppState {
     }
   }
 
+  enum OriginalPlaybackEngine: String, CaseIterable, Identifiable {
+    case automatic, system, vlc
+    var id: String { rawValue }
+    var title: String {
+      switch self {
+      case .automatic: return "自动（卡顿时切换 VLC）"
+      case .system: return "系统 AVPlayer"
+      case .vlc: return "VLC"
+      }
+    }
+  }
+
   enum MediaConnectionState: Equatable {
     case unknown
     case connected
@@ -158,6 +170,10 @@ final class AppState {
 
   var defaultQuality: DefaultQuality {
     didSet { UserDefaults.standard.set(defaultQuality.rawValue, forKey: Keys.defaultQuality) }
+  }
+
+  var originalPlaybackEngine: OriginalPlaybackEngine {
+    didSet { UserDefaults.standard.set(originalPlaybackEngine.rawValue, forKey: Keys.originalPlaybackEngine) }
   }
 
   var colorSchemePreference: ColorSchemePreference {
@@ -275,7 +291,8 @@ final class AppState {
       BrowserLayout(rawValue: defaults.string(forKey: Keys.browserLayout) ?? "") ?? .grid
     defaultQuality =
       DefaultQuality(rawValue: defaults.string(forKey: Keys.defaultQuality) ?? "")
-      ?? .highestTranscode
+        ?? .highestTranscode
+    originalPlaybackEngine = OriginalPlaybackEngine(rawValue: defaults.string(forKey: Keys.originalPlaybackEngine) ?? "") ?? .automatic
     colorSchemePreference =
       ColorSchemePreference(rawValue: defaults.string(forKey: Keys.colorScheme) ?? "") ?? .system
     let sourceStore = MediaSourceSelectionStore.shared
@@ -524,6 +541,7 @@ final class AppState {
     static let preferredPlaybackRate = "cineva.player.playbackRate.v1"
     static let compactArtworkMigration = "cineva.compactArtworkMigration.v1"
     static let defaultQuality = "gallery115.defaultQuality"
+    static let originalPlaybackEngine = "cineva.playback.originalEngine.v1"
     static let colorScheme = "gallery115.colorScheme"
     static let rootFolderID = "gallery115.rootFolderID"
     static let faceIDEnabled = "gallery115.faceIDEnabled"

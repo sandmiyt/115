@@ -18,12 +18,18 @@ import SwiftUI
     private(set) var networkMbps: Double = 0
     private(set) var transferredMegabytes: Double = 0
     private(set) var volume: Float = 1
+    private(set) var errorMessage: String?
     var bufferedUntil: Double { currentTime }
     var bufferedDuration: Double { 0 }
 
     let player = VLCMediaPlayer()
     private var pollTimer: Timer?
     private var item: CloudItem?
+    private var configuredSource: VideoSource?
+    private var pendingResumePosition: Double?
+    private var lastMediaProgressAt = Date()
+    private var sampledBytes: Int64 = 0
+    private var sampledAt = Date()
     private var libraryStore: LibraryStore?
     private var lastSavedSecond = -1
     private var lastState: VLCMediaPlayerState = .stopped
@@ -40,12 +46,15 @@ import SwiftUI
       item: CloudItem,
       libraryStore: LibraryStore,
       playbackRate: Float,
-      fastStartEnabled: Bool
+      fastStartEnabled: Bool,
+      resumeAt: Double? = nil
     ) {
+      guard configuredSource != source || self.item?.id != item.id else { return }
       stop(saveProgress: false)
       let generation = UUID()
       playbackGeneration = generation
       self.item = item
+      configuredSource = source
       self.libraryStore = libraryStore
       didReachEnd = false
       currentTime = 0
@@ -54,13 +63,17 @@ import SwiftUI
       transferredMegabytes = 0
       maxObservedTime = 0
       lastSavedSecond = -1
+      errorMessage = nil
+      sampledBytes = 0
+      sampledAt = Date()
+      lastMediaProgressAt = Date()
 
       let media = VLCMedia(url: source.url)
       // Originals often arrive in bursts. 650 ms exhausts almost immediately
       // between responses; keep a bounded runway without changing the source.
       let cacheMilliseconds = item.isDiscImage ? 4200 : (fastStartEnabled ? 1800 : 3500)
       var options: [String: Any] = [
-        "http-user-agent": APIClient.userAgent,
+        "http-user-agent": source.headers.first(where: { $0.key.lowercased() == "user-agent" })?.value ?? APIClient.userAgent,
         "network-caching": cacheMilliseconds,
         "disc-caching": cacheMilliseconds,
         "file-caching": cacheMilliseconds,
@@ -81,20 +94,16 @@ import SwiftUI
       isPlaying = true
       isBuffering = true
 
-      let resume = libraryStore.resumePosition(for: item)
-      if resume > 2, duration <= 0 || resume < duration - 15 {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-          guard let self,
-            self.playbackGeneration == generation,
-            self.item?.id == item.id
-          else { return }
-          self.seek(to: resume)
-        }
-      }
+      let resume = resumeAt ?? libraryStore.resumePosition(for: item)
+      // Handoffs preserve even a sub-two-second position. Apply only when VLC
+      // reports seekability; a fixed 350 ms timer races slow network opening.
+      pendingResumePosition = resume > 0 && (resumeAt != nil || (resume > 2 && (duration <= 0 || resume < duration - 15))) ? resume : nil
+      if let pendingResumePosition { currentTime = pendingResumePosition }
       startPolling()
     }
 
     func attachDrawable(_ view: UIView) {
+      if let attached = player.drawable as? UIView, attached === view { return }
       player.drawable = view
     }
 
@@ -123,6 +132,7 @@ import SwiftUI
     }
 
     func seek(to seconds: Double) {
+      pendingResumePosition = nil
       cancelInteractiveScrub()
       let target = clampedSeekTarget(seconds)
       currentTime = target
@@ -131,6 +141,7 @@ import SwiftUI
 
     @discardableResult
     func beginInteractiveScrub() -> Bool {
+      pendingResumePosition = nil
       let shouldResume = isPlaying || player.state == .playing || player.state == .buffering
       cancelInteractiveScrub()
       interactiveScrubActive = true
@@ -226,6 +237,8 @@ import SwiftUI
       // Invalidate delayed work (for example resume seeking) from the previous
       // media item before the controller is reused for another episode.
       playbackGeneration = UUID()
+      configuredSource = nil
+      pendingResumePosition = nil
       pollTimer?.invalidate()
       pollTimer = nil
       player.stop()
@@ -237,19 +250,28 @@ import SwiftUI
 
     private func startPolling() {
       pollTimer?.invalidate()
-      pollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+      pollTimer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
         Task { @MainActor [weak self] in
           self?.poll()
         }
       }
       pollTimer?.tolerance = 0.08
+      if let pollTimer { RunLoop.main.add(pollTimer, forMode: .common) }
     }
 
     private func poll() {
       let state = player.state
       let milliseconds = max(player.time.intValue, 0)
-      if !interactiveScrubActive {
-        currentTime = Double(milliseconds) / 1000
+      let mediaTime = Double(milliseconds) / 1000
+      let now = Date()
+      if let resume = pendingResumePosition {
+        if player.isSeekable {
+          pendingResumePosition = nil
+          applySeek(resume)
+        }
+      } else if !interactiveScrubActive {
+        if abs(mediaTime - currentTime) > 0.08 { lastMediaProgressAt = now }
+        currentTime = mediaTime
         maxObservedTime = max(maxObservedTime, currentTime)
       }
 
@@ -258,16 +280,21 @@ import SwiftUI
       }
 
       isPlaying = !interactiveScrubActive && state == .playing
-      isBuffering = !interactiveScrubActive && state == .opening
+      isBuffering = !interactiveScrubActive && (state == .opening
+        || (state == .buffering && now.timeIntervalSince(lastMediaProgressAt) > 0.75))
+      if state == .error { errorMessage = "VLC 无法读取此原画，请检查网络或在设置中切换系统内核。" }
       if let audio = player.audio {
         volume = Float(audio.volume) / 100
       }
 
       if let media = player.media {
         let stats = media.statistics
-        let bitrate = Double(stats.inputBitrate)
-        networkMbps = bitrate > 0 ? bitrate * 8 / 1_000_000 : 0
-        transferredMegabytes = Double(stats.readBytes) / 1_048_576
+        let bytes = max(Int64(stats.readBytes), 0)
+        let elapsed = now.timeIntervalSince(sampledAt)
+        networkMbps = elapsed > 0 && bytes >= sampledBytes ? Double(bytes - sampledBytes) * 8 / elapsed / 1_000_000 : 0
+        sampledBytes = bytes
+        sampledAt = now
+        transferredMegabytes = Double(bytes) / 1_048_576
       }
 
       if state == .stopped, lastState == .playing, duration > 0, maxObservedTime >= duration * 0.92 {
@@ -279,7 +306,7 @@ import SwiftUI
     }
 
     private func saveProgress(force: Bool) {
-      guard !interactiveScrubActive, let item, let libraryStore else { return }
+      guard !interactiveScrubActive, pendingResumePosition == nil, let item, let libraryStore else { return }
       let second = max(0, Int(currentTime.rounded(.down)))
       if force || second >= lastSavedSecond + 5 {
         lastSavedSecond = second
@@ -321,6 +348,7 @@ import SwiftUI
     private(set) var networkMbps: Double = 0
     private(set) var transferredMegabytes: Double = 0
     private(set) var volume: Float = 1
+    private(set) var errorMessage: String?
     var bufferedUntil: Double { currentTime }
     var bufferedDuration: Double { 0 }
 
@@ -329,7 +357,8 @@ import SwiftUI
       item: CloudItem,
       libraryStore: LibraryStore,
       playbackRate: Float,
-      fastStartEnabled: Bool
+      fastStartEnabled: Bool,
+      resumeAt: Double? = nil
     ) {}
     func pause() {}
     func resume() {}

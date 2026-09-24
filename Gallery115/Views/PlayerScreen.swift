@@ -335,6 +335,12 @@ struct PlayerScreen: View {
       configureRemotePlayback()
       updateRemotePlaybackInfo()
     }
+    .onChange(of: vlcController.errorMessage) { _, message in
+      if let message, useVLC { model?.errorMessage = message }
+    }
+    .onChange(of: systemPresentationController.isPictureInPictureActive) { _, active in
+      model?.allowsAutomaticEngineSwitch = !active
+    }
     .onChange(of: activeCurrentTime) { _, _ in
       updateRemotePlaybackInfo()
     }
@@ -2021,6 +2027,7 @@ struct PlayerScreen: View {
       api: appState.api,
       libraryStore: appState.libraryStore,
       defaultQuality: appState.defaultQuality,
+      originalPlaybackEngine: appState.originalPlaybackEngine,
       fastStartEnabled: appState.fastStartEnabled,
       networkAutoRecoveryEnabled: appState.networkAutoRecoveryEnabled
     )
@@ -2032,7 +2039,7 @@ struct PlayerScreen: View {
     // received its URL and begun opening the media connection.
     await newModel.prepareAndPlay()
     guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else {
-      newModel.player.pause()
+      newModel.pause()
       return
     }
 
@@ -2116,8 +2123,10 @@ struct PlayerScreen: View {
         item: currentItem,
         libraryStore: appState.libraryStore,
         playbackRate: playbackRate,
-        fastStartEnabled: appState.fastStartEnabled
+        fastStartEnabled: appState.fastStartEnabled,
+        resumeAt: playerModel.engineSwitchResumePosition
       )
+      vlcController.setVolume(playerModel.volume)
     } else {
       if useVLC {
         vlcController.stop(saveProgress: false)
@@ -2974,6 +2983,9 @@ private struct PlayerInfoSheet: View {
         Section("播放") {
           LabeledContent("播放内核", value: playbackEngine)
           LabeledContent("当前清晰度", value: model?.selectedSource?.title ?? "原画")
+          if let reason = model?.engineSwitchReason {
+            Text(reason).font(.caption).foregroundStyle(.secondary)
+          }
           LabeledContent("画面模式", value: videoLayout.title)
           LabeledContent("播放速度", value: playbackRate == 1 ? "1x" : String(format: "%gx", playbackRate))
           LabeledContent("同目录队列", value: "\(playlistCount) 个视频")
@@ -2989,8 +3001,11 @@ private struct PlayerInfoSheet: View {
         }
 
         Section("网络") {
+          if playbackEngine == "AVPlayer", let model {
+            LabeledContent("播放状态", value: model.waitingStatus)
+          }
           LabeledContent(
-            "实时速度",
+            "下载速度（采样）",
             value: networkMbps > 0.01 ? String(format: "%.1f Mbps", networkMbps) : "--"
           )
           LabeledContent(

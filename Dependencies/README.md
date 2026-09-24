@@ -24,3 +24,27 @@ Local `pod install` continues to use the official source. If it is unavailable,
 run `CINEVA_VLC_MIRROR=github pod install`, or prefix `./build_unsigned_ipa.sh`
 with the same environment variable. No playback engine or codec is removed to
 work around a download failure.
+
+## Original-video engine routing (2.2.8)
+
+Settings > Playback exposes Automatic, AVPlayer and VLC for original sources.
+Automatic keeps native playback until a continuous 15-second interruption or
+three interruptions of at least 3 seconds within 60 seconds, then hands the same
+URL and current position to VLC once. Network recovery must be enabled; AirPlay,
+PiP, intentional pause and active scrubbing suppress the stall handoff. There is
+no automatic quality downgrade or AVPlayer/VLC switching loop. VLC receives the
+source User-Agent and waits for seekability before restoring the position.
+
+Engine selection was reviewed against the upstream projects:
+- https://github.com/videolan/vlckit (the already pinned libvlc integration)
+- https://github.com/kingslay/KSPlayer (progress preview and disk precaching are
+  listed as paid-version features, not capabilities of its public GPL version)
+- https://github.com/mpvkit/MPVKit (upstream cautions about infrequent maintenance
+  and patched Metal support)
+
+This is an integration choice, not a measured claim that VLC is universally
+faster. Xcode packaging cannot verify a user's authenticated 115 CDN path. Device
+checks still needed: the same long original on both engines, sustained stalls,
+handoff position/rate/volume, pause/seek/PiP exclusions, and rapid next/back. The
+download-speed display samples access-log byte counters and may lag their update;
+it is not a packet-level bandwidth measurement. No new regression CI job is added.

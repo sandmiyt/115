@@ -162,6 +162,9 @@ final class PlayerModel: PlaybackEngineControlling {
   private(set) var networkMbps: Double = 0
   private(set) var transferredMegabytes: Double = 0
   private(set) var requiresVLC = false
+  private(set) var engineSwitchResumePosition: Double?
+  private(set) var engineSwitchReason: String?
+  private(set) var waitingStatus = "准备播放"
   private(set) var videoCodec = "读取中"
   private(set) var hdrFormat = "SDR"
   private(set) var nominalFrameRate: Float = 0
@@ -169,6 +172,7 @@ final class PlayerModel: PlaybackEngineControlling {
 
   var errorMessage: String?
   var didFallbackFromOriginal = false
+  var allowsAutomaticEngineSwitch = true
 
   let player = AVPlayer()
   var volume: Float { player.volume }
@@ -177,6 +181,7 @@ final class PlayerModel: PlaybackEngineControlling {
   private let api: APIClient
   private let libraryStore: LibraryStore
   private let defaultQuality: AppState.DefaultQuality
+  private let originalPlaybackEngine: AppState.OriginalPlaybackEngine
   private let fastStartEnabled: Bool
   private let networkAutoRecoveryEnabled: Bool
   private var activeAsset: AVURLAsset?
@@ -184,7 +189,8 @@ final class PlayerModel: PlaybackEngineControlling {
   private var mediaInfoGeneration = UUID()
   private var audioGroup: AVMediaSelectionGroup?
   private var subtitleGroup: AVMediaSelectionGroup?
-  nonisolated(unsafe) private var timeObserver: Any?
+  nonisolated(unsafe) private var playbackTimer: Timer?
+  @ObservationIgnored private var deferredSourcesTask: Task<Void, Never>?
   nonisolated(unsafe) private var failureObserver: NSObjectProtocol?
   nonisolated(unsafe) private var endObserver: NSObjectProtocol?
   nonisolated(unsafe) private var stallObserver: NSObjectProtocol?
@@ -199,6 +205,11 @@ final class PlayerModel: PlaybackEngineControlling {
   private var lastPlaybackProgressAt = Date()
   private var lastPlaybackProgressTime: Double = 0
   private var wantsPlayback = false
+  private var hasPlayedCurrentItem = false
+  private var pendingInitialPosition: Double = 0
+  private var bufferingStartedAt: Date?
+  private var countedCurrentStall = false
+  private var sustainedStalls: [Date] = []
   private var interactiveScrubActive = false
   private var stallProbeTask: Task<Void, Never>?
 
@@ -217,6 +228,7 @@ final class PlayerModel: PlaybackEngineControlling {
   init(
     item: CloudItem, api: APIClient, libraryStore: LibraryStore,
     defaultQuality: AppState.DefaultQuality,
+    originalPlaybackEngine: AppState.OriginalPlaybackEngine = .automatic,
     fastStartEnabled: Bool = true,
     networkAutoRecoveryEnabled: Bool = true
   ) {
@@ -224,6 +236,7 @@ final class PlayerModel: PlaybackEngineControlling {
     self.api = api
     self.libraryStore = libraryStore
     self.defaultQuality = defaultQuality
+    self.originalPlaybackEngine = originalPlaybackEngine
     self.fastStartEnabled = fastStartEnabled
     self.networkAutoRecoveryEnabled = networkAutoRecoveryEnabled
     self.duration = max(item.duration, libraryStore.knownDuration(for: item))
@@ -234,9 +247,8 @@ final class PlayerModel: PlaybackEngineControlling {
   }
 
   deinit {
-    if let timeObserver {
-      player.removeTimeObserver(timeObserver)
-    }
+    playbackTimer?.invalidate()
+    deferredSourcesTask?.cancel()
     if let failureObserver {
       NotificationCenter.default.removeObserver(failureObserver)
     }
@@ -262,9 +274,9 @@ final class PlayerModel: PlaybackEngineControlling {
     defer { isPreparing = false }
 
     do {
-      let loadedSources = try await api.videoSources(for: item)
+      let initial = try await api.initialVideoSources(for: item, preferOriginal: defaultQuality == .original)
       try Task.checkCancellation()
-      sources = loadedSources
+      sources = initial.sources
       guard !sources.isEmpty else {
         errorMessage = "媒体源没有返回可播放地址。"
         return
@@ -283,9 +295,25 @@ final class PlayerModel: PlaybackEngineControlling {
         await play(preferred, allowFallback: true)
       }
       installTimeObserverIfNeeded()
+      if initial.hasDeferredTranscodes { loadRemainingSources() }
     } catch {
       guard !Task.isCancelled else { return }
       errorMessage = error.localizedDescription
+    }
+  }
+
+  private func loadRemainingSources() {
+    deferredSourcesTask?.cancel()
+    let api = self.api
+    let item = self.item
+    deferredSourcesTask = Task { @MainActor [weak self] in
+      do {
+        try await Task.sleep(for: .seconds(2))
+        let remaining = try await api.remainingVideoSources(for: item)
+        guard let self, !Task.isCancelled else { return }
+        let existingIDs = Set(self.sources.map(\.id))
+        self.sources.append(contentsOf: remaining.filter { !existingIDs.contains($0.id) })
+      } catch { /* Original playback continues even when other qualities are unavailable. */ }
     }
   }
 
@@ -296,6 +324,8 @@ final class PlayerModel: PlaybackEngineControlling {
 
   func pause() {
     wantsPlayback = false
+    bufferingStartedAt = nil
+    countedCurrentStall = false
     stallProbeTask?.cancel()
     stallProbeTask = nil
     cancelInteractiveScrub()
@@ -357,6 +387,8 @@ final class PlayerModel: PlaybackEngineControlling {
     let shouldResume = scrubResumeAfterFinish || isPlaying || player.timeControlStatus != .paused || player.rate > 0
     cancelInteractiveScrub()
     interactiveScrubActive = true
+    bufferingStartedAt = nil
+    countedCurrentStall = false
     stallProbeTask?.cancel()
     stallProbeTask = nil
     player.pause()
@@ -558,6 +590,13 @@ final class PlayerModel: PlaybackEngineControlling {
     bufferedRanges = []
     bufferedUntil = 0
     selectedSource = source
+    hasPlayedCurrentItem = false
+    pendingInitialPosition = libraryStore.resumePosition(for: item)
+    engineSwitchReason = nil
+    engineSwitchResumePosition = nil
+    bufferingStartedAt = nil
+    countedCurrentStall = false
+    sustainedStalls = []
     wantsPlayback = true
     errorMessage = nil
     didReachEnd = false
@@ -593,7 +632,8 @@ final class PlayerModel: PlaybackEngineControlling {
     // the VLC runtime is actually bundled. MP4/MOV and other Apple-friendly
     // originals still stay on AVPlayer so HDR, Dolby Vision, AirPlay and PiP
     // keep using the system playback pipeline.
-    if source.isOriginal, item.prefersVLCForOriginal, VLCAvailability.isAvailable {
+    if source.isOriginal, originalPlaybackEngine != .system,
+      (item.prefersVLCForOriginal || originalPlaybackEngine == .vlc), VLCAvailability.isAvailable {
       player.replaceCurrentItem(with: nil)
       requiresVLC = true
       isPlaying = false
@@ -823,73 +863,144 @@ final class PlayerModel: PlaybackEngineControlling {
   }
 
   private func installTimeObserverIfNeeded() {
-    guard timeObserver == nil else { return }
-    timeObserver = player.addPeriodicTimeObserver(
-      forInterval: CMTime(seconds: 0.5, preferredTimescale: 2),
-      queue: .main
-    ) { [weak self] time in
-      Task { @MainActor [weak self] in
-        guard let self else { return }
-        let seconds = time.seconds.isFinite ? max(time.seconds, 0) : 0
-        let now = Date()
-        // A backwards seek also establishes a new progress baseline. Otherwise
-        // playback appears stalled until it reaches the old pre-seek timestamp.
-        let progressed = abs(seconds - self.lastPlaybackProgressTime) > 0.08
-        if progressed {
-          self.lastPlaybackProgressTime = seconds
-          self.lastPlaybackProgressAt = now
-        }
-
-        if !self.interactiveScrubActive {
-          self.currentTime = seconds
-          self.isPlaying = self.player.timeControlStatus == .playing
-          self.isBuffering = self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate
-        }
-
-        if self.networkAutoRecoveryEnabled,
-          self.wantsPlayback,
-          !self.didReachEnd,
-          !self.interactiveScrubActive,
-          seconds > 0.5,
-          now.timeIntervalSince(self.lastPlaybackProgressAt) > 3.2,
-          (self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate || self.player.rate > 0)
-        {
-          self.requestStallRecoveryIfNeeded()
-        }
-
-        let ranges = PlaybackBufferPolicy.normalized((self.player.currentItem?.loadedTimeRanges ?? []).map {
-          let range = $0.timeRangeValue
-          return PlaybackBufferRange(start: range.start.seconds, end: CMTimeRangeGetEnd(range).seconds)
-        })
-        if ranges != self.bufferedRanges { self.bufferedRanges = ranges }
-        self.bufferedUntil = PlaybackBufferPolicy.contiguousEnd(at: self.currentTime, ranges: ranges)
-
-        if let event = self.player.currentItem?.accessLog()?.events.last {
-          let observed = event.observedBitrate
-          let bytes = event.numberOfBytesTransferred
-          self.transferredMegabytes = bytes > 0 ? Double(bytes) / 1_048_576 : 0
-
-          if observed.isFinite, observed > 0 {
-            self.networkMbps = observed / 1_000_000
-          } else {
-            let now = Date()
-            let elapsed = now.timeIntervalSince(self.lastBandwidthSampleAt)
-            if elapsed >= 0.45, bytes >= self.lastTransferredBytes {
-              let delta = bytes - self.lastTransferredBytes
-              self.networkMbps = elapsed > 0 ? Double(delta) * 8 / elapsed / 1_000_000 : 0
-              self.lastTransferredBytes = bytes
-              self.lastBandwidthSampleAt = now
-            }
-          }
-        }
-
-        let second = Int(seconds)
-        if second >= 0, second != self.lastSavedSecond, second % 5 == 0 {
-          self.lastSavedSecond = second
-          self.saveProgress(force: false)
-        }
-      }
+    guard playbackTimer == nil else { return }
+    // Playback-time observers stop ticking when the media clock stalls. The
+    // watchdog and buffer display must keep running on wall time, including
+    // while the user is dragging or waiting for a remote range to arrive.
+    let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+      Task { @MainActor [weak self] in self?.pollPlayback() }
     }
+    timer.tolerance = 0.08
+    RunLoop.main.add(timer, forMode: .common)
+    playbackTimer = timer
+  }
+
+  private func pollPlayback() {
+    guard !requiresVLC else { return }
+    if let failedItem = player.currentItem, failedItem.status == .failed {
+      if selectedSource?.isOriginal == true, originalPlaybackEngine != .system, VLCAvailability.isAvailable {
+        switchOriginalToVLC(reason: "系统内核无法打开原画，已切换 VLC")
+      } else {
+        errorMessage = failedItem.error?.localizedDescription ?? "视频无法打开。"
+        wantsPlayback = false
+      }
+      return
+    }
+    let seconds = player.currentTime().seconds.isFinite ? max(player.currentTime().seconds, 0) : 0
+    let now = Date()
+    // A backwards seek also establishes a new progress baseline. Otherwise
+    // playback appears stalled until it reaches the old pre-seek timestamp.
+    let progressed = abs(seconds - lastPlaybackProgressTime) > 0.08
+    if progressed {
+      lastPlaybackProgressTime = seconds
+      lastPlaybackProgressAt = now
+      if seconds > 0 { hasPlayedCurrentItem = true }
+    }
+
+    if !interactiveScrubActive {
+      currentTime = seconds
+      isPlaying = player.timeControlStatus == .playing
+      isBuffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
+    }
+
+    if networkAutoRecoveryEnabled,
+      wantsPlayback,
+      !didReachEnd,
+      !interactiveScrubActive,
+      seconds > 0.5,
+      now.timeIntervalSince(lastPlaybackProgressAt) > 3.2,
+      (player.timeControlStatus == .waitingToPlayAtSpecifiedRate || player.rate > 0)
+    {
+      requestStallRecoveryIfNeeded()
+    }
+
+    let ranges = PlaybackBufferPolicy.normalized((player.currentItem?.loadedTimeRanges ?? []).map {
+      let range = $0.timeRangeValue
+      return PlaybackBufferRange(start: range.start.seconds, end: CMTimeRangeGetEnd(range).seconds)
+    })
+    if ranges != bufferedRanges { bufferedRanges = ranges }
+    bufferedUntil = PlaybackBufferPolicy.contiguousEnd(at: currentTime, ranges: ranges)
+
+    if let log = player.currentItem?.accessLog() {
+      let bytes = log.events.reduce(Int64(0)) { $0 + max($1.numberOfBytesTransferred, 0) }
+      transferredMegabytes = Double(bytes) / 1_048_576
+      let elapsed = now.timeIntervalSince(lastBandwidthSampleAt)
+      if elapsed >= 0.45 {
+        networkMbps = bytes >= lastTransferredBytes
+          ? Double(bytes - lastTransferredBytes) * 8 / elapsed / 1_000_000 : 0
+        lastTransferredBytes = bytes
+        lastBandwidthSampleAt = now
+      }
+    } else {
+      networkMbps = 0
+    }
+    updateWaitingStatusAndFallback(now: now)
+    guard !requiresVLC else { return }
+
+    let second = Int(seconds)
+    if second >= 0, second != lastSavedSecond, second % 5 == 0 {
+      lastSavedSecond = second
+      saveProgress(force: false)
+    }
+  }
+
+  private func updateWaitingStatusAndFallback(now: Date) {
+    guard wantsPlayback, !interactiveScrubActive, !didReachEnd else {
+      bufferingStartedAt = nil
+      countedCurrentStall = false
+      waitingStatus = interactiveScrubActive ? "正在定位" : "已暂停"
+      return
+    }
+    let stalled = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
+      || (player.currentItem?.status == .readyToPlay && now.timeIntervalSince(lastPlaybackProgressAt) > 3)
+    guard stalled else {
+      bufferingStartedAt = nil
+      countedCurrentStall = false
+      waitingStatus = "正在播放"
+      return
+    }
+    isBuffering = true
+    if player.reasonForWaitingToPlay == .toMinimizeStalls {
+      waitingStatus = bufferedDuration > 0 ? "系统正在评估缓冲" : "正在等待视频数据"
+    } else {
+      waitingStatus = "正在等待视频数据或解码"
+    }
+    if bufferingStartedAt == nil { bufferingStartedAt = now }
+    let wait = now.timeIntervalSince(bufferingStartedAt ?? now)
+    sustainedStalls.removeAll { now.timeIntervalSince($0) > 60 }
+    if wait >= 3, !countedCurrentStall {
+      countedCurrentStall = true
+      sustainedStalls.append(now)
+    }
+    // A single normal refill must not change engines. Recover only a long
+    // interruption or repeated sustained stalls, and never downgrade quality.
+    guard networkAutoRecoveryEnabled, allowsAutomaticEngineSwitch, originalPlaybackEngine == .automatic,
+      selectedSource?.isOriginal == true, !player.isExternalPlaybackActive,
+      wait >= 15 || sustainedStalls.count >= 3 else { return }
+    switchOriginalToVLC(reason: "原画持续缓冲，已切换 VLC 续播")
+  }
+
+  private func switchOriginalToVLC(reason: String) {
+    guard !requiresVLC, selectedSource?.isOriginal == true, VLCAvailability.isAvailable else { return }
+    let position = player.currentTime().seconds
+    engineSwitchResumePosition = position.isFinite && position > 0 ? position
+      : (hasPlayedCurrentItem ? currentTime : pendingInitialPosition)
+    libraryStore.recordPlayback(item, position: engineSwitchResumePosition ?? 0, duration: duration)
+    engineSwitchReason = reason
+    waitingStatus = reason
+    cancelInteractiveScrub()
+    stallProbeTask?.cancel()
+    stallProbeTask = nil
+    wantsPlayback = false
+    player.pause()
+    player.replaceCurrentItem(with: nil)
+    // Invalidate metadata tasks from the old AVPlayerItem.
+    mediaInfoGeneration = UUID()
+    activeAsset = nil
+    requiresVLC = true
+    isPlaying = false
+    isBuffering = false
+    errorMessage = nil
   }
 
   private func installItemObservers(for playerItem: AVPlayerItem) {
@@ -910,6 +1021,7 @@ final class PlayerModel: PlaybackEngineControlling {
     ) { [weak self] notification in
       guard let self else { return }
       Task { @MainActor in
+        guard self.player.currentItem === playerItem else { return }
         await self.handlePlaybackFailure(notification)
       }
     }
@@ -920,7 +1032,7 @@ final class PlayerModel: PlaybackEngineControlling {
       queue: .main
     ) { [weak self] _ in
       Task { @MainActor [weak self] in
-        guard let self else { return }
+        guard let self, self.player.currentItem === playerItem else { return }
         self.currentTime = self.duration
         self.isPlaying = false
         self.didReachEnd = true
@@ -936,7 +1048,8 @@ final class PlayerModel: PlaybackEngineControlling {
       queue: .main
     ) { [weak self] _ in
       Task { @MainActor [weak self] in
-        self?.requestStallRecoveryIfNeeded()
+        guard let self, self.player.currentItem === playerItem else { return }
+        self.requestStallRecoveryIfNeeded()
       }
     }
   }
@@ -985,12 +1098,8 @@ final class PlayerModel: PlaybackEngineControlling {
     guard !isFallingBack else { return }
     let reason = (notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error)?
       .localizedDescription
-    if selectedSource?.isOriginal == true, VLCAvailability.isAvailable {
-      requiresVLC = true
-      player.replaceCurrentItem(with: nil)
-      isPlaying = false
-      isBuffering = false
-      errorMessage = nil
+    if selectedSource?.isOriginal == true, originalPlaybackEngine != .system, VLCAvailability.isAvailable {
+      switchOriginalToVLC(reason: "系统内核无法继续播放，已切换 VLC 原画")
     } else if selectedSource?.isOriginal == true, let fallback = bestTranscode {
       isFallingBack = true
       didFallbackFromOriginal = true
@@ -1062,6 +1171,7 @@ final class PlayerModel: PlaybackEngineControlling {
   }
 
   private func saveProgress(force: Bool) {
+    guard hasPlayedCurrentItem else { return }
     let seconds = player.currentTime().seconds
     guard seconds.isFinite, seconds >= 0 else { return }
     libraryStore.recordPlayback(item, position: seconds, duration: duration)

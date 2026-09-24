@@ -355,6 +355,15 @@ private struct PlaybackSettingsView: View {
           .font(.caption)
           .foregroundStyle(.secondary)
 
+        Picker("原画播放内核", selection: $appState.originalPlaybackEngine) {
+          ForEach(AppState.OriginalPlaybackEngine.allCases) { engine in
+            Text(engine.title).tag(engine)
+          }
+        }
+        Text("自动模式在原画持续卡顿时切换 VLC，并保留进度。VLC 播放同一原文件；系统内核支持原生 HDR、画中画和 AirPlay。")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+
         Toggle("自动播放下一集", isOn: $appState.autoPlayNextEpisode)
         Text(
           appState.autoPlayNextEpisode
