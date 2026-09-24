@@ -110,11 +110,10 @@ Windows 只能进行源码预检；最终类型检查以完整 Xcode Release 构
 依据：[Apple seek 容差与解码延迟](https://developer.apple.com/documentation/avfoundation/avplayer/seek(to:tolerancebefore:toleranceafter:))、[Apple QA1820 合并拖动定位](https://developer.apple.com/library/archive/qa/qa1820/_index.html)。
 
 
-## 2026-09-24 1080P 画质选项（2.2.5 / 29）
+## 2026-09-24 默认画质新增 1080P（2.2.5 / 29）
 
-- 设置的默认画质新增“1080P 优先”，保留用户原有默认值。优先选 115 返回的 definition=4 转码；没有时先选较低转码，再回退到其他实际可用源。
-- 播放器清晰度菜单统一标注 1080P。没有实际 1080P 地址时显示“当前视频暂无转码源”，不会把原画地址伪装为 1080P，也不在手机上实时转码。
-- 手动换画质前保存当前引擎的进度，再把明确的当前位置传给系统播放器，避免套用历史续播的片尾跳过规则。点击已经选中的画质不会重载。
+- 仅在设置 → 播放 → 默认画质新增“1080P 优先”，保留用户原有默认值。优先选 115 返回的 definition=4 转码；没有时先选较低转码，再回退到其他实际可用源，当前实际画质沿用既有播放器显示。
+- 播放菜单、手动切换画质和续播逻辑保持原样；不新增播放菜单入口或不可用提示。
 - GitHub 仍只构建 IPA，不增加 regression 任务或测试产物。
 
-验证：Windows 源码预检和 diff 检查；完整 Release 构建结果以对应 GitHub Actions 为准。真实 115 账号的视频转码可用性、原画切换 1080P 的续播和长视频流畅度仍需真机验证。
+验证：Windows 源码预检和 diff 检查；完整 Release 构建结果以对应 GitHub Actions 为准。真实 115 账号的视频转码可用性及长视频播放流畅度仍需真机验证。

@@ -289,9 +289,9 @@ final class PlayerModel: PlaybackEngineControlling {
     }
   }
 
-  func select(_ source: VideoSource, resumeAt seconds: Double? = nil) async {
+  func select(_ source: VideoSource) async {
     didFallbackFromOriginal = false
-    await play(source, allowFallback: true, resumeAt: seconds)
+    await play(source, allowFallback: true)
   }
 
   func pause() {
@@ -540,7 +540,7 @@ final class PlayerModel: PlaybackEngineControlling {
     max(PlaybackBufferPolicy.contiguousEnd(at: currentTime, ranges: bufferedRanges) - currentTime, 0)
   }
 
-  private func play(_ source: VideoSource, allowFallback: Bool, resumeAt seconds: Double? = nil) async {
+  private func play(_ source: VideoSource, allowFallback: Bool) async {
     cancelInteractiveScrub()
     bufferedRanges = []
     bufferedUntil = 0
@@ -619,11 +619,8 @@ final class PlayerModel: PlaybackEngineControlling {
     installItemObservers(for: playerItem)
     player.replaceCurrentItem(with: playerItem)
 
-    let resumePosition = seconds ?? libraryStore.resumePosition(for: item)
-    let shouldResume = seconds != nil
-      ? resumePosition.isFinite && resumePosition > 0 && (duration <= 0 || resumePosition < duration)
-      : resumePosition > 2 && (duration <= 0 || resumePosition < duration - 15)
-    if shouldResume {
+    let resumePosition = libraryStore.resumePosition(for: item)
+    if resumePosition > 2, duration <= 0 || resumePosition < duration - 15 {
       currentTime = resumePosition
       player.seek(
         to: CMTime(seconds: resumePosition, preferredTimescale: 600),

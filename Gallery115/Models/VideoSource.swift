@@ -21,8 +21,6 @@ struct VideoSource: Identifiable, Hashable {
     !isOriginal && (definition == 4 || (definition <= 0 && title.uppercased().contains("1080P")))
   }
 
-  var qualityTitle: String { is1080p ? "1080P" : title }
-
   static func preferred1080p(in sources: [VideoSource]) -> VideoSource? {
     let transcodes = sources.filter { !$0.isOriginal }
     if let fullHD = transcodes.first(where: \.is1080p) { return fullHD }
