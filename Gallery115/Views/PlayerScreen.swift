@@ -1610,7 +1610,6 @@ struct PlayerScreen: View {
     AirPlayRoutePickerButton { presented in
       isRoutePickerPresented = presented
       if presented {
-        model?.prepareForExternalPlayback()
         keepControlsDuringInteraction()
       } else {
         scheduleControlsHide()
@@ -3010,9 +3009,6 @@ private struct PlayerInfoSheet: View {
           if playbackEngine == "AVPlayer", let model {
             LabeledContent("播放状态", value: model.waitingStatus)
             LabeledContent("读取方式", value: model.playbackTransport)
-            if model.diskBufferedMegabytes > 0 {
-              LabeledContent("可复用视频缓存", value: String(format: "%.0f MB", model.diskBufferedMegabytes))
-            }
           }
           LabeledContent(
             "下载速度（采样）",
@@ -3022,6 +3018,31 @@ private struct PlayerInfoSheet: View {
             "已缓冲",
             value: bufferedDuration > 0 ? formatTime(bufferedDuration) : "--"
           )
+          if playbackEngine == "AVPlayer", let model {
+            if let seconds = model.sourceLookupSeconds {
+              LabeledContent("取流地址耗时", value: String(format: "%.2f 秒", seconds))
+            }
+            if let seconds = model.readySeconds {
+              LabeledContent("播放器就绪耗时", value: String(format: "%.2f 秒", seconds))
+            }
+            if let seconds = model.firstPlaybackSeconds {
+              LabeledContent("实际起播耗时（采样）", value: String(format: "%.2f 秒", seconds))
+            }
+            if let mbps = model.observedMbps {
+              LabeledContent("平均下载带宽", value: String(format: "%.1f Mbps", mbps))
+            }
+            if let mbps = model.requiredMbps {
+              LabeledContent("媒体码率（估算）", value: String(format: "%.1f Mbps", mbps))
+            }
+            LabeledContent("播放中缓冲次数", value: "\(model.playbackStallCount)")
+            Button {
+              UIPasteboard.general.string = model.playbackDiagnosticText
+            } label: {
+              Label("复制播放诊断", systemImage: "doc.on.doc")
+            }
+            Text("就绪和起播耗时从交给播放器时算起，每 0.5 秒采样；平均带宽由系统日志提供。诊断不含文件名、播放地址或账号信息。")
+              .font(.caption).foregroundStyle(.secondary)
+          }
         }
 
         Section("手势") {

@@ -19,8 +19,8 @@ struct PlaybackBufferRange: Equatable, Sendable {
 enum PlaybackBufferPolicy {
   /// A compressed-data estimate, not a hard AVFoundation memory limit.
   /// The old 64 MB budget reduced 80 Mbps originals to the eight-second floor, even after
-  /// repeated refills. Scale the compressed runway to device memory; the disk
-  /// range cache has its own independent limit and stores no decoded frames.
+  /// repeated refills. Scale the compressed runway to device memory; the
+  /// playback controller separately bounds when it bypasses an evaluation wait.
   static func forwardDuration(bitrate: Double, stalls: Int, rate: Double,
     memoryBytes: UInt64 = 4 * 1_024 * 1_024 * 1_024) -> Double {
     let speed = rate.isFinite ? min(max(rate, 1), 2) : 1
