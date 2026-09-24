@@ -393,6 +393,7 @@ struct PlayerScreen: View {
     auxiliaryLoadTask?.cancel()
     dismissRestoreTask?.cancel()
     pauseActivePlayer()
+    model?.stop()
     vlcController.stop()
     RemotePlaybackCoordinator.shared.deactivate()
     PlayerOrientation.request(.portrait)
@@ -1609,6 +1610,7 @@ struct PlayerScreen: View {
     AirPlayRoutePickerButton { presented in
       isRoutePickerPresented = presented
       if presented {
+        model?.prepareForExternalPlayback()
         keepControlsDuringInteraction()
       } else {
         scheduleControlsHide()
@@ -2022,6 +2024,7 @@ struct PlayerScreen: View {
 
     if model != nil {
       pauseActivePlayer()
+      model?.stop()
       vlcController.stop()
     }
 
@@ -2042,7 +2045,7 @@ struct PlayerScreen: View {
     // received its URL and begun opening the media connection.
     await newModel.prepareAndPlay()
     guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else {
-      newModel.pause()
+      newModel.stop()
       return
     }
 
@@ -3006,6 +3009,10 @@ private struct PlayerInfoSheet: View {
         Section("网络") {
           if playbackEngine == "AVPlayer", let model {
             LabeledContent("播放状态", value: model.waitingStatus)
+            LabeledContent("读取方式", value: model.playbackTransport)
+            if model.diskBufferedMegabytes > 0 {
+              LabeledContent("可复用视频缓存", value: String(format: "%.0f MB", model.diskBufferedMegabytes))
+            }
           }
           LabeledContent(
             "下载速度（采样）",

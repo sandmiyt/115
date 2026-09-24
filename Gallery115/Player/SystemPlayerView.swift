@@ -278,8 +278,8 @@ final class TimelinePreviewController {
     }
     guard warmSlot < 48, warmFailures < 2, requestTask == nil,
       Date().timeIntervalSince(lastWarmAt) >= 8 else { return }
-    // A small, bounded storyboard on a low-resolution source only. Playback
-    // takes priority; maintain() cancels it as soon as the runway drops.
+    // Remote assets must not opt in: even small transcode seeks can compete
+    // with the original's download. Only local files may build a storyboard.
     requestedTime = min(duration * (Double(warmSlot) + 0.5) / 48, max(duration - 0.1, 0))
     warmSlot += 1
     lastWarmAt = Date()

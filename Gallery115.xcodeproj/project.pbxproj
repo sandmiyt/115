@@ -6,6 +6,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A20260924000000000000001 /* PlaybackRangeCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20260924000000000000002 /* PlaybackRangeCache.swift */; };
 		B20260828000000000000001 /* ArtworkDiskStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20260828000000000000002 /* ArtworkDiskStore.swift */; };
 		521FB18B426BCF1EA800706D /* AppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 40438E2D45CDB29E1083E055 /* AppState.swift */; };
 		AE9364A65643882550E6EA92 /* Gallery115App.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00548918D52A82A65A1D74A2 /* Gallery115App.swift */; };
@@ -35,6 +36,7 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		A20260924000000000000002 /* PlaybackRangeCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Player/PlaybackRangeCache.swift"; sourceTree = "<group>"; };
 		B20260828000000000000002 /* ArtworkDiskStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Services/ArtworkDiskStore.swift"; sourceTree = "<group>"; };
 		40438E2D45CDB29E1083E055 /* AppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "App/AppState.swift"; sourceTree = "<group>"; };
 		00548918D52A82A65A1D74A2 /* Gallery115App.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "App/Gallery115App.swift"; sourceTree = "<group>"; };
@@ -77,6 +79,7 @@
 			EDAEB5527FD83DF23EC88115 /* PlaybackEntry.swift */,
 			3CA6219BB01EA7B2B44123D3 /* VideoSource.swift */,
 			49208E12BD7D72D7A072D03B /* PlayerModel.swift */,
+			A20260924000000000000002 /* PlaybackRangeCache.swift */,
 			4DA09603840D4132DBD16480 /* SystemPlayerView.swift */,
 			6DE4B28AB714B7240B87B987 /* VLCPlayerView.swift */,
 			3EE7AD17E780497D23E03B73 /* APIClient.swift */,
@@ -146,6 +149,7 @@
 			3B90172B14741C84D2D3A847 /* PlaybackEntry.swift in Sources */,
 			DBA79977EDD7D52F00F0D43E /* VideoSource.swift in Sources */,
 			552EA1BE15BB2B70FD49DF66 /* PlayerModel.swift in Sources */,
+			A20260924000000000000001 /* PlaybackRangeCache.swift in Sources */,
 			B61D52CCA38B0544719959F1 /* SystemPlayerView.swift in Sources */,
 			F1CB980C6268BF209A380F47 /* VLCPlayerView.swift in Sources */,
 			B68D885D084697AC2A63B5F7 /* APIClient.swift in Sources */,
@@ -171,8 +175,8 @@
 /* Begin XCBuildConfiguration section */
 		5E8ACABCCBE1DB5D311988C9 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = { CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SDKROOT = iphoneos; SWIFT_VERSION = 5.0; DEBUG_INFORMATION_FORMAT = dwarf; ENABLE_TESTABILITY = YES; GCC_OPTIMIZATION_LEVEL = 0; ONLY_ACTIVE_ARCH = YES; SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG; }; name = Debug; };
 		F84FD35CA8548076F2B51EDF /* Release */ = {isa = XCBuildConfiguration; buildSettings = { CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SDKROOT = iphoneos; SWIFT_VERSION = 5.0; DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"; SWIFT_COMPILATION_MODE = wholemodule; }; name = Release; };
-		53797DE442FCF2C62405D6BD /* Debug */ = {isa = XCBuildConfiguration; buildSettings = { ASSETCATALOG_COMPILER_ACCENT_COLOR_NAME = AccentColor; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 33; ENABLE_PREVIEWS = YES; GENERATE_INFOPLIST_FILE = YES; INFOPLIST_FILE = Gallery115/Info.plist; INFOPLIST_KEY_CFBundleDisplayName = Cineva; INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.entertainment"; INFOPLIST_KEY_NSFaceIDUsageDescription = "用于保护 Cineva 中的媒体库、收藏与播放记录。"; INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES; INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES; INFOPLIST_KEY_UILaunchScreen_Generation = YES; INFOPLIST_KEY_UIRequiresFullScreen = YES; INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 2.2.9; PRODUCT_BUNDLE_IDENTIFIER = com.xiaocai.gallery115; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; TARGETED_DEVICE_FAMILY = 1; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; }; name = Debug; };
-		C015BAAA3C846BD82DBAB3CE /* Release */ = {isa = XCBuildConfiguration; buildSettings = { ASSETCATALOG_COMPILER_ACCENT_COLOR_NAME = AccentColor; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 33; ENABLE_PREVIEWS = YES; GENERATE_INFOPLIST_FILE = YES; INFOPLIST_FILE = Gallery115/Info.plist; INFOPLIST_KEY_CFBundleDisplayName = Cineva; INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.entertainment"; INFOPLIST_KEY_NSFaceIDUsageDescription = "用于保护 Cineva 中的媒体库、收藏与播放记录。"; INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES; INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES; INFOPLIST_KEY_UILaunchScreen_Generation = YES; INFOPLIST_KEY_UIRequiresFullScreen = YES; INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 2.2.9; PRODUCT_BUNDLE_IDENTIFIER = com.xiaocai.gallery115; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; TARGETED_DEVICE_FAMILY = 1; SWIFT_COMPILATION_MODE = wholemodule; }; name = Release; };
+		53797DE442FCF2C62405D6BD /* Debug */ = {isa = XCBuildConfiguration; buildSettings = { ASSETCATALOG_COMPILER_ACCENT_COLOR_NAME = AccentColor; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 34; ENABLE_PREVIEWS = YES; GENERATE_INFOPLIST_FILE = YES; INFOPLIST_FILE = Gallery115/Info.plist; INFOPLIST_KEY_CFBundleDisplayName = Cineva; INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.entertainment"; INFOPLIST_KEY_NSFaceIDUsageDescription = "用于保护 Cineva 中的媒体库、收藏与播放记录。"; INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES; INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES; INFOPLIST_KEY_UILaunchScreen_Generation = YES; INFOPLIST_KEY_UIRequiresFullScreen = YES; INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 2.2.10; PRODUCT_BUNDLE_IDENTIFIER = com.xiaocai.gallery115; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; TARGETED_DEVICE_FAMILY = 1; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; }; name = Debug; };
+		C015BAAA3C846BD82DBAB3CE /* Release */ = {isa = XCBuildConfiguration; buildSettings = { ASSETCATALOG_COMPILER_ACCENT_COLOR_NAME = AccentColor; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 34; ENABLE_PREVIEWS = YES; GENERATE_INFOPLIST_FILE = YES; INFOPLIST_FILE = Gallery115/Info.plist; INFOPLIST_KEY_CFBundleDisplayName = Cineva; INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.entertainment"; INFOPLIST_KEY_NSFaceIDUsageDescription = "用于保护 Cineva 中的媒体库、收藏与播放记录。"; INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES; INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES; INFOPLIST_KEY_UILaunchScreen_Generation = YES; INFOPLIST_KEY_UIRequiresFullScreen = YES; INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 2.2.10; PRODUCT_BUNDLE_IDENTIFIER = com.xiaocai.gallery115; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; TARGETED_DEVICE_FAMILY = 1; SWIFT_COMPILATION_MODE = wholemodule; }; name = Release; };
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */

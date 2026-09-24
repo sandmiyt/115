@@ -186,6 +186,11 @@ final class PlayerModel: PlaybackEngineControlling {
   private let fastStartEnabled: Bool
   private let networkAutoRecoveryEnabled: Bool
   private var activeAsset: AVURLAsset?
+  nonisolated(unsafe) private var rangeCache: PlaybackRangeCache?
+  private var bypassRangeCache = false
+  private var switchingCacheTransport = false
+  private(set) var diskBufferedMegabytes: Double = 0
+  private(set) var playbackTransport = "直连"
   private var mediaInfoGeneration = UUID()
   private var audioGroup: AVMediaSelectionGroup?
   private var subtitleGroup: AVMediaSelectionGroup?
@@ -196,6 +201,7 @@ final class PlayerModel: PlaybackEngineControlling {
   nonisolated(unsafe) private var stallObserver: NSObjectProtocol?
   nonisolated(unsafe) private var interruptionObserver: NSObjectProtocol?
   nonisolated(unsafe) private var routeChangeObserver: NSObjectProtocol?
+  nonisolated(unsafe) private var externalPlaybackObserver: NSKeyValueObservation?
   private var lastSavedSecond = -1
   private var lastRemoteHistorySecond = -60
   private var isFallingBack = false
@@ -244,9 +250,14 @@ final class PlayerModel: PlaybackEngineControlling {
     player.allowsExternalPlayback = true
     configureAudioSession()
     installAudioSessionObservers()
+    externalPlaybackObserver = player.observe(\.isExternalPlaybackActive, options: [.new]) { [weak self] _, change in
+      guard change.newValue == true else { return }
+      Task { @MainActor [weak self] in self?.prepareForExternalPlayback() }
+    }
   }
 
   deinit {
+    rangeCache?.stop()
     playbackTimer?.invalidate()
     deferredSourcesTask?.cancel()
     if let failureObserver {
@@ -308,7 +319,13 @@ final class PlayerModel: PlaybackEngineControlling {
     let item = self.item
     deferredSourcesTask = Task { @MainActor [weak self] in
       do {
-        try await Task.sleep(for: .seconds(2))
+        // Other quality URLs are only needed for optional previews/fallbacks.
+        // A fixed two-second delay still competes with a slow original start.
+        while let self, !self.requiresVLC,
+          !self.hasPlayedCurrentItem || self.isBuffering || self.bufferedDuration < 10 {
+          try await Task.sleep(for: .seconds(1))
+        }
+        try Task.checkCancellation()
         let remaining = try await api.remainingVideoSources(for: item)
         guard let self, !Task.isCancelled else { return }
         let existingIDs = Set(self.sources.map(\.id))
@@ -590,13 +607,17 @@ final class PlayerModel: PlaybackEngineControlling {
     max(PlaybackBufferPolicy.contiguousEnd(at: currentTime, ranges: bufferedRanges) - currentTime, 0)
   }
 
-  private func play(_ source: VideoSource, allowFallback: Bool) async {
+  private func play(_ source: VideoSource, allowFallback: Bool, resumeAt: Double? = nil) async {
+    rangeCache?.stop()
+    rangeCache = nil
+    diskBufferedMegabytes = 0
+    playbackTransport = "直连"
     cancelInteractiveScrub()
     bufferedRanges = []
     bufferedUntil = 0
     selectedSource = source
     hasPlayedCurrentItem = false
-    pendingInitialPosition = libraryStore.resumePosition(for: item)
+    pendingInitialPosition = resumeAt ?? libraryStore.resumePosition(for: item)
     engineSwitchReason = nil
     engineSwitchResumePosition = nil
     bufferingStartedAt = nil
@@ -652,7 +673,17 @@ final class PlayerModel: PlaybackEngineControlling {
 
     var assetOptions: [String: Any] = [AVURLAssetPreferPreciseDurationAndTimingKey: false]
     if !source.headers.isEmpty { assetOptions["AVURLAssetHTTPHeaderFieldsKey"] = source.headers }
-    let asset = AVURLAsset(url: source.url, options: assetOptions)
+    let asset: AVURLAsset
+    let airPlay = player.isExternalPlaybackActive || AVAudioSession.sharedInstance().currentRoute.outputs.contains { $0.portType == .airPlay }
+    if !bypassRangeCache, !airPlay,
+      PlaybackRangeCache.supports(source: source, fileExtension: item.fileExtension),
+      let cache = PlaybackRangeCache(source: source, fileExtension: item.fileExtension) {
+      rangeCache = cache
+      asset = cache.makeAsset()
+      playbackTransport = "分段磁盘缓存"
+    } else {
+      asset = AVURLAsset(url: source.url, options: assetOptions)
+    }
     activeAsset = asset
 
     // Keep first-frame startup lean: AVPlayerItem(asset:) implicitly asks the
@@ -662,7 +693,7 @@ final class PlayerModel: PlaybackEngineControlling {
     let playerItem = AVPlayerItem(asset: asset, automaticallyLoadedAssetKeys: [])
     // Startup uses a small runway; once frames advance we grow it using the
     // stream bitrate. Do not force an almost-empty buffer to play immediately.
-    playerItem.preferredForwardBufferDuration = fastStartEnabled ? 4 : 8
+    playerItem.preferredForwardBufferDuration = fastStartEnabled ? 8 : 15
 
     // Maximum-fidelity policy with no extra decode/filter stage. A zero bit-rate
     // or resolution value means "no cap" for adaptive/HLS assets, including on
@@ -679,8 +710,8 @@ final class PlayerModel: PlaybackEngineControlling {
     installItemObservers(for: playerItem)
     player.replaceCurrentItem(with: playerItem)
 
-    let resumePosition = libraryStore.resumePosition(for: item)
-    if resumePosition > 2, duration <= 0 || resumePosition < duration - 15 {
+    let resumePosition = pendingInitialPosition
+    if resumePosition > 0, resumeAt != nil || (resumePosition > 2 && (duration <= 0 || resumePosition < duration - 15)) {
       currentTime = resumePosition
       player.seek(
         to: CMTime(seconds: resumePosition, preferredTimescale: 600),
@@ -735,7 +766,7 @@ final class PlayerModel: PlaybackEngineControlling {
       var options: [String: Any] = [AVURLAssetPreferPreciseDurationAndTimingKey: false]
       if !source.headers.isEmpty { options["AVURLAssetHTTPHeaderFieldsKey"] = source.headers }
       timelinePreview.configure(asset: AVURLAsset(url: source.url, options: options),
-        identity: source.id, allowsWarmup: true, fallbackAsset: activeAsset)
+        identity: source.id, allowsWarmup: false, fallbackAsset: activeAsset)
     } else {
       timelinePreview.configure(asset: activeAsset, identity: selectedSource?.id ?? "",
         allowsWarmup: activeAsset.url.isFileURL)
@@ -878,6 +909,7 @@ final class PlayerModel: PlaybackEngineControlling {
   private func pollPlayback() {
     guard !requiresVLC else { return }
     if let failedItem = player.currentItem, failedItem.status == .failed {
+      if recoverRangeCacheIfNeeded() { return }
       if selectedSource?.isOriginal == true, originalPlaybackEngine != .system, VLCAvailability.isAvailable {
         switchOriginalToVLC(reason: "系统内核无法打开原画，已切换 VLC")
       } else {
@@ -925,16 +957,13 @@ final class PlayerModel: PlaybackEngineControlling {
       mayWarm: wantsPlayback && isPlaying && !isBuffering && !interactiveScrubActive
         && bufferedDuration >= 20 && !player.isExternalPlaybackActive)
 
-    if let log = player.currentItem?.accessLog() {
+    if let cache = rangeCache {
+      let counters = cache.counters
+      diskBufferedMegabytes = Double(counters.disk) / 1_048_576
+      sampleNetwork(bytes: counters.network, now: now)
+    } else if let log = player.currentItem?.accessLog() {
       let bytes = log.events.reduce(Int64(0)) { $0 + max($1.numberOfBytesTransferred, 0) }
-      transferredMegabytes = Double(bytes) / 1_048_576
-      let elapsed = now.timeIntervalSince(lastBandwidthSampleAt)
-      if elapsed >= 0.45 {
-        networkMbps = bytes >= lastTransferredBytes
-          ? Double(bytes - lastTransferredBytes) * 8 / elapsed / 1_000_000 : 0
-        lastTransferredBytes = bytes
-        lastBandwidthSampleAt = now
-      }
+      sampleNetwork(bytes: bytes, now: now)
     } else {
       networkMbps = 0
     }
@@ -948,6 +977,17 @@ final class PlayerModel: PlaybackEngineControlling {
     }
   }
 
+  private func sampleNetwork(bytes: Int64, now: Date) {
+    transferredMegabytes = Double(bytes) / 1_048_576
+    let elapsed = now.timeIntervalSince(lastBandwidthSampleAt)
+    if elapsed >= 0.45 {
+      networkMbps = bytes >= lastTransferredBytes
+        ? Double(bytes - lastTransferredBytes) * 8 / elapsed / 1_000_000 : 0
+      lastTransferredBytes = bytes
+      lastBandwidthSampleAt = now
+    }
+  }
+
   private func updateForwardBuffer() {
     guard hasPlayedCurrentItem, let playerItem = player.currentItem else { return }
     let indicated = playerItem.accessLog()?.events.last?.indicatedBitrate ?? 0
@@ -955,7 +995,8 @@ final class PlayerModel: PlaybackEngineControlling {
       ? Double(item.size) * 8 / duration : 0
     let bitrate = max(indicated.isFinite ? indicated : 0, originalEstimate)
     let target = PlaybackBufferPolicy.forwardDuration(bitrate: bitrate,
-      stalls: bufferStallCount, rate: Double(player.defaultRate))
+      stalls: bufferStallCount, rate: Double(player.defaultRate),
+      memoryBytes: ProcessInfo.processInfo.physicalMemory)
     guard abs(target - preferredBufferSeconds) >= 2 else { return }
     preferredBufferSeconds = target
     playerItem.preferredForwardBufferDuration = target
@@ -984,6 +1025,7 @@ final class PlayerModel: PlaybackEngineControlling {
     }
     if bufferingStartedAt == nil { bufferingStartedAt = now }
     let wait = now.timeIntervalSince(bufferingStartedAt ?? now)
+    if wait >= 8, recoverRangeCacheIfNeeded() { return }
     sustainedStalls.removeAll { now.timeIntervalSince($0) > 60 }
     if wait >= 1, !countedCurrentStall {
       countedCurrentStall = true
@@ -1017,6 +1059,8 @@ final class PlayerModel: PlaybackEngineControlling {
     wantsPlayback = false
     player.pause()
     player.replaceCurrentItem(with: nil)
+    rangeCache?.stop()
+    rangeCache = nil
     // Invalidate metadata tasks from the old AVPlayerItem.
     mediaInfoGeneration = UUID()
     activeAsset = nil
@@ -1024,6 +1068,47 @@ final class PlayerModel: PlaybackEngineControlling {
     isPlaying = false
     isBuffering = false
     errorMessage = nil
+  }
+
+  /// Cache transport errors must not strand playback or cause a quality change.
+  /// The signed source, selected quality, playback rate and position are kept.
+  @discardableResult
+  private func recoverRangeCacheIfNeeded() -> Bool {
+    guard rangeCache != nil else { return false }
+    if switchingCacheTransport { return true }
+    switchingCacheTransport = true
+    let shouldResume = wantsPlayback
+    let position = max(currentTime, hasPlayedCurrentItem ? 0 : pendingInitialPosition)
+    let generation = mediaInfoGeneration
+    bypassRangeCache = true
+    timelinePreview.reset()
+    Task { @MainActor [weak self] in
+      guard let self else { return }
+      defer { self.switchingCacheTransport = false }
+      guard self.mediaInfoGeneration == generation, let source = self.selectedSource else { return }
+      await self.play(source, allowFallback: false, resumeAt: position)
+      if !shouldResume { self.pause() }
+    }
+    return true
+  }
+
+  func prepareForExternalPlayback() {
+    // A remote AirPlay receiver cannot resolve our in-process resource loader.
+    // Switch to the original URL before displaying the route picker.
+    _ = recoverRangeCacheIfNeeded()
+  }
+
+  func stop() {
+    pause()
+    deferredSourcesTask?.cancel()
+    mediaInfoGeneration = UUID()
+    timelinePreview.reset()
+    player.replaceCurrentItem(with: nil)
+    activeAsset = nil
+    rangeCache?.stop()
+    rangeCache = nil
+    playbackTimer?.invalidate()
+    playbackTimer = nil
   }
 
   private func installItemObservers(for playerItem: AVPlayerItem) {
@@ -1045,6 +1130,7 @@ final class PlayerModel: PlaybackEngineControlling {
       guard let self else { return }
       Task { @MainActor in
         guard self.player.currentItem === playerItem else { return }
+        if self.recoverRangeCacheIfNeeded() { return }
         await self.handlePlaybackFailure(notification)
       }
     }
@@ -1186,6 +1272,9 @@ final class PlayerModel: PlaybackEngineControlling {
           let rawReason = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
           let reason = AVAudioSession.RouteChangeReason(rawValue: rawReason)
         else { return }
+        if AVAudioSession.sharedInstance().currentRoute.outputs.contains(where: { $0.portType == .airPlay }) {
+          self.prepareForExternalPlayback()
+        }
         if reason == .oldDeviceUnavailable {
           self.pause()
         }
