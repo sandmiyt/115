@@ -84,11 +84,12 @@ final class AppState {
   }
 
   enum OriginalPlaybackEngine: String, CaseIterable, Identifiable {
-    case automatic, system, vlc
+    case automatic, mpv, system, vlc
     var id: String { rawValue }
     var title: String {
       switch self {
-      case .automatic: return "自动（卡顿时切换 VLC）"
+      case .automatic: return "自动（优先 mpv）"
+      case .mpv: return "mpv（连续预读）"
       case .system: return "系统 AVPlayer"
       case .vlc: return "VLC"
       }

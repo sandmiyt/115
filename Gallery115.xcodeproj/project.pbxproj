@@ -6,6 +6,12 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+        D2026092400000000000000B /* MPVKit in Frameworks */ = {isa = PBXBuildFile; productRef = D2026092400000000000000C /* MPVKit */; };
+        D20260924000000000000009 /* certifi-LICENSE.txt in Resources */ = {isa = PBXBuildFile; fileRef = D2026092400000000000000A /* certifi-LICENSE.txt */; };
+        D20260924000000000000007 /* MPVKit-LICENSE.txt in Resources */ = {isa = PBXBuildFile; fileRef = D20260924000000000000008 /* MPVKit-LICENSE.txt */; };
+        D20260924000000000000005 /* mpv-cacert.pem in Resources */ = {isa = PBXBuildFile; fileRef = D20260924000000000000006 /* mpv-cacert.pem */; };
+        D20260924000000000000003 /* AlternatePlaybackController.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20260924000000000000004 /* AlternatePlaybackController.swift */; };
+        D20260924000000000000001 /* MPVPlayerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20260924000000000000002 /* MPVPlayerView.swift */; };
         C20260924000000000000001 /* PlaybackRecoveryPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20260924000000000000002 /* PlaybackRecoveryPolicy.swift */; };
 		B20260828000000000000001 /* ArtworkDiskStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20260828000000000000002 /* ArtworkDiskStore.swift */; };
 		521FB18B426BCF1EA800706D /* AppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 40438E2D45CDB29E1083E055 /* AppState.swift */; };
@@ -36,6 +42,11 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+        D2026092400000000000000A /* certifi-LICENSE.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "Resources/certifi-LICENSE.txt"; sourceTree = "<group>"; };
+        D20260924000000000000008 /* MPVKit-LICENSE.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "Resources/MPVKit-LICENSE.txt"; sourceTree = "<group>"; };
+        D20260924000000000000006 /* mpv-cacert.pem */ = {isa = PBXFileReference; lastKnownFileType = text; path = "Resources/mpv-cacert.pem"; sourceTree = "<group>"; };
+        D20260924000000000000004 /* AlternatePlaybackController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Player/AlternatePlaybackController.swift"; sourceTree = "<group>"; };
+        D20260924000000000000002 /* MPVPlayerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Player/MPVPlayerView.swift"; sourceTree = "<group>"; };
         C20260924000000000000002 /* PlaybackRecoveryPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Models/PlaybackRecoveryPolicy.swift"; sourceTree = "<group>"; };
 		B20260828000000000000002 /* ArtworkDiskStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Services/ArtworkDiskStore.swift"; sourceTree = "<group>"; };
 		40438E2D45CDB29E1083E055 /* AppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "App/AppState.swift"; sourceTree = "<group>"; };
@@ -67,12 +78,17 @@
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
-		7B8633C7EB6F5CB13673C25D /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		7B8633C7EB6F5CB13673C25D /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (D2026092400000000000000B /* MPVKit in Frameworks */); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
 		6CFC827E67DCAE34C72B9CED = {isa = PBXGroup; children = (9FE4B5428B3E28F1C9A0DF64 /* Gallery115 */, 021F2B7F3E0C61452C987484 /* Products */); sourceTree = "<group>"; };
 		9FE4B5428B3E28F1C9A0DF64 /* Gallery115 */ = {isa = PBXGroup; children = (
+            D2026092400000000000000A /* certifi-LICENSE.txt */,
+            D20260924000000000000008 /* MPVKit-LICENSE.txt */,
+            D20260924000000000000006 /* mpv-cacert.pem */,
+            D20260924000000000000004 /* AlternatePlaybackController.swift */,
+            D20260924000000000000002 /* MPVPlayerView.swift */,
 			40438E2D45CDB29E1083E055 /* AppState.swift */,
 			00548918D52A82A65A1D74A2 /* Gallery115App.swift */,
 			22039DEAAAB704237C2148A6 /* CloudItem.swift */,
@@ -113,6 +129,7 @@
 			dependencies = ();
 			name = Gallery115;
 			productName = Gallery115;
+            packageProductDependencies = (D2026092400000000000000C /* MPVKit */);
 			productReference = 38A007151ABE87CC01A5B6E9 /* Gallery115.app */;
 			productType = "com.apple.product-type.application";
 		};
@@ -131,18 +148,21 @@
 			knownRegions = (en, Base);
 			mainGroup = 6CFC827E67DCAE34C72B9CED;
 			productRefGroup = 021F2B7F3E0C61452C987484 /* Products */;
-			projectDirPath = "";
+			packageReferences = (D2026092400000000000000D /* MPVKit */);
+            projectDirPath = "";
 			projectRoot = "";
 			targets = (0E8A3AD980EC179856012B7E /* Gallery115 */);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
-		C52ABA055DA4D0050382EB56 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (28013CB1AAD0E177074237F6 /* Assets.xcassets in Resources */); runOnlyForDeploymentPostprocessing = 0; };
+		C52ABA055DA4D0050382EB56 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (D20260924000000000000009 /* certifi-LICENSE.txt in Resources */, D20260924000000000000007 /* MPVKit-LICENSE.txt in Resources */, D20260924000000000000005 /* mpv-cacert.pem in Resources */, 28013CB1AAD0E177074237F6 /* Assets.xcassets in Resources */); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		E4F78730D65EE9F55E2BAC2F /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (
+            D20260924000000000000003 /* AlternatePlaybackController.swift in Sources */,
+            D20260924000000000000001 /* MPVPlayerView.swift in Sources */,
 			521FB18B426BCF1EA800706D /* AppState.swift in Sources */,
 			AE9364A65643882550E6EA92 /* Gallery115App.swift in Sources */,
 			14F617CAA9B6CBE16B57CB38 /* CloudItem.swift in Sources */,
@@ -172,11 +192,17 @@
 		); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 
+/* Begin XCRemoteSwiftPackageReference section */
+        D2026092400000000000000D /* MPVKit */ = {isa = XCRemoteSwiftPackageReference; repositoryURL = "https://github.com/mpvkit/MPVKit.git"; requirement = {kind = revision; revision = f82e06d4f5ef4fc4aa9faba3782a462dbbef870c; }; };
+/* End XCRemoteSwiftPackageReference section */
+/* Begin XCSwiftPackageProductDependency section */
+        D2026092400000000000000C /* MPVKit */ = {isa = XCSwiftPackageProductDependency; package = D2026092400000000000000D /* MPVKit */; productName = MPVKit; };
+/* End XCSwiftPackageProductDependency section */
 /* Begin XCBuildConfiguration section */
 		5E8ACABCCBE1DB5D311988C9 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = { CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SDKROOT = iphoneos; SWIFT_VERSION = 5.0; DEBUG_INFORMATION_FORMAT = dwarf; ENABLE_TESTABILITY = YES; GCC_OPTIMIZATION_LEVEL = 0; ONLY_ACTIVE_ARCH = YES; SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG; }; name = Debug; };
 		F84FD35CA8548076F2B51EDF /* Release */ = {isa = XCBuildConfiguration; buildSettings = { CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SDKROOT = iphoneos; SWIFT_VERSION = 5.0; DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"; SWIFT_COMPILATION_MODE = wholemodule; }; name = Release; };
-		53797DE442FCF2C62405D6BD /* Debug */ = {isa = XCBuildConfiguration; buildSettings = { ASSETCATALOG_COMPILER_ACCENT_COLOR_NAME = AccentColor; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 37; ENABLE_PREVIEWS = YES; GENERATE_INFOPLIST_FILE = YES; INFOPLIST_FILE = Gallery115/Info.plist; INFOPLIST_KEY_CFBundleDisplayName = Cineva; INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.entertainment"; INFOPLIST_KEY_NSFaceIDUsageDescription = "用于保护 Cineva 中的媒体库、收藏与播放记录。"; INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES; INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES; INFOPLIST_KEY_UILaunchScreen_Generation = YES; INFOPLIST_KEY_UIRequiresFullScreen = YES; INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 2.2.12; PRODUCT_BUNDLE_IDENTIFIER = com.xiaocai.gallery115; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; TARGETED_DEVICE_FAMILY = 1; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; }; name = Debug; };
-		C015BAAA3C846BD82DBAB3CE /* Release */ = {isa = XCBuildConfiguration; buildSettings = { ASSETCATALOG_COMPILER_ACCENT_COLOR_NAME = AccentColor; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 37; ENABLE_PREVIEWS = YES; GENERATE_INFOPLIST_FILE = YES; INFOPLIST_FILE = Gallery115/Info.plist; INFOPLIST_KEY_CFBundleDisplayName = Cineva; INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.entertainment"; INFOPLIST_KEY_NSFaceIDUsageDescription = "用于保护 Cineva 中的媒体库、收藏与播放记录。"; INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES; INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES; INFOPLIST_KEY_UILaunchScreen_Generation = YES; INFOPLIST_KEY_UIRequiresFullScreen = YES; INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 2.2.12; PRODUCT_BUNDLE_IDENTIFIER = com.xiaocai.gallery115; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; TARGETED_DEVICE_FAMILY = 1; SWIFT_COMPILATION_MODE = wholemodule; }; name = Release; };
+		53797DE442FCF2C62405D6BD /* Debug */ = {isa = XCBuildConfiguration; buildSettings = { ASSETCATALOG_COMPILER_ACCENT_COLOR_NAME = AccentColor; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 38; ENABLE_PREVIEWS = YES; GENERATE_INFOPLIST_FILE = YES; INFOPLIST_FILE = Gallery115/Info.plist; INFOPLIST_KEY_CFBundleDisplayName = Cineva; INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.entertainment"; INFOPLIST_KEY_NSFaceIDUsageDescription = "用于保护 Cineva 中的媒体库、收藏与播放记录。"; INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES; INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES; INFOPLIST_KEY_UILaunchScreen_Generation = YES; INFOPLIST_KEY_UIRequiresFullScreen = YES; INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 2.3.0; PRODUCT_BUNDLE_IDENTIFIER = com.xiaocai.gallery115; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; TARGETED_DEVICE_FAMILY = 1; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; }; name = Debug; };
+		C015BAAA3C846BD82DBAB3CE /* Release */ = {isa = XCBuildConfiguration; buildSettings = { ASSETCATALOG_COMPILER_ACCENT_COLOR_NAME = AccentColor; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 38; ENABLE_PREVIEWS = YES; GENERATE_INFOPLIST_FILE = YES; INFOPLIST_FILE = Gallery115/Info.plist; INFOPLIST_KEY_CFBundleDisplayName = Cineva; INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.entertainment"; INFOPLIST_KEY_NSFaceIDUsageDescription = "用于保护 Cineva 中的媒体库、收藏与播放记录。"; INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES; INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES; INFOPLIST_KEY_UILaunchScreen_Generation = YES; INFOPLIST_KEY_UIRequiresFullScreen = YES; INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 2.3.0; PRODUCT_BUNDLE_IDENTIFIER = com.xiaocai.gallery115; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; TARGETED_DEVICE_FAMILY = 1; SWIFT_COMPILATION_MODE = wholemodule; }; name = Release; };
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
