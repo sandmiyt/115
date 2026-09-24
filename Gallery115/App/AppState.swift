@@ -84,12 +84,11 @@ final class AppState {
   }
 
   enum OriginalPlaybackEngine: String, CaseIterable, Identifiable {
-    case automatic, mpv, system, vlc
+    case automatic, system, vlc
     var id: String { rawValue }
     var title: String {
       switch self {
-      case .automatic: return "自动（优先 mpv）"
-      case .mpv: return "mpv（连续预读）"
+      case .automatic: return "自动（卡顿时切换 VLC）"
       case .system: return "系统 AVPlayer"
       case .vlc: return "VLC"
       }
@@ -293,7 +292,12 @@ final class AppState {
     defaultQuality =
       DefaultQuality(rawValue: defaults.string(forKey: Keys.defaultQuality) ?? "")
         ?? .highestTranscode
-    originalPlaybackEngine = OriginalPlaybackEngine(rawValue: defaults.string(forKey: Keys.originalPlaybackEngine) ?? "") ?? .automatic
+    // Version 2.3.0 exposed mpv; migrate that retired choice before creating a player.
+    let savedPlaybackEngine = defaults.string(forKey: Keys.originalPlaybackEngine) ?? ""
+    originalPlaybackEngine = OriginalPlaybackEngine(rawValue: savedPlaybackEngine) ?? .automatic
+    if savedPlaybackEngine == "mpv" {
+      defaults.set(OriginalPlaybackEngine.automatic.rawValue, forKey: Keys.originalPlaybackEngine)
+    }
     colorSchemePreference =
       ColorSchemePreference(rawValue: defaults.string(forKey: Keys.colorScheme) ?? "") ?? .system
     let sourceStore = MediaSourceSelectionStore.shared

@@ -161,8 +161,7 @@ final class PlayerModel: PlaybackEngineControlling {
   private(set) var selectedSubtitleOptionID: String?
   private(set) var networkMbps: Double = 0
   private(set) var transferredMegabytes: Double = 0
-  private(set) var requiresAlternateEngine = false
-  private(set) var alternateBackend: AlternatePlaybackBackend = .mpv
+  private(set) var requiresVLC = false
   private(set) var engineSwitchResumePosition: Double?
   private(set) var engineSwitchReason: String?
   private(set) var waitingStatus = "准备播放"
@@ -315,8 +314,8 @@ final class PlayerModel: PlaybackEngineControlling {
       if let preferred {
         await play(preferred, allowFallback: true)
       }
-      if !requiresAlternateEngine { installTimeObserverIfNeeded() }
-      if initial.hasDeferredSources && !requiresAlternateEngine { loadRemainingSources() }
+      installTimeObserverIfNeeded()
+      if initial.hasDeferredSources { loadRemainingSources() }
     } catch {
       guard !Task.isCancelled else { return }
       errorMessage = error.localizedDescription
@@ -332,7 +331,7 @@ final class PlayerModel: PlaybackEngineControlling {
       do {
         // Other quality URLs are only needed for optional previews/fallbacks.
         // A fixed two-second delay still competes with a slow original start.
-        while let self, !self.requiresAlternateEngine,
+        while let self, !self.requiresVLC,
           !self.hasPlayedCurrentItem || self.isBuffering || self.bufferedDuration < 10 {
           try await Task.sleep(for: .seconds(1))
         }
@@ -679,7 +678,7 @@ final class PlayerModel: PlaybackEngineControlling {
     errorMessage = nil
     didReachEnd = false
     isBuffering = true
-    requiresAlternateEngine = false
+    requiresVLC = false
     videoDisplaySize = nil
     videoCodec = "读取中"
     hdrFormat = "SDR"
@@ -703,19 +702,6 @@ final class PlayerModel: PlaybackEngineControlling {
     interactiveScrubActive = false
     player.automaticallyWaitsToMinimizeStalling = true
 
-    // Use a separate demuxer and packet cache from the start, instead of
-    // waiting for AVPlayer to starve before handing the original to another engine.
-    if originalPlaybackEngine == .mpv || (originalPlaybackEngine == .automatic && !item.isDiscImage) {
-      player.replaceCurrentItem(with: nil)
-      alternateBackend = .mpv
-      requiresAlternateEngine = true
-      isPlaying = false
-      isBuffering = false
-      videoCodec = item.fileExtension.uppercased()
-      hdrFormat = "由 mpv 输出"
-      return
-    }
-
     // Containers that AVPlayer commonly rejects should go straight to VLC when
     // the VLC runtime is actually bundled. MP4/MOV and other Apple-friendly
     // originals still stay on AVPlayer so HDR, Dolby Vision, AirPlay and PiP
@@ -723,8 +709,7 @@ final class PlayerModel: PlaybackEngineControlling {
     if source.isOriginal, originalPlaybackEngine != .system,
       (item.prefersVLCForOriginal || originalPlaybackEngine == .vlc), VLCAvailability.isAvailable {
       player.replaceCurrentItem(with: nil)
-      alternateBackend = .vlc
-      requiresAlternateEngine = true
+      requiresVLC = true
       isPlaying = false
       isBuffering = false
       videoCodec = item.fileExtension.uppercased()
@@ -807,7 +792,7 @@ final class PlayerModel: PlaybackEngineControlling {
   }
 
   private func configureTimelinePreviewSource() {
-    guard !requiresAlternateEngine, let activeAsset else { return }
+    guard !requiresVLC, let activeAsset else { return }
     // Small transcodes are previews only; the selected playback quality stays
     // original. Never scan the entire remote original to prepare thumbnails.
     let lightSource = sources.filter { !$0.isOriginal && (1...3).contains($0.definition) }
@@ -958,7 +943,7 @@ final class PlayerModel: PlaybackEngineControlling {
   }
 
   private func pollPlayback() {
-    guard !requiresAlternateEngine else { return }
+    guard !requiresVLC else { return }
     if let failedItem = player.currentItem, failedItem.status == .failed {
       if selectedSource?.isOriginal == true, originalPlaybackEngine != .system, VLCAvailability.isAvailable {
         switchOriginalToVLC(reason: "系统内核无法打开原画，已切换 VLC")
@@ -1031,7 +1016,7 @@ final class PlayerModel: PlaybackEngineControlling {
     requiredMbps = required > 0 ? required / 1_000_000 : nil
     updateWaitingStatusAndFallback(now: now)
     if countedCurrentStall { playbackStallSeconds += pollElapsed }
-    guard !requiresAlternateEngine else { return }
+    guard !requiresVLC else { return }
 
     let second = Int(seconds)
     if second >= 0, second != lastSavedSecond, second % 5 == 0 {
@@ -1113,7 +1098,7 @@ final class PlayerModel: PlaybackEngineControlling {
   }
 
   var canSwitchToVLC: Bool {
-    selectedSource?.isOriginal == true && !requiresAlternateEngine && VLCAvailability.isAvailable
+    selectedSource?.isOriginal == true && !requiresVLC && VLCAvailability.isAvailable
       && allowsAutomaticEngineSwitch && !player.isExternalPlaybackActive
       && wantsPlayback && !interactiveScrubActive && !positionSeekPending
   }
@@ -1178,7 +1163,7 @@ final class PlayerModel: PlaybackEngineControlling {
   }
 
   private func switchOriginalToVLC(reason: String) {
-    guard !requiresAlternateEngine, selectedSource?.isOriginal == true, VLCAvailability.isAvailable else { return }
+    guard !requiresVLC, selectedSource?.isOriginal == true, VLCAvailability.isAvailable else { return }
     let position = player.currentTime().seconds
     engineSwitchResumePosition = position.isFinite && position > 0 ? position
       : (hasPlayedCurrentItem ? currentTime : pendingInitialPosition)
@@ -1197,8 +1182,7 @@ final class PlayerModel: PlaybackEngineControlling {
     // Invalidate metadata tasks from the old AVPlayerItem.
     mediaInfoGeneration = UUID()
     activeAsset = nil
-    alternateBackend = .vlc
-    requiresAlternateEngine = true
+    requiresVLC = true
     isPlaying = false
     isBuffering = false
     errorMessage = nil

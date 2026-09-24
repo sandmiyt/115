@@ -355,12 +355,12 @@ private struct PlaybackSettingsView: View {
           .font(.caption)
           .foregroundStyle(.secondary)
 
-        Picker("播放内核", selection: $appState.originalPlaybackEngine) {
+        Picker("原画播放内核", selection: $appState.originalPlaybackEngine) {
           ForEach(AppState.OriginalPlaybackEngine.allCases) { engine in
             Text(engine.title).tag(engine)
           }
         }
-        Text("自动模式优先使用 mpv 连续预读，ISO/IMG 使用 VLC。mpv 支持已缓存范围内快速跳转；需要系统 HDR、画中画或 AirPlay 时，可选择系统 AVPlayer。")
+        Text("自动模式在原画起播过慢或反复缓冲时切换 VLC，并保留进度。VLC 播放同一原文件；系统内核支持原生 HDR、画中画和 AirPlay。")
           .font(.caption)
           .foregroundStyle(.secondary)
 
@@ -558,11 +558,6 @@ private struct CacheSettingsView: View {
 }
 
 private struct AboutSettingsView: View {
-  private func licenseText(_ name: String) -> String {
-    guard let url = Bundle.main.url(forResource: name, withExtension: "txt"),
-      let text = try? String(contentsOf: url, encoding: .utf8) else { return "请通过源码链接查看许可。" }
-    return text
-  }
   var body: some View {
     Form {
       Section {
@@ -577,18 +572,7 @@ private struct AboutSettingsView: View {
         }
         LabeledContent("版本", value: (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "")
         LabeledContent("媒体协议", value: "115 Open API + WebDAV")
-        LabeledContent("播放内核", value: "mpv + AVPlayer + VLC")
-        Link("mpv / MPVKit 源码与构建说明", destination: URL(string: "https://github.com/mpvkit/MPVKit/tree/f82e06d4f5ef4fc4aa9faba3782a462dbbef870c")!)
-        NavigationLink("mpv 开源许可（LGPL v3，无担保）") {
-          ScrollView {
-            Text(licenseText("MPVKit-LICENSE")).font(.footnote).textSelection(.enabled).padding()
-          }.navigationTitle("mpv 开源许可")
-        }
-        NavigationLink("HTTPS 证书许可") {
-          ScrollView {
-            Text(licenseText("certifi-LICENSE")).font(.footnote).textSelection(.enabled).padding()
-          }.navigationTitle("证书许可")
-        }
+        LabeledContent("播放内核", value: "AVPlayer + VLC")
       }
     }
     .navigationTitle("关于")
