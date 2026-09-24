@@ -415,7 +415,6 @@ final class PlayerModel: PlaybackEngineControlling {
     positionSeekPending = true
     awaitingSeekPlayback = true
     resumedCurrentWait = false
-    initialStartAttempted = false
     previousPollWasPlaying = false
     bufferingStartedAt = nil
     countedCurrentStall = false
@@ -440,7 +439,6 @@ final class PlayerModel: PlaybackEngineControlling {
     if positionSeekPending { player.currentItem?.cancelPendingSeeks() }
     positionSeekPending = false
     resumedCurrentWait = false
-    initialStartAttempted = false
     interactiveScrubActive = true
     awaitingSeekPlayback = true
     previousPollWasPlaying = false
@@ -644,6 +642,8 @@ final class PlayerModel: PlaybackEngineControlling {
     max(PlaybackBufferPolicy.contiguousEnd(at: currentTime, ranges: bufferedRanges) - currentTime, 0)
   }
 
+  var forwardBufferTarget: Double { preferredBufferSeconds }
+
   private func play(_ source: VideoSource, allowFallback: Bool, resumeAt: Double? = nil) async {
     mediaInfoTask?.cancel()
     itemStartedAt = ProcessInfo.processInfo.systemUptime
@@ -729,9 +729,13 @@ final class PlayerModel: PlaybackEngineControlling {
     // loads duration/tracks asynchronously after playback starts, so avoid
     // duplicating that work on the critical startup path.
     let playerItem = AVPlayerItem(asset: asset, automaticallyLoadedAssetKeys: [])
-    // Startup uses a small runway; once frames advance we grow it using the
-    // stream bitrate. Do not force an almost-empty buffer to play immediately.
-    playerItem.preferredForwardBufferDuration = fastStartEnabled ? 3 : 8
+    // Prefetch is not a minimum startup delay. A three-second preference limits
+    // requested headroom for a bursty original; request steady-state headroom
+    // from the outset and let AVPlayer decide when it can safely begin.
+    let estimatedBitrate = source.isOriginal && duration > 0 ? Double(item.size) * 8 / duration : 0
+    preferredBufferSeconds = PlaybackBufferPolicy.forwardDuration(bitrate: estimatedBitrate,
+      stalls: 0, rate: Double(player.defaultRate), memoryBytes: ProcessInfo.processInfo.physicalMemory)
+    playerItem.preferredForwardBufferDuration = preferredBufferSeconds
 
     // Maximum-fidelity policy with no extra decode/filter stage. A zero bit-rate
     // or resolution value means "no cap" for adaptive/HLS assets, including on
@@ -1037,7 +1041,7 @@ final class PlayerModel: PlaybackEngineControlling {
   }
 
   private func updateForwardBuffer() {
-    guard hasPlayedCurrentItem, let playerItem = player.currentItem else { return }
+    guard let playerItem = player.currentItem else { return }
     let indicated = playerItem.accessLog()?.events.last?.indicatedBitrate ?? 0
     let originalEstimate = selectedSource?.isOriginal == true && duration > 0
       ? Double(item.size) * 8 / duration : 0
@@ -1073,7 +1077,7 @@ final class PlayerModel: PlaybackEngineControlling {
     }
     if bufferingStartedAt == nil { bufferingStartedAt = now }
     let wait = now.timeIntervalSince(bufferingStartedAt ?? now)
-    resumeWithBufferedRunwayIfNeeded(wait: wait)
+    startWithBufferedRunwayIfNeeded()
     let uptime = ProcessInfo.processInfo.systemUptime
     if hasPlayedCurrentItem, !awaitingSeekPlayback, wait >= 1, !countedCurrentStall {
       countedCurrentStall = true
@@ -1088,7 +1092,7 @@ final class PlayerModel: PlaybackEngineControlling {
       selectedSource?.isOriginal == true, !player.isExternalPlaybackActive,
       now.timeIntervalSince(lastControlledResumeAt) >= 3,
       let reason = recoveryPolicy.reason(now: uptime, wait: wait,
-        hasStarted: hasPlayedCurrentItem, seeking: awaitingSeekPlayback,
+        hasStarted: hasPlayedCurrentItem, seeking: positionSeekPending,
         fastStart: fastStartEnabled) else { return }
     switch reason {
     case .slowStart: switchOriginalToVLC(reason: "系统内核起播超过 10 秒，已切换 VLC 原画")
@@ -1108,31 +1112,25 @@ final class PlayerModel: PlaybackEngineControlling {
     switchOriginalToVLC(reason: "手动切换 VLC，继续播放同一原文件")
   }
 
-  private func resumeWithBufferedRunwayIfNeeded(wait: Double) {
+  private func startWithBufferedRunwayIfNeeded() {
     guard let playerItem = player.currentItem, playerItem.status == .readyToPlay,
       player.reasonForWaitingToPlay == .toMinimizeStalls,
       !player.isExternalPlaybackActive, !positionSeekPending,
       !playerItem.isPlaybackBufferEmpty, !resumedCurrentWait else { return }
-    let starting = !hasPlayedCurrentItem || awaitingSeekPlayback
-    guard starting ? fastStartEnabled : networkAutoRecoveryEnabled else { return }
-    if !hasPlayedCurrentItem && initialStartAttempted { return }
-    let speed = Double(max(player.defaultRate, 0.5))
-    // Forward prefetch and the resume threshold are separate: keep downloading
-    // ahead, but don't wait for a whole long movie to be predicted stall-free.
-    // After a real refill require a larger runway, not a barely nonempty buffer.
-    let runway = (starting ? 3.0 : min(20, 8 + Double(bufferStallCount) * 4)) * speed
     let remaining = duration > 0 ? max(duration - currentTime, 0) : .infinity
-    let threshold = min(runway, remaining)
-    guard threshold > 0.1, bufferedDuration + 0.05 >= threshold,
-      wait >= (starting ? 0 : 1) else { return }
+    guard PlaybackStartupPolicy.canStartImmediately(hasStarted: hasPlayedCurrentItem,
+      attempted: initialStartAttempted, seeking: positionSeekPending,
+      fastStart: fastStartEnabled, original: selectedSource?.isOriginal == true,
+      buffered: bufferedDuration, remaining: remaining, rate: Double(player.defaultRate),
+      observedBitrate: observedMbps, requiredBitrate: requiredMbps) else { return }
     resumedCurrentWait = true
     lastControlledResumeAt = Date()
     lastPlaybackProgressAt = lastControlledResumeAt
-    if !hasPlayedCurrentItem { initialStartAttempted = true }
+    initialStartAttempted = true
     controlledResumeCount += 1
     player.playImmediately(atRate: player.defaultRate)
-    // Automatic waiting stays enabled for a subsequent genuinely empty buffer.
-    // Retry eligibility is restored only by real playback, not by a timer.
+    // No further forced starts for this item, including seeks and refills.
+    // AVPlayer retains control of the reserve needed for sustained playback.
   }
 
   var playbackDiagnosticText: String {

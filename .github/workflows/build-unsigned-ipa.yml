@@ -19,6 +19,14 @@ jobs:
       - name: Select latest Xcode
         run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
 
+      - name: Test shipping playback policies
+        run: |
+          set -euo pipefail
+          xcrun swiftc Gallery115/Models/CloudItem.swift \
+            Gallery115/Models/PlaybackRecoveryPolicy.swift \
+            Tests/PlaybackPolicyTests.swift -o "$RUNNER_TEMP/playback-policy-tests"
+          "$RUNNER_TEMP/playback-policy-tests"
+
       - name: Restore CocoaPods download cache
         id: pods-cache
         uses: actions/cache/restore@v4

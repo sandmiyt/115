@@ -2061,48 +2061,58 @@ struct PlayerScreen: View {
     controlsVisible = true
     scheduleControlsHide()
 
-    let initialPlaybackTime = activeCurrentTime
     auxiliaryLoadTask = Task { @MainActor in
-      // 650ms was shorter than a cold WebDAV/115 open (often 10-20s), so
-      // sidecars competed with startup. Wait for actual media-time progress.
-      if appState.fastStartEnabled {
-        while abs(activeCurrentTime - initialPlaybackTime) <= 0.08 || activeIsBuffering || !activeIsPlaying {
-          do { try await Task.sleep(nanoseconds: 250_000_000) }
-          catch { return }
-          guard currentItem.id == expectedID, model === newModel else { return }
-          if newModel.errorMessage != nil { return }
-        }
-      }
+      // One advancing frame is not a stable connection. Require a reserve
+      // before releasing competing requests, even when fast start is disabled.
+      guard await waitForAuxiliaryRunway(itemID: expectedID, playerModel: newModel) else { return }
       guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else { return }
       Logger(subsystem: "com.xiaocai.gallery115", category: "PlaybackStartup")
         .info("Auxiliary loads released after \(ProcessInfo.processInfo.systemUptime - startupBeganAt, privacy: .public)s")
 
-      async let subtitleTracksTask: [ExternalSubtitleTrack] =
-        (try? await appState.api.externalSubtitleTracks(for: expectedItem)) ?? []
-      async let sidecarChapterTask = appState.api.sidecarChapters(for: expectedItem)
-
-      let tracks = await subtitleTracksTask
+      let tracks = (try? await appState.api.externalSubtitleTracks(for: expectedItem)) ?? []
       guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else { return }
       externalSubtitleTracks = tracks
       autoSelectExternalSubtitleIfNeeded()
 
-      sidecarChapters = await sidecarChapterTask
+      guard await waitForAuxiliaryRunway(itemID: expectedID, playerModel: newModel) else { return }
+      sidecarChapters = await appState.api.sidecarChapters(for: expectedItem)
       guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else { return }
 
-      // Poster/NFO can be much larger than chapter/subtitle discovery. Load it
-      // after playback has had an additional head start so artwork never wins a
-      // bandwidth race against the first seconds of the movie.
-      if appState.fastStartEnabled {
-        try? await Task.sleep(nanoseconds: 700_000_000)
-      }
+      guard await waitForAuxiliaryRunway(itemID: expectedID, playerModel: newModel) else { return }
       guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else { return }
 
       localMetadata = await appState.api.localMetadata(for: expectedItem)
       guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else { return }
       configureRemotePlayback()
 
+      guard await waitForAuxiliaryRunway(itemID: expectedID, playerModel: newModel) else { return }
       await ensureCompletePlaylist(for: expectedItem)
     }
+  }
+
+  @MainActor
+  private func waitForAuxiliaryRunway(itemID: String, playerModel: PlayerModel) async -> Bool {
+    var stableSince = ProcessInfo.processInfo.systemUptime
+    var previousTime = activeCurrentTime
+    while !Task.isCancelled, currentItem.id == itemID, model === playerModel {
+      if playerModel.errorMessage != nil || activeDidReachEnd { return false }
+      do { try await Task.sleep(for: .milliseconds(500)) } catch { return false }
+      guard !Task.isCancelled, currentItem.id == itemID, model === playerModel else { return false }
+      let now = ProcessInfo.processInfo.systemUptime
+      let time = activeCurrentTime
+      let step = time - previousTime
+      previousTime = time
+      if !activeIsPlaying || activeIsBuffering || step <= 0.08 || step > 2 {
+        stableSince = now
+        continue
+      }
+      let remaining = activeDuration > 0 ? max(activeDuration - time, 0) : .infinity
+      if PlaybackStartupPolicy.canLoadAuxiliary(stableSeconds: now - stableSince,
+        buffered: useVLC ? nil : playerModel.bufferedDuration,
+        remaining: remaining, rate: Double(playbackRate),
+        forwardTarget: playerModel.forwardBufferTarget) { return true }
+    }
+    return false
   }
 
   @MainActor

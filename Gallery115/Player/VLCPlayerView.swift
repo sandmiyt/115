@@ -58,8 +58,7 @@ import SwiftUI
     ) {
       guard configuredSource != source || self.item?.id != item.id else { return }
       stop(saveProgress: false)
-      let generation = UUID()
-      playbackGeneration = generation
+      playbackGeneration = UUID()
       self.item = item
       configuredSource = source
       self.libraryStore = libraryStore
@@ -83,9 +82,10 @@ import SwiftUI
       diagnosticWaitCounted = false
 
       let media = VLCMedia(url: source.url)
-      // Originals often arrive in bursts. 650 ms exhausts almost immediately
-      // between responses; keep a bounded runway without changing the source.
-      let cacheMilliseconds = item.isDiscImage ? 4200 : (fastStartEnabled ? 1800 : 3500)
+      // A 1.8-second original cache is depleted by brief CDN delivery gaps.
+      // Keep a larger bounded reserve for the same original bytes.
+      let cacheMilliseconds = PlaybackStartupPolicy.vlcCacheMilliseconds(
+        original: source.isOriginal, disc: item.isDiscImage, fastStart: fastStartEnabled)
       var options: [String: Any] = [
         "http-user-agent": source.headers.first(where: { $0.key.lowercased() == "user-agent" })?.value ?? APIClient.userAgent,
         "network-caching": cacheMilliseconds,

@@ -24,6 +24,7 @@ sources = [
     "Tests/CacheRegression/ArtworkCacheTests.swift",
     "Tests/CacheRegression/FrameExtractionTests.swift",
     "Tests/CacheRegression/FolderCollectionPolicyTests.swift",
+    "Tests/PlaybackPolicyTests.swift",
     "Gallery115/Models/CloudItem.swift", "Gallery115/Views/FolderView.swift",
     "Gallery115/Services/APIClient.swift",
     "Gallery115/Services/Cloud115AuthManager.swift",
@@ -127,7 +128,10 @@ check("generation == cacheGeneration" in service and "cacheGeneration = UUID()" 
       "Clear invalidates in-flight results")
 check("suspendNetwork(for: thumbnailPlaybackOwner)" in player and "resumeNetwork(for: owner)" in player,
       "Player lifecycle acquires/releases thumbnail priority")
-check("abs(activeCurrentTime - initialPlaybackTime)" in player, "Auxiliary loads wait for playback progress")
+check("PlaybackStartupPolicy.canLoadAuxiliary" in player
+      and "step <= 0.08 || step > 2" in player
+      and player.count("guard await waitForAuxiliaryRunway") == 4,
+      "Each auxiliary stage waits for sustained progress and contiguous runway")
 check("let targetScale = min(max(rawScale, 1.0), 5.0)" in player
       and "if rawScale > 5.0" in player,
       "Video pinch rests at up to five-times zoom with rubber-band overshoot")
@@ -152,10 +156,9 @@ vlc = (ROOT / "Gallery115/Player/VLCPlayerView.swift").read_text(encoding="utf-8
 original_vlc = subprocess.check_output(["git", "show", "HEAD:Gallery115/Player/VLCPlayerView.swift"], cwd=ROOT).decode("utf-8")
 def vlc_credentials(text):
     # Engine handoff intentionally changes configure/resume. Keep protecting
-    # WebDAV credential forwarding and the established network-cache limits.
+    # WebDAV credential forwarding. Cache policy is covered by Swift tests.
     auth = text.split('      if let authorization = source.headers["Authorization"]', 1)[1].split("      media.addOptions(options)", 1)[0]
-    cache = re.search(r"let cacheMilliseconds = .*", text).group(0)
-    return auth, cache
+    return auth
 unchanged = unchanged and vlc_credentials(vlc) == vlc_credentials(original_vlc)
 keychain = (ROOT / "Gallery115/Services/KeychainStore.swift").read_text(encoding="utf-8")
 original_keychain = subprocess.check_output(
@@ -166,8 +169,15 @@ def token_storage(text):
     end = text.index("\n\nenum MediaSourceKind")
     return text[start:end]
 check(unchanged and token_storage(keychain) == token_storage(original_keychain),
-      "AVPlayer view, VLC credentials/cache limits, and token storage unchanged")
+      "AVPlayer view, VLC credentials, and token storage unchanged")
 player_model = (ROOT / "Gallery115/Player/PlayerModel.swift").read_text(encoding="utf-8")
+check(player_model.count("player.playImmediately(") == 1
+      and "guard PlaybackStartupPolicy.canStartImmediately(" in player_model
+      and player_model.count("initialStartAttempted = false") == 2,
+      "Forced startup is policy-gated and reset only for a new item")
+check("playerItem.preferredForwardBufferDuration = preferredBufferSeconds" in player_model
+      and "PlaybackStartupPolicy.vlcCacheMilliseconds(" in vlc,
+      "Both engines use the tested buffering policy")
 old_player_model = subprocess.check_output(["git", "show", "HEAD:Gallery115/Player/PlayerModel.swift"],
                                           cwd=ROOT).decode("utf-8")
 def without_prepare(text):
