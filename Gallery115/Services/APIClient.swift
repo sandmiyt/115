@@ -62,14 +62,11 @@ actor APIClient {
     }
   }
 
-  func initialVideoSources(for item: CloudItem, preferOriginal: Bool) async throws -> (sources: [VideoSource], hasDeferredSources: Bool) {
-    if source == .cloud115 {
+  func initialVideoSources(for item: CloudItem, preferOriginal: Bool) async throws -> (sources: [VideoSource], hasDeferredTranscodes: Bool) {
+    if preferOriginal, source == .cloud115 {
       do {
-        if preferOriginal {
-          return ([try await cloud115.playbackOriginalSource(for: item)], true)
-        }
-        let transcodes = try await cloud115.playbackTranscodedSources(for: item)
-        if !transcodes.isEmpty { return (transcodes, true) }
+        let original = try await cloud115.playbackOriginalSource(for: item)
+        return ([original], true)
       } catch let error as CloudProviderError {
         switch error {
         case .authenticationRequired, .rateLimited: throw error
@@ -77,23 +74,16 @@ actor APIClient {
         }
       } catch {
         try Task.checkCancellation()
+        // Keep the existing authenticated/transcode fallback if original lookup fails.
       }
-      try Task.checkCancellation()
-      // A failed preferred lookup falls back once. An already usable 1080p
-      // stream must not wait for the unrelated original-file URL request.
-      if preferOriginal {
-        return (try await cloud115.playbackTranscodedSources(for: item), false)
-      }
-      return ([try await cloud115.playbackOriginalSource(for: item)], false)
     }
     try Task.checkCancellation()
     return (try await videoSources(for: item), false)
   }
 
-  func remainingVideoSources(for item: CloudItem, preferOriginal: Bool) async throws -> [VideoSource] {
+  func remainingVideoSources(for item: CloudItem) async throws -> [VideoSource] {
     guard source == .cloud115 else { return [] }
-    if preferOriginal { return try await cloud115.playbackTranscodedSources(for: item) }
-    return [try await cloud115.playbackOriginalSource(for: item)]
+    return try await cloud115.playbackTranscodedSources(for: item)
   }
 
   func thumbnailLibraryPage(id: String, offset: Int, forceRefresh: Bool = false) async throws -> ThumbnailLibraryPage {

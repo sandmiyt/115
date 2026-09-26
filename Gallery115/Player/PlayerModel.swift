@@ -186,25 +186,6 @@ final class PlayerModel: PlaybackEngineControlling {
   private let fastStartEnabled: Bool
   private let networkAutoRecoveryEnabled: Bool
   private var activeAsset: AVURLAsset?
-  let playbackTransport = "直连"
-  private(set) var sourceLookupSeconds: Double?
-  private(set) var readySeconds: Double?
-  private(set) var firstPlaybackSeconds: Double?
-  private(set) var observedMbps: Double?
-  private(set) var requiredMbps: Double?
-  private(set) var playbackStallCount = 0
-  private(set) var playbackStallSeconds: Double = 0
-  private(set) var controlledResumeCount = 0
-  private var itemStartedAt: TimeInterval = 0
-  private var previousPollAt: TimeInterval = 0
-  private var previousPollWasPlaying = false
-  private var positionSeekPending = false
-  private var positionSeekGeneration = 0
-  private var resumedCurrentWait = false
-  private var initialStartAttempted = false
-  private var awaitingSeekPlayback = false
-  private var lastControlledResumeAt = Date.distantPast
-  @ObservationIgnored private var mediaInfoTask: Task<Void, Never>?
   private var mediaInfoGeneration = UUID()
   private var audioGroup: AVMediaSelectionGroup?
   private var subtitleGroup: AVMediaSelectionGroup?
@@ -220,6 +201,7 @@ final class PlayerModel: PlaybackEngineControlling {
   private var isFallingBack = false
   private var lastTransferredBytes: Int64 = 0
   private var lastBandwidthSampleAt = Date()
+  private var lastStallRecoveryAt = Date.distantPast
   private var lastPlaybackProgressAt = Date()
   private var lastPlaybackProgressTime: Double = 0
   private var wantsPlayback = false
@@ -227,10 +209,11 @@ final class PlayerModel: PlaybackEngineControlling {
   private var pendingInitialPosition: Double = 0
   private var bufferingStartedAt: Date?
   private var countedCurrentStall = false
-  private var recoveryPolicy = PlaybackRecoveryPolicy()
+  private var sustainedStalls: [Date] = []
   private var bufferStallCount = 0
   private var preferredBufferSeconds: Double = 0
   private var interactiveScrubActive = false
+  private var stallProbeTask: Task<Void, Never>?
 
   // The main player seeks only on release. A generation guard also handles a
   // new drag beginning before the preceding release seek has completed.
@@ -264,7 +247,6 @@ final class PlayerModel: PlaybackEngineControlling {
   }
 
   deinit {
-    mediaInfoTask?.cancel()
     playbackTimer?.invalidate()
     deferredSourcesTask?.cancel()
     if let failureObserver {
@@ -292,10 +274,8 @@ final class PlayerModel: PlaybackEngineControlling {
     defer { isPreparing = false }
 
     do {
-      let lookupStartedAt = ProcessInfo.processInfo.systemUptime
       let initial = try await api.initialVideoSources(for: item, preferOriginal: defaultQuality == .original)
       try Task.checkCancellation()
-      sourceLookupSeconds = ProcessInfo.processInfo.systemUptime - lookupStartedAt
       sources = initial.sources
       guard !sources.isEmpty else {
         errorMessage = "媒体源没有返回可播放地址。"
@@ -306,8 +286,6 @@ final class PlayerModel: PlaybackEngineControlling {
       switch defaultQuality {
       case .highestTranscode:
         preferred = bestTranscode ?? original ?? sources.first
-      case .fullHD:
-        preferred = VideoSource.preferred1080p(in: sources)
       case .original:
         preferred = original ?? bestTranscode ?? sources.first
       }
@@ -315,7 +293,7 @@ final class PlayerModel: PlaybackEngineControlling {
         await play(preferred, allowFallback: true)
       }
       installTimeObserverIfNeeded()
-      if initial.hasDeferredSources { loadRemainingSources() }
+      if initial.hasDeferredTranscodes { loadRemainingSources() }
     } catch {
       guard !Task.isCancelled else { return }
       errorMessage = error.localizedDescription
@@ -326,17 +304,10 @@ final class PlayerModel: PlaybackEngineControlling {
     deferredSourcesTask?.cancel()
     let api = self.api
     let item = self.item
-    let preferOriginal = selectedSource?.isOriginal == true
     deferredSourcesTask = Task { @MainActor [weak self] in
       do {
-        // Other quality URLs are only needed for optional previews/fallbacks.
-        // A fixed two-second delay still competes with a slow original start.
-        while let self, !self.requiresVLC,
-          !self.hasPlayedCurrentItem || self.isBuffering || self.bufferedDuration < 10 {
-          try await Task.sleep(for: .seconds(1))
-        }
-        try Task.checkCancellation()
-        let remaining = try await api.remainingVideoSources(for: item, preferOriginal: preferOriginal)
+        try await Task.sleep(for: .seconds(2))
+        let remaining = try await api.remainingVideoSources(for: item)
         guard let self, !Task.isCancelled else { return }
         let existingIDs = Set(self.sources.map(\.id))
         self.sources.append(contentsOf: remaining.filter { !existingIDs.contains($0.id) })
@@ -354,6 +325,8 @@ final class PlayerModel: PlaybackEngineControlling {
     wantsPlayback = false
     bufferingStartedAt = nil
     countedCurrentStall = false
+    stallProbeTask?.cancel()
+    stallProbeTask = nil
     cancelInteractiveScrub()
     player.pause()
     isPlaying = false
@@ -363,8 +336,6 @@ final class PlayerModel: PlaybackEngineControlling {
 
   func resume() {
     wantsPlayback = true
-    resumedCurrentWait = false
-    previousPollWasPlaying = false
     lastPlaybackProgressAt = Date()
     didReachEnd = false
     activateAudioSession()
@@ -377,12 +348,12 @@ final class PlayerModel: PlaybackEngineControlling {
     wantsPlayback = true
     lastPlaybackProgressAt = Date()
     cancelInteractiveScrub()
+    stallProbeTask?.cancel()
+    stallProbeTask = nil
     didReachEnd = false
     currentTime = 0
-    awaitingSeekPlayback = true
-    previousPollWasPlaying = false
     bufferedUntil = max(bufferedUntil, 0)
-    seekPosition(to: .zero)
+    player.seek(to: .zero)
     player.play()
     isPlaying = true
     isBuffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
@@ -400,33 +371,12 @@ final class PlayerModel: PlaybackEngineControlling {
 
   func seek(to seconds: Double) {
     cancelInteractiveScrub()
+    stallProbeTask?.cancel()
+    stallProbeTask = nil
     lastPlaybackProgressAt = Date()
     let target = clampedSeekTarget(seconds)
     currentTime = target
-    awaitingSeekPlayback = true
-    previousPollWasPlaying = false
-    seekPosition(to: CMTime(seconds: target, preferredTimescale: 600))
-  }
-
-  private func seekPosition(to target: CMTime, tolerance: CMTime = .zero) {
-    guard let playerItem = player.currentItem else { return }
-    positionSeekGeneration &+= 1
-    let generation = positionSeekGeneration
-    positionSeekPending = true
-    awaitingSeekPlayback = true
-    resumedCurrentWait = false
-    previousPollWasPlaying = false
-    bufferingStartedAt = nil
-    countedCurrentStall = false
-    player.seek(to: target, toleranceBefore: tolerance, toleranceAfter: tolerance) { [weak self] _ in
-      Task { @MainActor in
-        guard let self, self.player.currentItem === playerItem,
-          self.positionSeekGeneration == generation else { return }
-        self.positionSeekPending = false
-        self.previousPollWasPlaying = false
-        self.lastPlaybackProgressAt = Date()
-      }
-    }
+    player.seek(to: CMTime(seconds: target, preferredTimescale: 600))
   }
 
   /// Keep the primary decoder and its forward buffer untouched while dragging.
@@ -435,15 +385,11 @@ final class PlayerModel: PlaybackEngineControlling {
   func beginInteractiveScrub() -> Bool {
     let shouldResume = scrubResumeAfterFinish || isPlaying || player.timeControlStatus != .paused || player.rate > 0
     cancelInteractiveScrub()
-    positionSeekGeneration &+= 1
-    if positionSeekPending { player.currentItem?.cancelPendingSeeks() }
-    positionSeekPending = false
-    resumedCurrentWait = false
     interactiveScrubActive = true
-    awaitingSeekPlayback = true
-    previousPollWasPlaying = false
     bufferingStartedAt = nil
     countedCurrentStall = false
+    stallProbeTask?.cancel()
+    stallProbeTask = nil
     player.pause()
     isPlaying = false
     isBuffering = false
@@ -521,7 +467,7 @@ final class PlayerModel: PlaybackEngineControlling {
     let isFinalPass = scrubFinalTarget != nil
     // Tiny tolerances force a GOP decode even for already-buffered data.
     // AVPlayer's fast path finds a nearby decodable frame while dragging.
-    let tolerance = isFinalPass ? CMTime(seconds: 0.5, preferredTimescale: 600) : .positiveInfinity
+    let tolerance = isFinalPass ? CMTime(seconds: 0.10, preferredTimescale: 600) : .positiveInfinity
     scrubSeekInProgress = true
     scrubInFlightTarget = target
     isInteractiveScrubLoading = isFinalPass
@@ -642,36 +588,18 @@ final class PlayerModel: PlaybackEngineControlling {
     max(PlaybackBufferPolicy.contiguousEnd(at: currentTime, ranges: bufferedRanges) - currentTime, 0)
   }
 
-  var forwardBufferTarget: Double { preferredBufferSeconds }
-
-  private func play(_ source: VideoSource, allowFallback: Bool, resumeAt: Double? = nil) async {
-    mediaInfoTask?.cancel()
-    itemStartedAt = ProcessInfo.processInfo.systemUptime
-    previousPollAt = itemStartedAt
-    previousPollWasPlaying = false
-    positionSeekPending = false
-    initialStartAttempted = false
-    awaitingSeekPlayback = false
-    lastControlledResumeAt = .distantPast
-    resumedCurrentWait = false
-    readySeconds = nil
-    firstPlaybackSeconds = nil
-    observedMbps = nil
-    requiredMbps = nil
-    playbackStallCount = 0
-    playbackStallSeconds = 0
-    controlledResumeCount = 0
+  private func play(_ source: VideoSource, allowFallback: Bool) async {
     cancelInteractiveScrub()
     bufferedRanges = []
     bufferedUntil = 0
     selectedSource = source
     hasPlayedCurrentItem = false
-    pendingInitialPosition = resumeAt ?? libraryStore.resumePosition(for: item)
+    pendingInitialPosition = libraryStore.resumePosition(for: item)
     engineSwitchReason = nil
     engineSwitchResumePosition = nil
     bufferingStartedAt = nil
     countedCurrentStall = false
-    recoveryPolicy = PlaybackRecoveryPolicy()
+    sustainedStalls = []
     bufferStallCount = 0
     preferredBufferSeconds = 0
     wantsPlayback = true
@@ -700,6 +628,9 @@ final class PlayerModel: PlaybackEngineControlling {
     lastPlaybackProgressAt = Date()
     lastPlaybackProgressTime = 0
     interactiveScrubActive = false
+    stallProbeTask?.cancel()
+    stallProbeTask = nil
+    lastStallRecoveryAt = .distantPast
     player.automaticallyWaitsToMinimizeStalling = true
 
     // Containers that AVPlayer commonly rejects should go straight to VLC when
@@ -719,8 +650,6 @@ final class PlayerModel: PlaybackEngineControlling {
 
     var assetOptions: [String: Any] = [AVURLAssetPreferPreciseDurationAndTimingKey: false]
     if !source.headers.isEmpty { assetOptions["AVURLAssetHTTPHeaderFieldsKey"] = source.headers }
-    // Keep AVFoundation's independent range requests intact. The experimental
-    // single-request resource loader could cancel media reads for metadata reads.
     let asset = AVURLAsset(url: source.url, options: assetOptions)
     activeAsset = asset
 
@@ -729,13 +658,9 @@ final class PlayerModel: PlaybackEngineControlling {
     // loads duration/tracks asynchronously after playback starts, so avoid
     // duplicating that work on the critical startup path.
     let playerItem = AVPlayerItem(asset: asset, automaticallyLoadedAssetKeys: [])
-    // Prefetch is not a minimum startup delay. A three-second preference limits
-    // requested headroom for a bursty original; request steady-state headroom
-    // from the outset and let AVPlayer decide when it can safely begin.
-    let estimatedBitrate = source.isOriginal && duration > 0 ? Double(item.size) * 8 / duration : 0
-    preferredBufferSeconds = PlaybackBufferPolicy.forwardDuration(bitrate: estimatedBitrate,
-      stalls: 0, rate: Double(player.defaultRate), memoryBytes: ProcessInfo.processInfo.physicalMemory)
-    playerItem.preferredForwardBufferDuration = preferredBufferSeconds
+    // Startup uses a small runway; once frames advance we grow it using the
+    // stream bitrate. Do not force an almost-empty buffer to play immediately.
+    playerItem.preferredForwardBufferDuration = fastStartEnabled ? 4 : 8
 
     // Maximum-fidelity policy with no extra decode/filter stage. A zero bit-rate
     // or resolution value means "no cap" for adaptive/HLS assets, including on
@@ -752,11 +677,14 @@ final class PlayerModel: PlaybackEngineControlling {
     installItemObservers(for: playerItem)
     player.replaceCurrentItem(with: playerItem)
 
-    let resumePosition = pendingInitialPosition
-    if resumePosition > 0, resumeAt != nil || (resumePosition > 2 && (duration <= 0 || resumePosition < duration - 15)) {
+    let resumePosition = libraryStore.resumePosition(for: item)
+    if resumePosition > 2, duration <= 0 || resumePosition < duration - 15 {
       currentTime = resumePosition
-      seekPosition(to: CMTime(seconds: resumePosition, preferredTimescale: 600),
-        tolerance: CMTime(seconds: 1, preferredTimescale: 600))
+      player.seek(
+        to: CMTime(seconds: resumePosition, preferredTimescale: 600),
+        toleranceBefore: CMTime(seconds: 1, preferredTimescale: 600),
+        toleranceAfter: CMTime(seconds: 1, preferredTimescale: 600)
+      ) { _ in }
     } else {
       currentTime = 0
     }
@@ -766,15 +694,15 @@ final class PlayerModel: PlaybackEngineControlling {
     isBuffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
 
     let generation = mediaInfoGeneration
-    mediaInfoTask = Task { @MainActor [weak self] in
-      // A fixed delay still probes a slow remote asset during startup. Wait for
-      // actual playback plus a runway; cancellation releases an abandoned item.
-      while let self, self.mediaInfoGeneration == generation,
-        !self.hasPlayedCurrentItem || self.isBuffering || self.bufferedDuration < 5 {
-        do { try await Task.sleep(for: .milliseconds(500)) } catch { return }
+    Task { @MainActor [weak self] in
+      guard let self else { return }
+      // In fast-start mode, give AVPlayer a short head start before asking the
+      // same remote asset for duration/tracks/chapters. Those inspections can
+      // otherwise compete with the first media ranges on slower OpenList links.
+      if self.fastStartEnabled {
+        try? await Task.sleep(nanoseconds: 900_000_000)
       }
-      guard let self, !Task.isCancelled, self.mediaInfoGeneration == generation,
-        self.player.currentItem === playerItem else { return }
+      guard self.mediaInfoGeneration == generation, self.player.currentItem === playerItem else { return }
       async let durationTask = try? asset.load(.duration)
       async let characteristicsTask = self.detectVideoCharacteristics(asset)
       async let selectionTask: Void = self.loadMediaSelectionOptions(asset: asset, playerItem: playerItem)
@@ -805,7 +733,7 @@ final class PlayerModel: PlaybackEngineControlling {
       var options: [String: Any] = [AVURLAssetPreferPreciseDurationAndTimingKey: false]
       if !source.headers.isEmpty { options["AVURLAssetHTTPHeaderFieldsKey"] = source.headers }
       timelinePreview.configure(asset: AVURLAsset(url: source.url, options: options),
-        identity: source.id, allowsWarmup: false, fallbackAsset: activeAsset)
+        identity: source.id, allowsWarmup: true, fallbackAsset: activeAsset)
     } else {
       timelinePreview.configure(asset: activeAsset, identity: selectedSource?.id ?? "",
         allowsWarmup: activeAsset.url.isFileURL)
@@ -906,7 +834,6 @@ final class PlayerModel: PlaybackEngineControlling {
     async let loadedSubtitleGroup = try? asset.loadMediaSelectionGroup(for: .legible)
 
     let (audio, subtitles) = await (loadedAudioGroup, loadedSubtitleGroup)
-    guard !Task.isCancelled, player.currentItem === playerItem else { return }
     audioGroup = audio
     subtitleGroup = subtitles
 
@@ -959,38 +886,30 @@ final class PlayerModel: PlaybackEngineControlling {
     }
     let seconds = player.currentTime().seconds.isFinite ? max(player.currentTime().seconds, 0) : 0
     let now = Date()
-    let uptime = ProcessInfo.processInfo.systemUptime
-    let pollElapsed = max(0, uptime - previousPollAt)
-    let playing = player.timeControlStatus == .playing
-    let delta = seconds - lastPlaybackProgressTime
-    // A restored timestamp is a seek, not proof that any frames have played.
-    // Require consecutive playing samples and a plausible media-clock step.
-    let progressed = previousPollWasPlaying && playing && !positionSeekPending
-      && !interactiveScrubActive && delta > 0.08
-      && delta <= pollElapsed * Double(max(player.defaultRate, 1)) + 0.5
-    lastPlaybackProgressTime = seconds
-    previousPollAt = uptime
-    previousPollWasPlaying = playing
+    // A backwards seek also establishes a new progress baseline. Otherwise
+    // playback appears stalled until it reaches the old pre-seek timestamp.
+    let progressed = abs(seconds - lastPlaybackProgressTime) > 0.08
     if progressed {
+      lastPlaybackProgressTime = seconds
       lastPlaybackProgressAt = now
-      if !hasPlayedCurrentItem { firstPlaybackSeconds = uptime - itemStartedAt }
-      hasPlayedCurrentItem = true
-      awaitingSeekPlayback = false
-      resumedCurrentWait = false
-    }
-    if let playerItem = player.currentItem, playerItem.status == .readyToPlay {
-      if readySeconds == nil { readySeconds = uptime - itemStartedAt }
-      let loadedDuration = playerItem.duration.seconds
-      if loadedDuration.isFinite, loadedDuration > 0 { duration = loadedDuration }
-      if videoDisplaySize == nil, playerItem.presentationSize.width > 0 {
-        videoDisplaySize = playerItem.presentationSize
-      }
+      if seconds > 0 { hasPlayedCurrentItem = true }
     }
 
     if !interactiveScrubActive {
       currentTime = seconds
       isPlaying = player.timeControlStatus == .playing
       isBuffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
+    }
+
+    if networkAutoRecoveryEnabled,
+      wantsPlayback,
+      !didReachEnd,
+      !interactiveScrubActive,
+      seconds > 0.5,
+      now.timeIntervalSince(lastPlaybackProgressAt) > 3.2,
+      (player.timeControlStatus == .waitingToPlayAtSpecifiedRate || player.rate > 0)
+    {
+      requestStallRecoveryIfNeeded()
     }
 
     let ranges = PlaybackBufferPolicy.normalized((player.currentItem?.loadedTimeRanges ?? []).map {
@@ -1006,20 +925,18 @@ final class PlayerModel: PlaybackEngineControlling {
 
     if let log = player.currentItem?.accessLog() {
       let bytes = log.events.reduce(Int64(0)) { $0 + max($1.numberOfBytesTransferred, 0) }
-      sampleNetwork(bytes: bytes, now: now)
-      let measured = log.events.last?.observedBitrate ?? 0
-      observedMbps = measured.isFinite && measured > 0 ? measured / 1_000_000 : nil
+      transferredMegabytes = Double(bytes) / 1_048_576
+      let elapsed = now.timeIntervalSince(lastBandwidthSampleAt)
+      if elapsed >= 0.45 {
+        networkMbps = bytes >= lastTransferredBytes
+          ? Double(bytes - lastTransferredBytes) * 8 / elapsed / 1_000_000 : 0
+        lastTransferredBytes = bytes
+        lastBandwidthSampleAt = now
+      }
     } else {
       networkMbps = 0
-      observedMbps = nil
     }
-    let indicated = player.currentItem?.accessLog()?.events.last?.indicatedBitrate ?? 0
-    let originalEstimate = selectedSource?.isOriginal == true && duration > 0
-      ? Double(item.size) * 8 / duration : 0
-    let required = max(indicated.isFinite ? indicated : 0, originalEstimate)
-    requiredMbps = required > 0 ? required / 1_000_000 : nil
     updateWaitingStatusAndFallback(now: now)
-    if countedCurrentStall { playbackStallSeconds += pollElapsed }
     guard !requiresVLC else { return }
 
     let second = Int(seconds)
@@ -1029,26 +946,14 @@ final class PlayerModel: PlaybackEngineControlling {
     }
   }
 
-  private func sampleNetwork(bytes: Int64, now: Date) {
-    transferredMegabytes = Double(bytes) / 1_048_576
-    let elapsed = now.timeIntervalSince(lastBandwidthSampleAt)
-    if elapsed >= 0.45 {
-      networkMbps = bytes >= lastTransferredBytes
-        ? Double(bytes - lastTransferredBytes) * 8 / elapsed / 1_000_000 : 0
-      lastTransferredBytes = bytes
-      lastBandwidthSampleAt = now
-    }
-  }
-
   private func updateForwardBuffer() {
-    guard let playerItem = player.currentItem else { return }
+    guard hasPlayedCurrentItem, let playerItem = player.currentItem else { return }
     let indicated = playerItem.accessLog()?.events.last?.indicatedBitrate ?? 0
     let originalEstimate = selectedSource?.isOriginal == true && duration > 0
       ? Double(item.size) * 8 / duration : 0
     let bitrate = max(indicated.isFinite ? indicated : 0, originalEstimate)
     let target = PlaybackBufferPolicy.forwardDuration(bitrate: bitrate,
-      stalls: bufferStallCount, rate: Double(player.defaultRate),
-      memoryBytes: ProcessInfo.processInfo.physicalMemory)
+      stalls: bufferStallCount, rate: Double(player.defaultRate))
     guard abs(target - preferredBufferSeconds) >= 2 else { return }
     preferredBufferSeconds = target
     playerItem.preferredForwardBufferDuration = target
@@ -1077,87 +982,23 @@ final class PlayerModel: PlaybackEngineControlling {
     }
     if bufferingStartedAt == nil { bufferingStartedAt = now }
     let wait = now.timeIntervalSince(bufferingStartedAt ?? now)
-    startWithBufferedRunwayIfNeeded()
-    let uptime = ProcessInfo.processInfo.systemUptime
-    if hasPlayedCurrentItem, !awaitingSeekPlayback, wait >= 1, !countedCurrentStall {
+    sustainedStalls.removeAll { now.timeIntervalSince($0) > 60 }
+    if wait >= 1, !countedCurrentStall {
       countedCurrentStall = true
-      playbackStallCount += 1
-      recoveryPolicy.recordRefill(at: uptime)
       bufferStallCount = min(bufferStallCount + 1, 3)
       updateForwardBuffer()
     }
-    // Two separate >=1 s refills in a minute are disruptive too. Previously
-    // only >=3 s waits counted, so repeated short freezes never recovered.
+    // Short refills grow the buffer too, but only sustained stalls trigger an
+    // engine handoff. Count a continuous stall once at the three-second mark.
+    if wait >= 3, sustainedStalls.last.map({ $0 < (bufferingStartedAt ?? now) }) ?? true {
+      sustainedStalls.append(now)
+    }
+    // A single normal refill must not change engines. Recover only a long
+    // interruption or repeated sustained stalls, and never downgrade quality.
     guard networkAutoRecoveryEnabled, allowsAutomaticEngineSwitch, originalPlaybackEngine == .automatic,
       selectedSource?.isOriginal == true, !player.isExternalPlaybackActive,
-      now.timeIntervalSince(lastControlledResumeAt) >= 3,
-      let reason = recoveryPolicy.reason(now: uptime, wait: wait,
-        hasStarted: hasPlayedCurrentItem, seeking: positionSeekPending,
-        fastStart: fastStartEnabled) else { return }
-    switch reason {
-    case .slowStart: switchOriginalToVLC(reason: "系统内核起播超过 10 秒，已切换 VLC 原画")
-    case .repeatedRefills: switchOriginalToVLC(reason: "一分钟内反复缓冲，已切换 VLC 原画续播")
-    case .prolongedWait: switchOriginalToVLC(reason: "原画持续缓冲，已切换 VLC 续播")
-    }
-  }
-
-  var canSwitchToVLC: Bool {
-    selectedSource?.isOriginal == true && !requiresVLC && VLCAvailability.isAvailable
-      && allowsAutomaticEngineSwitch && !player.isExternalPlaybackActive
-      && wantsPlayback && !interactiveScrubActive && !positionSeekPending
-  }
-
-  func useVLCForCurrentOriginal() {
-    guard canSwitchToVLC else { return }
-    switchOriginalToVLC(reason: "手动切换 VLC，继续播放同一原文件")
-  }
-
-  private func startWithBufferedRunwayIfNeeded() {
-    guard let playerItem = player.currentItem, playerItem.status == .readyToPlay,
-      player.reasonForWaitingToPlay == .toMinimizeStalls,
-      !player.isExternalPlaybackActive, !positionSeekPending,
-      !playerItem.isPlaybackBufferEmpty, !resumedCurrentWait else { return }
-    let remaining = duration > 0 ? max(duration - currentTime, 0) : .infinity
-    guard PlaybackStartupPolicy.canStartImmediately(hasStarted: hasPlayedCurrentItem,
-      attempted: initialStartAttempted, seeking: positionSeekPending,
-      fastStart: fastStartEnabled, original: selectedSource?.isOriginal == true,
-      buffered: bufferedDuration, remaining: remaining, rate: Double(player.defaultRate),
-      observedBitrate: observedMbps, requiredBitrate: requiredMbps) else { return }
-    resumedCurrentWait = true
-    lastControlledResumeAt = Date()
-    lastPlaybackProgressAt = lastControlledResumeAt
-    initialStartAttempted = true
-    controlledResumeCount += 1
-    player.playImmediately(atRate: player.defaultRate)
-    // No further forced starts for this item, including seeks and refills.
-    // AVPlayer retains control of the reserve needed for sustained playback.
-  }
-
-  var playbackDiagnosticText: String {
-    func seconds(_ value: Double?) -> String {
-      value.map { String(format: "%.2f s", $0) } ?? "未获得"
-    }
-    func mbps(_ value: Double?) -> String {
-      value.map { String(format: "%.2f Mbps", $0) } ?? "未提供"
-    }
-    let version = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "?"
-    let build = (Bundle.main.infoDictionary?["CFBundleVersion"] as? String) ?? "?"
-    // Deliberately omit file names, URLs, headers, account IDs and error text.
-    return """
-      Cineva \(version) (\(build)) · AVPlayer · \(playbackTransport)
-      画质：\(selectedSource?.isOriginal == true ? "原文件" : "转码")
-      取流地址：\(seconds(sourceLookupSeconds))
-      播放器就绪：\(seconds(readySeconds))
-      实际起播（播放器创建后）：\(seconds(firstPlaybackSeconds))
-      状态：\(waitingStatus)
-      内核设置：\(originalPlaybackEngine.title) · 自动恢复：\(networkAutoRecoveryEnabled ? "开" : "关")
-      连续缓冲：\(String(format: "%.2f s", bufferedDuration))
-      历史下载吞吐（非当前网速）：\(mbps(observedMbps))
-      媒体码率（估算）：\(mbps(requiredMbps))
-      倍速：\(player.defaultRate)
-      播放中缓冲：\(playbackStallCount) 次 / \(seconds(playbackStallSeconds))
-      有缓冲主动起播：\(controlledResumeCount) 次
-      """
+      wait >= 15 || sustainedStalls.count >= 3 else { return }
+    switchOriginalToVLC(reason: "原画持续缓冲，已切换 VLC 续播")
   }
 
   private func switchOriginalToVLC(reason: String) {
@@ -1169,14 +1010,11 @@ final class PlayerModel: PlaybackEngineControlling {
     engineSwitchReason = reason
     waitingStatus = reason
     cancelInteractiveScrub()
+    stallProbeTask?.cancel()
+    stallProbeTask = nil
     wantsPlayback = false
     player.pause()
     player.replaceCurrentItem(with: nil)
-    mediaInfoTask?.cancel()
-    deferredSourcesTask?.cancel()
-    timelinePreview.reset()
-    playbackTimer?.invalidate()
-    playbackTimer = nil
     // Invalidate metadata tasks from the old AVPlayerItem.
     mediaInfoGeneration = UUID()
     activeAsset = nil
@@ -1184,18 +1022,6 @@ final class PlayerModel: PlaybackEngineControlling {
     isPlaying = false
     isBuffering = false
     errorMessage = nil
-  }
-
-  func stop() {
-    pause()
-    deferredSourcesTask?.cancel()
-    mediaInfoTask?.cancel()
-    mediaInfoGeneration = UUID()
-    timelinePreview.reset()
-    player.replaceCurrentItem(with: nil)
-    activeAsset = nil
-    playbackTimer?.invalidate()
-    playbackTimer = nil
   }
 
   private func installItemObservers(for playerItem: AVPlayerItem) {
@@ -1232,6 +1058,7 @@ final class PlayerModel: PlaybackEngineControlling {
         self.isPlaying = false
         self.didReachEnd = true
         self.wantsPlayback = false
+        self.stallProbeTask?.cancel()
         self.saveProgress(force: true)
       }
     }
@@ -1243,8 +1070,48 @@ final class PlayerModel: PlaybackEngineControlling {
     ) { [weak self] _ in
       Task { @MainActor [weak self] in
         guard let self, self.player.currentItem === playerItem else { return }
-        self.pollPlayback()
+        self.requestStallRecoveryIfNeeded()
       }
+    }
+  }
+
+  private func requestStallRecoveryIfNeeded() {
+    guard networkAutoRecoveryEnabled, wantsPlayback, !didReachEnd, !interactiveScrubActive else { return }
+    guard let playerItem = player.currentItem, playerItem.status == .readyToPlay else { return }
+    guard stallProbeTask == nil else { return }
+    let now = Date()
+    guard now.timeIntervalSince(lastStallRecoveryAt) > 8 else { return }
+
+    lastStallRecoveryAt = now
+    isBuffering = true
+    let generation = mediaInfoGeneration
+    let stalledAt = max(player.currentTime().seconds.isFinite ? player.currentTime().seconds : currentTime, 0)
+
+    // A stall is normally a legitimate buffer refill, not a broken timeline.
+    // Let the native loader continue. Seeking after 950 ms can restart range /
+    // segment requests; playImmediately can consume the tiny refill again.
+    player.automaticallyWaitsToMinimizeStalling = true
+    stallProbeTask = Task { @MainActor [weak self] in
+      do { try await Task.sleep(for: .seconds(8)) } catch { return }
+      guard let self, !Task.isCancelled, self.mediaInfoGeneration == generation else { return }
+      self.stallProbeTask = nil
+      guard self.wantsPlayback, !self.didReachEnd, !self.interactiveScrubActive,
+        self.player.currentItem === playerItem else { return }
+
+      let nowTime = max(self.player.currentTime().seconds.isFinite ? self.player.currentTime().seconds : self.currentTime, 0)
+      if nowTime > stalledAt + 0.12 {
+        self.lastPlaybackProgressAt = Date()
+        self.lastPlaybackProgressTime = nowTime
+        self.isBuffering = self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate
+        return
+      }
+
+      // Only reassert play when the buffer is ready. Never cancel a pending
+      // download or force playback against AVPlayer's insufficient-data signal.
+      guard !playerItem.isPlaybackBufferEmpty,
+        playerItem.isPlaybackLikelyToKeepUp || playerItem.isPlaybackBufferFull else { return }
+      self.player.play()
+      self.isBuffering = self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate
     }
   }
 

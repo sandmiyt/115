@@ -18,16 +18,12 @@ struct PlaybackBufferRange: Equatable, Sendable {
 
 enum PlaybackBufferPolicy {
   /// A compressed-data estimate, not a hard AVFoundation memory limit.
-  /// The old 64 MB budget reduced 80 Mbps originals to the eight-second floor, even after
-  /// repeated refills. Scale the compressed runway to device memory; the
-  /// playback controller separately bounds when it bypasses an evaluation wait.
-  static func forwardDuration(bitrate: Double, stalls: Int, rate: Double,
-    memoryBytes: UInt64 = 4 * 1_024 * 1_024 * 1_024) -> Double {
-    let speed = rate.isFinite ? min(max(rate, 1), 2) : 1
-    let desired = min(120, 60 + Double(min(max(stalls, 0), 3)) * 20) * speed
-    let memoryBudget = min(256.0 * 1_048_576, max(96.0 * 1_048_576, Double(memoryBytes) / 24))
-    let budgetSeconds = bitrate.isFinite && bitrate > 0 ? memoryBudget * 8 / bitrate : 90
-    return min(desired, max(12, budgetSeconds))
+  /// Keep a longer runway on bursty connections without requesting minutes of
+  /// a very high bitrate original. Decoded frames are managed by AVFoundation.
+  static func forwardDuration(bitrate: Double, stalls: Int, rate: Double) -> Double {
+    let desired = min(90, 30 + Double(min(max(stalls, 0), 3)) * 20) * max(rate, 1)
+    let budgetSeconds = bitrate.isFinite && bitrate > 0 ? 64 * 1_048_576 * 8 / bitrate : 60
+    return min(desired, max(8, budgetSeconds))
   }
 
   static func normalized(_ ranges: [PlaybackBufferRange]) -> [PlaybackBufferRange] {

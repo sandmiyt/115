@@ -172,11 +172,8 @@ final class TimelinePreviewController {
     let generator = AVAssetImageGenerator(asset: asset)
     generator.appliesPreferredTrackTransform = true
     generator.maximumSize = CGSize(width: 480, height: 480)
-    // Scrub previews can use a nearby keyframe; requiring a half-second window
-    // often forces a long-GOP original to download/decode many intermediate frames.
-    // The overlay always labels the actual image time, not the requested time.
-    generator.requestedTimeToleranceBefore = CMTime(seconds: 3, preferredTimescale: 600)
-    generator.requestedTimeToleranceAfter = CMTime(seconds: 3, preferredTimescale: 600)
+    generator.requestedTimeToleranceBefore = CMTime(seconds: 0.5, preferredTimescale: 600)
+    generator.requestedTimeToleranceAfter = CMTime(seconds: 0.5, preferredTimescale: 600)
     return generator
   }
 
@@ -207,7 +204,7 @@ final class TimelinePreviewController {
     // Never hold a completely unrelated frame while waiting on a remote miss.
     image = frame?.image
     imageTime = frame?.time ?? requestedTime
-    if let frame, abs(frame.time - requestedTime) <= 1 { return }
+    if let frame, abs(frame.time - requestedTime) <= 0.5 { return }
     guard requestTask == nil else { return }
     requestFrame(warming: false)
   }
@@ -281,8 +278,8 @@ final class TimelinePreviewController {
     }
     guard warmSlot < 48, warmFailures < 2, requestTask == nil,
       Date().timeIntervalSince(lastWarmAt) >= 8 else { return }
-    // Remote assets must not opt in: even small transcode seeks can compete
-    // with the original's download. Only local files may build a storyboard.
+    // A small, bounded storyboard on a low-resolution source only. Playback
+    // takes priority; maintain() cancels it as soon as the runway drops.
     requestedTime = min(duration * (Double(warmSlot) + 0.5) / 48, max(duration - 0.1, 0))
     warmSlot += 1
     lastWarmAt = Date()

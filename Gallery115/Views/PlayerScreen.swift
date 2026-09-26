@@ -256,7 +256,6 @@ struct PlayerScreen: View {
       PlayerInfoSheet(
         item: currentItem,
         model: model,
-        vlcController: vlcController,
         videoLayout: videoLayout,
         playbackRate: playbackRate,
         playlistCount: playlist.count,
@@ -340,7 +339,7 @@ struct PlayerScreen: View {
       if let message, useVLC { model?.errorMessage = message }
     }
     .onChange(of: systemPresentationController.isPictureInPictureActive) { _, active in
-      model?.allowsAutomaticEngineSwitch = !active && !isRoutePickerPresented
+      model?.allowsAutomaticEngineSwitch = !active
     }
     .onChange(of: activeCurrentTime) { _, _ in
       updateRemotePlaybackInfo()
@@ -394,7 +393,6 @@ struct PlayerScreen: View {
     auxiliaryLoadTask?.cancel()
     dismissRestoreTask?.cancel()
     pauseActivePlayer()
-    model?.stop()
     vlcController.stop()
     RemotePlaybackCoordinator.shared.deactivate()
     PlayerOrientation.request(.portrait)
@@ -1610,7 +1608,6 @@ struct PlayerScreen: View {
   private func settingsAirPlayButton() -> some View {
     AirPlayRoutePickerButton { presented in
       isRoutePickerPresented = presented
-      model?.allowsAutomaticEngineSwitch = !presented && !systemPresentationController.isPictureInPictureActive
       if presented {
         keepControlsDuringInteraction()
       } else {
@@ -2025,7 +2022,6 @@ struct PlayerScreen: View {
 
     if model != nil {
       pauseActivePlayer()
-      model?.stop()
       vlcController.stop()
     }
 
@@ -2046,7 +2042,7 @@ struct PlayerScreen: View {
     // received its URL and begun opening the media connection.
     await newModel.prepareAndPlay()
     guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else {
-      newModel.stop()
+      newModel.pause()
       return
     }
 
@@ -2061,58 +2057,48 @@ struct PlayerScreen: View {
     controlsVisible = true
     scheduleControlsHide()
 
+    let initialPlaybackTime = activeCurrentTime
     auxiliaryLoadTask = Task { @MainActor in
-      // One advancing frame is not a stable connection. Require a reserve
-      // before releasing competing requests, even when fast start is disabled.
-      guard await waitForAuxiliaryRunway(itemID: expectedID, playerModel: newModel) else { return }
+      // 650ms was shorter than a cold WebDAV/115 open (often 10-20s), so
+      // sidecars competed with startup. Wait for actual media-time progress.
+      if appState.fastStartEnabled {
+        while abs(activeCurrentTime - initialPlaybackTime) <= 0.08 || activeIsBuffering || !activeIsPlaying {
+          do { try await Task.sleep(nanoseconds: 250_000_000) }
+          catch { return }
+          guard currentItem.id == expectedID, model === newModel else { return }
+          if newModel.errorMessage != nil { return }
+        }
+      }
       guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else { return }
       Logger(subsystem: "com.xiaocai.gallery115", category: "PlaybackStartup")
         .info("Auxiliary loads released after \(ProcessInfo.processInfo.systemUptime - startupBeganAt, privacy: .public)s")
 
-      let tracks = (try? await appState.api.externalSubtitleTracks(for: expectedItem)) ?? []
+      async let subtitleTracksTask: [ExternalSubtitleTrack] =
+        (try? await appState.api.externalSubtitleTracks(for: expectedItem)) ?? []
+      async let sidecarChapterTask = appState.api.sidecarChapters(for: expectedItem)
+
+      let tracks = await subtitleTracksTask
       guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else { return }
       externalSubtitleTracks = tracks
       autoSelectExternalSubtitleIfNeeded()
 
-      guard await waitForAuxiliaryRunway(itemID: expectedID, playerModel: newModel) else { return }
-      sidecarChapters = await appState.api.sidecarChapters(for: expectedItem)
+      sidecarChapters = await sidecarChapterTask
       guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else { return }
 
-      guard await waitForAuxiliaryRunway(itemID: expectedID, playerModel: newModel) else { return }
+      // Poster/NFO can be much larger than chapter/subtitle discovery. Load it
+      // after playback has had an additional head start so artwork never wins a
+      // bandwidth race against the first seconds of the movie.
+      if appState.fastStartEnabled {
+        try? await Task.sleep(nanoseconds: 700_000_000)
+      }
       guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else { return }
 
       localMetadata = await appState.api.localMetadata(for: expectedItem)
       guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else { return }
       configureRemotePlayback()
 
-      guard await waitForAuxiliaryRunway(itemID: expectedID, playerModel: newModel) else { return }
       await ensureCompletePlaylist(for: expectedItem)
     }
-  }
-
-  @MainActor
-  private func waitForAuxiliaryRunway(itemID: String, playerModel: PlayerModel) async -> Bool {
-    var stableSince = ProcessInfo.processInfo.systemUptime
-    var previousTime = activeCurrentTime
-    while !Task.isCancelled, currentItem.id == itemID, model === playerModel {
-      if playerModel.errorMessage != nil || activeDidReachEnd { return false }
-      do { try await Task.sleep(for: .milliseconds(500)) } catch { return false }
-      guard !Task.isCancelled, currentItem.id == itemID, model === playerModel else { return false }
-      let now = ProcessInfo.processInfo.systemUptime
-      let time = activeCurrentTime
-      let step = time - previousTime
-      previousTime = time
-      if !activeIsPlaying || activeIsBuffering || step <= 0.08 || step > 2 {
-        stableSince = now
-        continue
-      }
-      let remaining = activeDuration > 0 ? max(activeDuration - time, 0) : .infinity
-      if PlaybackStartupPolicy.canLoadAuxiliary(stableSeconds: now - stableSince,
-        buffered: useVLC ? nil : playerModel.bufferedDuration,
-        remaining: remaining, rate: Double(playbackRate),
-        forwardTarget: playerModel.forwardBufferTarget) { return true }
-    }
-    return false
   }
 
   @MainActor
@@ -2942,7 +2928,6 @@ private struct PlayerInfoSheet: View {
   @Environment(AppState.self) private var appState
   let item: CloudItem
   let model: PlayerModel?
-  let vlcController: VLCPlaybackController
   let videoLayout: PlayerVideoLayout
   let playbackRate: Float
   let playlistCount: Int
@@ -3000,12 +2985,6 @@ private struct PlayerInfoSheet: View {
 
         Section("播放") {
           LabeledContent("播放内核", value: playbackEngine)
-          if playbackEngine == "AVPlayer", let model, model.selectedSource?.isOriginal == true {
-            Button("用 VLC 播放同一原文件") { model.useVLCForCurrentOriginal() }
-              .disabled(!model.canSwitchToVLC)
-            Text("保留画质和进度。VLC 不提供此处的画中画和 AirPlay 功能。")
-              .font(.caption).foregroundStyle(.secondary)
-          }
           LabeledContent("当前清晰度", value: model?.selectedSource?.title ?? "原画")
           if let reason = model?.engineSwitchReason {
             Text(reason).font(.caption).foregroundStyle(.secondary)
@@ -3027,7 +3006,6 @@ private struct PlayerInfoSheet: View {
         Section("网络") {
           if playbackEngine == "AVPlayer", let model {
             LabeledContent("播放状态", value: model.waitingStatus)
-            LabeledContent("读取方式", value: model.playbackTransport)
           }
           LabeledContent(
             "下载速度（采样）",
@@ -3037,42 +3015,6 @@ private struct PlayerInfoSheet: View {
             "已缓冲",
             value: bufferedDuration > 0 ? formatTime(bufferedDuration) : "--"
           )
-          if playbackEngine == "AVPlayer", let model {
-            if let seconds = model.sourceLookupSeconds {
-              LabeledContent("取流地址耗时", value: String(format: "%.2f 秒", seconds))
-            }
-            if let seconds = model.readySeconds {
-              LabeledContent("播放器就绪耗时", value: String(format: "%.2f 秒", seconds))
-            }
-            if let seconds = model.firstPlaybackSeconds {
-              LabeledContent("实际起播耗时（采样）", value: String(format: "%.2f 秒", seconds))
-            }
-            if let mbps = model.observedMbps {
-              LabeledContent("历史下载吞吐", value: String(format: "%.1f Mbps", mbps))
-            }
-            if let mbps = model.requiredMbps {
-              LabeledContent("媒体码率（估算）", value: String(format: "%.1f Mbps", mbps))
-            }
-            LabeledContent("播放中缓冲次数", value: "\(model.playbackStallCount)")
-            Button {
-              UIPasteboard.general.string = model.playbackDiagnosticText
-            } label: {
-              Label("复制播放诊断", systemImage: "doc.on.doc")
-            }
-            Text("就绪和起播耗时从交给播放器时算起，每 0.5 秒采样；历史吞吐不代表当前网速，无法排除请求等待。诊断不含文件名、播放地址或账号信息。")
-              .font(.caption).foregroundStyle(.secondary)
-          }
-          if playbackEngine == "VLC" {
-            if let seconds = vlcController.firstPlaybackSeconds {
-              LabeledContent("VLC 起播耗时（采样）", value: String(format: "%.2f 秒", seconds))
-            }
-            LabeledContent("VLC 缓冲次数（含定位）", value: "\(vlcController.playbackStallCount)")
-            Button {
-              UIPasteboard.general.string = vlcController.playbackDiagnosticText
-            } label: {
-              Label("复制播放诊断", systemImage: "doc.on.doc")
-            }
-          }
         }
 
         Section("手势") {

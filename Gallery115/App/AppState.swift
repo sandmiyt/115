@@ -69,7 +69,6 @@ final class AppState {
 
   enum DefaultQuality: String, CaseIterable, Identifiable {
     case highestTranscode
-    case fullHD
     case original
 
     var id: String { rawValue }
@@ -77,7 +76,6 @@ final class AppState {
     var title: String {
       switch self {
       case .highestTranscode: return "最高转码（推荐）"
-      case .fullHD: return "1080P 优先"
       case .original: return "原画优先"
       }
     }
@@ -289,13 +287,17 @@ final class AppState {
       ArtworkMode(rawValue: defaults.string(forKey: Keys.artworkMode) ?? "") ?? .fit
     browserLayout =
       BrowserLayout(rawValue: defaults.string(forKey: Keys.browserLayout) ?? "") ?? .grid
-    defaultQuality =
-      DefaultQuality(rawValue: defaults.string(forKey: Keys.defaultQuality) ?? "")
-        ?? .highestTranscode
-    // Version 2.3.0 exposed mpv; migrate that retired choice before creating a player.
-    let savedPlaybackEngine = defaults.string(forKey: Keys.originalPlaybackEngine) ?? ""
-    originalPlaybackEngine = OriginalPlaybackEngine(rawValue: savedPlaybackEngine) ?? .automatic
-    if savedPlaybackEngine == "mpv" {
+    let savedQuality = defaults.string(forKey: Keys.defaultQuality) ?? ""
+    // The retired 1080P preference returns to the original-file path.
+    if savedQuality == "fullHD" {
+      defaultQuality = .original
+      defaults.set(DefaultQuality.original.rawValue, forKey: Keys.defaultQuality)
+    } else {
+      defaultQuality = DefaultQuality(rawValue: savedQuality) ?? .highestTranscode
+    }
+    let savedEngine = defaults.string(forKey: Keys.originalPlaybackEngine) ?? ""
+    originalPlaybackEngine = OriginalPlaybackEngine(rawValue: savedEngine) ?? .automatic
+    if savedEngine == "mpv" {
       defaults.set(OriginalPlaybackEngine.automatic.rawValue, forKey: Keys.originalPlaybackEngine)
     }
     colorSchemePreference =
