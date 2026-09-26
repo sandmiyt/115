@@ -29,6 +29,11 @@ struct FFmpegDecodeValidationView: View {
           .font(.subheadline)
         if case .failed(let message) = session.state {
           Text(message).font(.callout).foregroundStyle(.red)
+          Button("从头验证") {
+            session.stop()
+            copiedDiagnostics = false
+            session.start(source: source, at: 0, preferHardware: preferHardware)
+          }
         } else {
           HStack {
             Text(session.state.title)
@@ -51,6 +56,11 @@ struct FFmpegDecodeValidationView: View {
           Text(session.colorDescription)
           Text("渲染器：Apple Native · NV12 / P010")
           Text(session.pipelineDescription)
+          Text(session.containerDescription)
+          Text(session.nativeStageDescription)
+          Text(session.recoveryDescription)
+          Text("解码器输出 \(session.decodedVideoFrames) 帧 · 目标前预滚 \(session.prerollFrames) 帧")
+          if let warning = session.audioWarning { Text(warning).foregroundStyle(.secondary) }
           Text(session.timingDescription)
           Text("显示入队 \(session.submittedFrames) 帧 / 丢弃迟到帧 \(session.droppedFrames) / 显示恢复 \(session.renderRecoveries) 次")
           Text("首帧可显示：\(session.displayReadiness) · \(session.renderingDescription)")

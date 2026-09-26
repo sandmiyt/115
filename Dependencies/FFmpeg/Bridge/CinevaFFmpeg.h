@@ -35,7 +35,19 @@ typedef struct {
     int colorPrimaries, colorTransfer, colorMatrix, hasMastering, hasContentLight;
     int64_t hardwareFrames, softwareFrames;
     double recoveryTarget;
+    // Failure is captured at its origin; worker activity cannot overwrite it.
+    int failureStage, readerStage, decoderStage;
+    int probeRetried, seekFallbacks, audioWarningCode;
+    int64_t decodedVideoFrames, prerollFrames;
+    int videoProfile, videoStreamIndex;
+    char container[48];
 } CinevaFFmpegSnapshot;
+enum {
+    CinevaStageOpen = 1, CinevaStageProbe, CinevaStageSelectVideo,
+    CinevaStageVideoOpen, CinevaStageAudioOpen, CinevaStageSeek,
+    CinevaStageRead, CinevaStageVideoDecode, CinevaStageAudioDecode,
+    CinevaStageVideoSurface, CinevaStageWorker
+};
 CinevaFFmpegSession * _Nullable CinevaFFmpegSessionCreate(
     const char * _Nonnull url, const char * _Nonnull headers, double startTime, int preferHardware);
 void CinevaFFmpegSessionCancel(CinevaFFmpegSession * _Nonnull session);
@@ -48,6 +60,7 @@ void CinevaFFmpegSessionSnapshot(CinevaFFmpegSession * _Nonnull session,
 CVPixelBufferRef _Nullable CinevaFFmpegSessionCopyFrame(CinevaFFmpegSession * _Nonnull session,
     double * _Nonnull pts, int * _Nonnull serial) CF_RETURNS_RETAINED;
 const char * _Nonnull CinevaFFmpegCodecName(int codec);
+void CinevaFFmpegErrorText(int code, char * _Nonnull buffer, int capacity);
 
 #ifdef __cplusplus
 }

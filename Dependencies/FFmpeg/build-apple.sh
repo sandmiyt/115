@@ -79,6 +79,7 @@ _CinevaFFmpegSessionSetPosition
 _CinevaFFmpegSessionSnapshot
 _CinevaFFmpegSessionCopyFrame
 _CinevaFFmpegCodecName
+_CinevaFFmpegErrorText
 EXPORTS
   "$compiler" -target "$triple" -isysroot "$sdkpath" -dynamiclib \
     -std=c11 -O2 -I "$prefix/include" -I "$ROOT/Bridge" "$ROOT"/Bridge/*.c \

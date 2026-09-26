@@ -55,16 +55,26 @@ final class FFmpegDecodeSession {
   private(set) var renderRecoveries = 0
   private(set) var displayReadiness = "等待首帧"
   private(set) var timingDescription = "等待时间戳"
+  private(set) var nativeStageDescription = "等待任务"
+  private(set) var recoveryDescription = "尚未重试"
+  private(set) var containerDescription = "容器尚未识别"
+  private(set) var decodedVideoFrames: Int64 = 0
+  private(set) var prerollFrames: Int64 = 0
+  private(set) var audioWarning: String?
 
   var diagnosticText: String {
     let version = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "unknown"
     let build = (Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String) ?? "unknown"
+    let failure: String
+    if case .failed(let message) = state { failure = message } else { failure = "无终止错误" }
     return "Cineva \(version) (\(build)) · FFmpeg 无声验证\n"
       + "\(mediaDescription)\n\(decoderDescription)\n\(outputDescription)\n\(colorDescription)\n"
       + "状态：\(state.title) · \(pipelineDescription)\n\(timingDescription)\n"
       + "解码：\(videoFrames) 帧；显示入队：\(submittedFrames)；丢帧：\(droppedFrames)；显示恢复：\(renderRecoveries)\n"
       + "队列：\(packetBytes / 1024) KB / \(frameCount) 帧；首帧可显示：\(displayReadiness)\n"
-      + (fallbackDescription ?? "")
+      + "\(containerDescription)\n\(nativeStageDescription)\n\(recoveryDescription)\n"
+      + "解码器输出：\(decodedVideoFrames) 帧；目标前预滚：\(prerollFrames) 帧\n"
+      + "\(failure)\n" + (audioWarning ?? "") + "\n" + (fallbackDescription ?? "")
   }
 
   @ObservationIgnored private var handle: FFmpegSessionHandle?
@@ -88,6 +98,15 @@ final class FFmpegDecodeSession {
     audioFrames = 0
     packetBytes = 0
     frameCount = 0
+    mediaDescription = "正在读取媒体信息"
+    nativeStageDescription = "等待任务"
+    recoveryDescription = "尚未重试"
+    containerDescription = "容器尚未识别"
+    pipelineDescription = "正在打开媒体"
+    timingDescription = "等待时间戳"
+    decodedVideoFrames = 0
+    prerollFrames = 0
+    audioWarning = nil
     submittedFrames = 0
     droppedFrames = 0
     renderRecoveries = 0
@@ -156,11 +175,105 @@ final class FFmpegDecodeSession {
     state = .seeking
   }
 
+  private func errorText(_ code: Int32) -> String {
+    var buffer = [CChar](repeating: 0, count: 128)
+    CinevaFFmpegErrorText(code, &buffer, 128)
+    return String(cString: buffer)
+  }
+
+  private func stageName(_ stage: Int32) -> String {
+    switch stage {
+    case 1: return "打开媒体地址"
+    case 2: return "探测媒体信息"
+    case 3: return "选择视频轨"
+    case 4: return "初始化视频解码器"
+    case 5: return "初始化音频解码器"
+    case 6: return "定位视频关键帧"
+    case 7: return "读取媒体包"
+    case 8: return "解码视频"
+    case 9: return "解码音频"
+    case 10: return "转换视频像素缓冲"
+    case 11: return "创建解码线程"
+    default: return "等待任务"
+    }
+  }
+
+  private func publish(_ snapshot: CinevaFFmpegSnapshot, now: Double) {
+    lastPublishedAt = now
+    duration = snapshot.duration
+    videoFrames = snapshot.videoFrames
+    audioFrames = snapshot.audioFrames
+    packetBytes = snapshot.packetBytes
+    frameCount = Int(snapshot.frameCount)
+    hardwareFrames = snapshot.hardwareFrames
+    softwareFrames = snapshot.softwareFrames
+    decoderDescription = snapshot.decoderType == 2 ? "VideoToolbox 硬件解码" :
+      (snapshot.decoderType == 1 ? "FFmpeg 软件解码" : "等待实际解码帧")
+    if snapshot.outputWidth > 0 {
+      outputDescription = "\(snapshot.outputWidth)×\(snapshot.outputHeight) · \(snapshot.outputBitDepth) 位 · 原生显示"
+    }
+    if snapshot.videoCodec != 0 {
+      let transfer = snapshot.colorTransfer == 16 ? "HDR10 / PQ" : (snapshot.colorTransfer == 18 ? "HLG" : "未标记 PQ / HLG")
+      colorDescription = "\(transfer) · primaries \(snapshot.colorPrimaries) / matrix \(snapshot.colorMatrix)"
+        + " · MDCV \(snapshot.hasMastering == 1 ? "有" : "无") / CLL \(snapshot.hasContentLight == 1 ? "有" : "无")"
+    }
+    switch snapshot.fallbackReason {
+    case 1: fallbackDescription = "当前设备或编码未提供可用硬解，使用软件解码。"
+    case 2: fallbackDescription = "硬解设备初始化失败，已改用软件解码。"
+    case 3: fallbackDescription = "硬解会话不接受当前格式或 Profile，已改用软件解码。"
+    case 4: fallbackDescription = "硬解过程中失败，已从当前位置附近的关键帧重新软件解码。"
+    case 5: fallbackDescription = "本次手动选择软件解码对照。"
+    default: fallbackDescription = nil
+    }
+    rotation = snapshot.rotation.isFinite ? snapshot.rotation : 0
+    if snapshot.videoCodec != 0 {
+      let video = String(cString: CinevaFFmpegCodecName(snapshot.videoCodec))
+      let audio = snapshot.audioCodec == 0 ? "无音轨" : String(cString: CinevaFFmpegCodecName(snapshot.audioCodec))
+      mediaDescription = "\(video) · \(snapshot.width)×\(snapshot.height) · 音频 \(audio)"
+      if snapshot.fps.isFinite, snapshot.fps > 0 { frameStep = 1 / min(240, max(1, snapshot.fps)) }
+    }
+    if renderer.anchored { currentTime = max(0, renderer.time) }
+    submittedFrames = renderer.submittedFrames
+    droppedFrames = renderer.droppedFrames
+    renderRecoveries = renderer.recoveryCount
+    renderingDescription = renderer.waitReason
+    if #available(iOS 17.4, *) {
+      displayReadiness = displayLayer.isReadyForDisplay ? "是" : "否"
+    } else {
+      displayReadiness = "当前系统未提供此诊断"
+    }
+    timingDescription = String(format: "时钟 %.3f s · 最近入队 %.3f s", renderer.time, renderer.lastPTS)
+      + (pending.map { String(format: " · 下一帧 %.3f s", $0.1) } ?? " · 下一帧未就绪")
+    if pending != nil || snapshot.frameCount > 0 {
+      pipelineDescription = "已有解码帧 · " + renderer.waitReason
+    } else if snapshot.packetCount > 0 {
+      pipelineDescription = "已有压缩数据 · 等待视频解码输出"
+    } else {
+      pipelineDescription = snapshot.status == 2 ? "解码已结束" : "等待解封装 / 网络数据"
+    }
+    nativeStageDescription = "读取：" + stageName(snapshot.readerStage)
+      + " · 解码：" + stageName(snapshot.decoderStage)
+    recoveryDescription = "扩展探测 \(snapshot.probeRetried) 次 · 关键帧定位回退 \(snapshot.seekFallbacks) 次"
+    decodedVideoFrames = snapshot.decodedVideoFrames
+    prerollFrames = snapshot.prerollFrames
+    audioWarning = snapshot.audioWarningCode == 0 ? nil :
+      "音轨验证已跳过：\(errorText(snapshot.audioWarningCode))（\(snapshot.audioWarningCode)）；无声视频验证继续。"
+    let container = withUnsafeBytes(of: snapshot.container) { bytes in
+      String(decoding: bytes.prefix { $0 != 0 }, as: UTF8.self)
+    }
+    containerDescription = container.isEmpty ? "容器尚未识别" : "容器：\(container) · 视频轨 \(snapshot.videoStreamIndex) · Profile \(snapshot.videoProfile)"
+    if snapshot.status < 0 { pipelineDescription = "失败阶段：" + stageName(snapshot.failureStage) }
+    else if snapshot.status == 0 { pipelineDescription = stageName(snapshot.readerStage) }
+  }
+
   fileprivate func pump() {
     guard let handle else { return }
     var snapshot = CinevaFFmpegSnapshot()
     CinevaFFmpegSessionSnapshot(handle.pointer, &snapshot)
     if snapshot.status < 0 {
+      publish(snapshot, now: CACurrentMediaTime())
+      let failureStage = stageName(snapshot.failureStage)
+      let detail = errorText(snapshot.errorCode)
       let code = snapshot.errorCode
       let av1SoftwareUnavailable = snapshot.fallbackReason > 0 &&
         String(cString: CinevaFFmpegCodecName(snapshot.videoCodec)) == "av1"
@@ -169,7 +282,7 @@ final class FFmpegDecodeSession {
         ? "本构建尚未集成 AV1 软件解码器。请尝试开启优先硬解，或返回原播放器使用 VLC。"
         : code == -70001
         ? "检测到 Dolby Vision，本阶段尚未接入其动态元数据处理。请返回原播放器使用系统内核。"
-        : "FFmpeg 验证未能继续（\(code)）。可能是地址过期、网络超时或格式暂不支持。请返回原播放器。")
+        : "\(failureStage)失败：\(detail)（\(code)）。请复制诊断；也可从头验证以区分定位问题。")
       return
     }
     // Decoder failure can trigger an internal keyframe restart in software.
@@ -183,58 +296,7 @@ final class FFmpegDecodeSession {
     }
     if renderer.anchored { CinevaFFmpegSessionSetPosition(handle.pointer, renderer.time) }
     let now = CACurrentMediaTime()
-    if now - lastPublishedAt >= 0.25 {
-      lastPublishedAt = now
-      duration = snapshot.duration
-      videoFrames = snapshot.videoFrames
-      audioFrames = snapshot.audioFrames
-      packetBytes = snapshot.packetBytes
-      frameCount = Int(snapshot.frameCount)
-      hardwareFrames = snapshot.hardwareFrames
-      softwareFrames = snapshot.softwareFrames
-      decoderDescription = snapshot.decoderType == 2 ? "VideoToolbox 硬件解码" :
-        (snapshot.decoderType == 1 ? "FFmpeg 软件解码" : "等待实际解码帧")
-      if snapshot.outputWidth > 0 {
-        outputDescription = "\(snapshot.outputWidth)×\(snapshot.outputHeight) · \(snapshot.outputBitDepth) 位 · 原生显示"
-        let transfer = snapshot.colorTransfer == 16 ? "HDR10 / PQ" : (snapshot.colorTransfer == 18 ? "HLG" : "未标记 PQ / HLG")
-        colorDescription = "\(transfer) · primaries \(snapshot.colorPrimaries) / matrix \(snapshot.colorMatrix)"
-          + " · MDCV \(snapshot.hasMastering == 1 ? "有" : "无") / CLL \(snapshot.hasContentLight == 1 ? "有" : "无")"
-      }
-      switch snapshot.fallbackReason {
-      case 1: fallbackDescription = "当前设备或编码未提供可用硬解，使用软件解码。"
-      case 2: fallbackDescription = "硬解设备初始化失败，已改用软件解码。"
-      case 3: fallbackDescription = "硬解会话不接受当前格式或 Profile，已改用软件解码。"
-      case 4: fallbackDescription = "硬解过程中失败，已从当前位置附近的关键帧重新软件解码。"
-      case 5: fallbackDescription = "本次手动选择软件解码对照。"
-      default: fallbackDescription = nil
-      }
-      rotation = snapshot.rotation.isFinite ? snapshot.rotation : 0
-      if snapshot.status > 0 {
-        let video = String(cString: CinevaFFmpegCodecName(snapshot.videoCodec))
-        let audio = snapshot.audioCodec == 0 ? "无音轨" : String(cString: CinevaFFmpegCodecName(snapshot.audioCodec))
-        mediaDescription = "\(video) · \(snapshot.width)×\(snapshot.height) · 音频 \(audio)"
-        if snapshot.fps.isFinite, snapshot.fps > 0 { frameStep = 1 / min(240, max(1, snapshot.fps)) }
-      }
-      if renderer.anchored { currentTime = max(0, renderer.time) }
-      submittedFrames = renderer.submittedFrames
-      droppedFrames = renderer.droppedFrames
-      renderRecoveries = renderer.recoveryCount
-      renderingDescription = renderer.waitReason
-      if #available(iOS 17.4, *) {
-        displayReadiness = displayLayer.isReadyForDisplay ? "是" : "否"
-      } else {
-        displayReadiness = "当前系统未提供此诊断"
-      }
-      timingDescription = String(format: "时钟 %.3f s · 最近入队 %.3f s", renderer.time, renderer.lastPTS)
-        + (pending.map { String(format: " · 下一帧 %.3f s", $0.1) } ?? " · 下一帧未就绪")
-      if pending != nil || snapshot.frameCount > 0 {
-        pipelineDescription = "已有解码帧 · " + renderer.waitReason
-      } else if snapshot.packetCount > 0 {
-        pipelineDescription = "已有压缩数据 · 等待视频解码输出"
-      } else {
-        pipelineDescription = snapshot.status == 2 ? "解码已结束" : "等待解封装 / 网络数据"
-      }
-    }
+    if now - lastPublishedAt >= 0.25 { publish(snapshot, now: now) }
     // Bounded feeding; native output schedules against its host timebase.
     // Polling never performs network reads, software decoding or pixel copies.
     for _ in 0..<8 {
