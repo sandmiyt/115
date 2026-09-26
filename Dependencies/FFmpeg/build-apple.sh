@@ -34,7 +34,7 @@ build_slice() {
     "$SOURCE/configure" --prefix="$prefix" --target-os=darwin --arch=aarch64 \
       --enable-cross-compile --cc="$compiler" --sysroot="$sdkpath" \
       --extra-cflags="-target $triple -fPIC" \
-      --extra-ldflags="-target $triple" --extra-asflags="-target $triple" \
+      --extra-ldflags="-target $triple" \
       --enable-static --disable-shared --enable-pic --enable-pthreads \
       --disable-autodetect --disable-gpl --disable-nonfree --disable-version3 \
       --disable-programs --disable-doc --disable-debug --disable-encoders \
