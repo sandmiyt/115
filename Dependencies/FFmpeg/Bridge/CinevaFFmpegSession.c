@@ -210,7 +210,8 @@ static void *decodeLoop(void *opaque) {
                 result = decodePacket(s, s->audio, frame, 0, entry, &nextPTS);
             }
             pthread_mutex_lock(&s->mutex);
-            if (entry.serial == atomic_load(&s->generation) && result >= 0) s->snapshot.status = 2;
+            if (entry.serial == atomic_load(&s->generation) && result >= 0 &&
+                !atomic_load(&s->cancelled)) s->snapshot.status = 2;
             pthread_mutex_unlock(&s->mutex);
         } else {
             int isVideo = entry.packet->stream_index == s->videoIndex;
@@ -366,7 +367,8 @@ static void *readLoop(void *opaque) {
         if (wanted != serial) {
             pthread_mutex_lock(&s->mutex);
             target = s->target;
-            clearQueues(s); s->snapshot.status = 1;
+            clearQueues(s);
+            if (!atomic_load(&s->cancelled)) s->snapshot.status = 1;
             pthread_cond_broadcast(&s->changed);
             pthread_mutex_unlock(&s->mutex);
             atomic_store(&s->interruptSeek, 0);

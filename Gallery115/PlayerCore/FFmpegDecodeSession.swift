@@ -185,7 +185,7 @@ final class FFmpegDecodeSession {
         (snapshot.decoderType == 1 ? "FFmpeg 软件解码" : "等待实际解码帧")
       if snapshot.outputWidth > 0 {
         outputDescription = "\(snapshot.outputWidth)×\(snapshot.outputHeight) · \(snapshot.outputBitDepth) 位 · 原生显示"
-        let transfer = snapshot.colorTransfer == 16 ? "HDR10 / PQ" : (snapshot.colorTransfer == 18 ? "HLG" : "SDR / 非 PQ、HLG")
+        let transfer = snapshot.colorTransfer == 16 ? "HDR10 / PQ" : (snapshot.colorTransfer == 18 ? "HLG" : "未标记 PQ / HLG")
         colorDescription = "\(transfer) · primaries \(snapshot.colorPrimaries) / matrix \(snapshot.colorMatrix)"
           + " · MDCV \(snapshot.hasMastering == 1 ? "有" : "无") / CLL \(snapshot.hasContentLight == 1 ? "有" : "无")"
       }
