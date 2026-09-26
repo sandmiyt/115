@@ -37,7 +37,7 @@
 ## 文件清单
 
 - `Dependencies/FFmpeg/Bridge/CinevaFFmpeg.{h,c}`
-- `Dependencies/FFmpeg/build-apple.sh`、`CinevaFFmpeg.podspec`、`COPYING.LGPLv2.1`
+- `Dependencies/FFmpeg/build-apple.sh`、`CinevaFFmpeg.podspec`、`LICENSE.txt`
 - `Gallery115/PlayerCore/FFmpegRuntime.swift`、`PlayerEngine.swift`、`PlayerTypes.swift`
 - `Gallery115/Player/PlayerModel.swift`
 - `Gallery115/Views/PlayerScreen.swift`、`SettingsView.swift`
