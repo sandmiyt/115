@@ -53,7 +53,7 @@ struct FFmpegDecodeValidationView: View {
           Text(session.pipelineDescription)
           Text(session.timingDescription)
           Text("显示入队 \(session.submittedFrames) 帧 / 丢弃迟到帧 \(session.droppedFrames) / 显示恢复 \(session.renderRecoveries) 次")
-          Text("首帧可显示：\(session.displayReady ? "是" : "否") · \(session.renderingDescription)")
+          Text("首帧可显示：\(session.displayReadiness) · \(session.renderingDescription)")
           Text("设备 HDR 播放资格：\(session.hdrDisplayEligible ? "支持" : "未提供")（不等于当前屏幕实测亮度）")
           Text("实际输出：硬解 \(session.hardwareFrames) 帧 / 软解 \(session.softwareFrames) 帧")
           if let reason = session.fallbackDescription { Text(reason).foregroundStyle(.secondary) }

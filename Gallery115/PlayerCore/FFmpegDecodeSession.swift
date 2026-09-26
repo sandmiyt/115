@@ -53,7 +53,7 @@ final class FFmpegDecodeSession {
   private(set) var submittedFrames = 0
   private(set) var droppedFrames = 0
   private(set) var renderRecoveries = 0
-  private(set) var displayReady = false
+  private(set) var displayReadiness = "等待首帧"
   private(set) var timingDescription = "等待时间戳"
 
   var diagnosticText: String {
@@ -63,7 +63,7 @@ final class FFmpegDecodeSession {
       + "\(mediaDescription)\n\(decoderDescription)\n\(outputDescription)\n\(colorDescription)\n"
       + "状态：\(state.title) · \(pipelineDescription)\n\(timingDescription)\n"
       + "解码：\(videoFrames) 帧；显示入队：\(submittedFrames)；丢帧：\(droppedFrames)；显示恢复：\(renderRecoveries)\n"
-      + "队列：\(packetBytes / 1024) KB / \(frameCount) 帧；首帧可显示：\(displayReady)\n"
+      + "队列：\(packetBytes / 1024) KB / \(frameCount) 帧；首帧可显示：\(displayReadiness)\n"
       + (fallbackDescription ?? "")
   }
 
@@ -91,7 +91,7 @@ final class FFmpegDecodeSession {
     submittedFrames = 0
     droppedFrames = 0
     renderRecoveries = 0
-    displayReady = false
+    displayReadiness = "等待首帧"
     serial = 1
     firstFrameSeconds = nil
     lastSeekSeconds = nil
@@ -220,7 +220,11 @@ final class FFmpegDecodeSession {
       droppedFrames = renderer.droppedFrames
       renderRecoveries = renderer.recoveryCount
       renderingDescription = renderer.waitReason
-      displayReady = displayLayer.isReadyForDisplay
+      if #available(iOS 17.4, *) {
+        displayReadiness = displayLayer.isReadyForDisplay ? "是" : "否"
+      } else {
+        displayReadiness = "当前系统未提供此诊断"
+      }
       timingDescription = String(format: "时钟 %.3f s · 最近入队 %.3f s", renderer.time, renderer.lastPTS)
         + (pending.map { String(format: " · 下一帧 %.3f s", $0.1) } ?? " · 下一帧未就绪")
       if pending != nil || snapshot.frameCount > 0 {
