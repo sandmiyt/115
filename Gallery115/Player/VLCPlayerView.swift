@@ -8,7 +8,7 @@ import SwiftUI
 
   @MainActor
   @Observable
-  final class VLCPlaybackController: PlaybackEngineControlling {
+  final class VLCPlaybackController: PlayerEngine {
     private(set) var currentTime: Double = 0
     private(set) var duration: Double = 0
     private(set) var isPlaying = false
@@ -21,6 +21,24 @@ import SwiftUI
     private(set) var errorMessage: String?
     var bufferedUntil: Double { currentTime }
     var bufferedDuration: Double { 0 }
+
+    var playbackState: PlayerState {
+      if configuredSource == nil { return item == nil ? .idle : .stopped }
+      if let errorMessage { return .failed(errorMessage) }
+      if interactiveScrubActive { return .seeking }
+      if didReachEnd { return .ended }
+      if isBuffering { return .buffering }
+      return isPlaying ? .playing : .paused
+    }
+
+    var statistics: PlayerStatistics {
+      // VLCKit 3.7's current adapter does not expose resident range caches,
+      // hardware-decoder identity, HDR metadata, or the AV sync offset.
+      PlayerStatistics(backend: .vlc,
+        networkMbps: sampledBytes > 0 ? networkMbps : nil,
+        downloadedBytes: sampledBytes > 0 ? sampledBytes : nil,
+        renderer: "VLCKit drawable")
+    }
 
     let player = VLCMediaPlayer()
     private var pollTimer: Timer?
@@ -338,7 +356,7 @@ import SwiftUI
 #else
   @MainActor
   @Observable
-  final class VLCPlaybackController: PlaybackEngineControlling {
+  final class VLCPlaybackController: PlayerEngine {
     private(set) var currentTime: Double = 0
     private(set) var duration: Double = 0
     private(set) var isPlaying = false
@@ -351,6 +369,9 @@ import SwiftUI
     private(set) var errorMessage: String?
     var bufferedUntil: Double { currentTime }
     var bufferedDuration: Double { 0 }
+
+    var playbackState: PlayerState { .failed("VLC 内核未安装") }
+    var statistics: PlayerStatistics { PlayerStatistics(backend: .vlc) }
 
     func configure(
       source: VideoSource,

@@ -262,7 +262,11 @@ struct PlayerScreen: View {
         localMetadata: localMetadata,
         networkMbps: activeNetworkMbps,
         bufferedDuration: activeBufferedDuration,
-        playbackEngine: useVLC ? "VLC" : "AVPlayer"
+        playbackEngine: activeStatistics.backend?.rawValue ?? "未开始",
+        statistics: activeStatistics,
+        state: activeState,
+        audioTrackCount: activeTrackSelector?.audioTracks.count,
+        subtitleTrackCount: activeTrackSelector?.subtitleTracks.count
       )
       .presentationDetents([.medium, .large])
       .presentationDragIndicator(.visible)
@@ -974,7 +978,7 @@ struct PlayerScreen: View {
         Text(currentItem.name)
           .font(.subheadline.weight(.semibold))
           .lineLimit(1).truncationMode(.middle)
-        Text(activeIsBuffering ? "正在缓冲" : (activeIsPlaying ? "正在播放" : "已暂停"))
+        Text(activeState.title)
           .font(.caption2).foregroundStyle(.white.opacity(0.65))
       }
       .foregroundStyle(.white)
@@ -1185,16 +1189,16 @@ struct PlayerScreen: View {
   private func playbackHUD(proxy: GeometryProxy) -> some View {
     let landscape = proxy.size.width > proxy.size.height
     let resolution: String = {
-      guard let size = model?.videoDisplaySize, size.width > 0, size.height > 0 else { return "读取中" }
+      guard let size = activeStatistics.videoSize, size.width > 0, size.height > 0 else { return "未提供" }
       return "\(Int(size.width.rounded()))×\(Int(size.height.rounded()))"
     }()
     let networkText = activeNetworkMbps > 0.01 ? String(format: "%.1f Mbps", activeNetworkMbps) : "--"
     let bufferText = activeBufferedDuration > 0 ? "\(formatTime(activeBufferedDuration))" : "--"
     let transferredText = activeTransferredMegabytes > 0.1 ? String(format: "%.1f MB", activeTransferredMegabytes) : "--"
-    let engine = useVLC ? "VLC" : "AVPlayer"
-    let codec = useVLC ? currentItem.fileExtension.uppercased() : (model?.videoCodec ?? "读取中")
-    let hdr = useVLC ? (currentItem.isDiscImage ? "ISO/IMG 原盘" : "VLC 原画") : (model?.hdrFormat ?? "SDR")
-    let fps = (model?.nominalFrameRate ?? 0) > 0.1 ? String(format: "%.3g fps", model?.nominalFrameRate ?? 0) : nil
+    let engine = activeStatistics.backend?.rawValue ?? "未开始"
+    let codec = activeStatistics.codec ?? "编码未提供"
+    let hdr = activeStatistics.hdrFormat ?? "动态范围未提供"
+    let fps = activeStatistics.fps.map { String(format: "%.3g fps", $0) }
 
     return VStack(alignment: .leading, spacing: 5) {
       HStack(spacing: 6) {
@@ -1343,20 +1347,20 @@ struct PlayerScreen: View {
   private func settingsAudioSection(model: PlayerModel) -> some View {
     VStack(alignment: .leading, spacing: 8) {
       settingsSectionTitle("音轨")
-      if model.audioOptions.isEmpty {
+      if (activeTrackSelector?.audioTracks ?? []).isEmpty {
         settingsUnavailableRow("当前视频没有可切换音轨", systemName: "waveform")
       } else {
-        settingsRow(title: "自动", systemName: "waveform", selected: model.selectedAudioOptionID == nil) {
-          model.selectAudio(nil)
+        settingsRow(title: "自动", systemName: "waveform", selected: activeTrackSelector?.selectedAudioOptionID == nil) {
+          activeTrackSelector?.selectAudio(nil)
           keepControlsDuringInteraction()
         }
-        ForEach(model.audioOptions) { option in
+        ForEach((activeTrackSelector?.audioTracks ?? [])) { option in
           settingsRow(
             title: option.title,
             systemName: "waveform",
-            selected: model.selectedAudioOptionID == option.id
+            selected: activeTrackSelector?.selectedAudioOptionID == option.id
           ) {
-            model.selectAudio(option.id)
+            activeTrackSelector?.selectAudio(option.id)
             keepControlsDuringInteraction()
           }
         }
@@ -1371,25 +1375,25 @@ struct PlayerScreen: View {
       settingsRow(
         title: "关闭字幕",
         systemName: "captions.bubble",
-        selected: model.selectedSubtitleOptionID == nil && selectedExternalSubtitleID == nil
+        selected: activeTrackSelector?.selectedSubtitleOptionID == nil && selectedExternalSubtitleID == nil
       ) {
-        model.selectSubtitle(nil)
+        activeTrackSelector?.selectSubtitle(nil)
         selectedExternalSubtitleID = nil
         externalSubtitleCues = []
         subtitleLoadTask?.cancel()
         keepControlsDuringInteraction()
       }
 
-      ForEach(model.subtitleOptions) { option in
+      ForEach((activeTrackSelector?.subtitleTracks ?? [])) { option in
         settingsRow(
           title: option.title,
           systemName: "captions.bubble",
-          selected: selectedExternalSubtitleID == nil && model.selectedSubtitleOptionID == option.id
+          selected: selectedExternalSubtitleID == nil && activeTrackSelector?.selectedSubtitleOptionID == option.id
         ) {
           selectedExternalSubtitleID = nil
           externalSubtitleCues = []
           subtitleLoadTask?.cancel()
-          model.selectSubtitle(option.id)
+          activeTrackSelector?.selectSubtitle(option.id)
           keepControlsDuringInteraction()
         }
       }
@@ -1400,13 +1404,13 @@ struct PlayerScreen: View {
           systemName: "captions.bubble.fill",
           selected: selectedExternalSubtitleID == track.id
         ) {
-          model.selectSubtitle(nil)
+          activeTrackSelector?.selectSubtitle(nil)
           loadExternalSubtitle(track)
           keepControlsDuringInteraction()
         }
       }
 
-      if model.subtitleOptions.isEmpty && externalSubtitleTracks.isEmpty {
+      if (activeTrackSelector?.subtitleTracks ?? []).isEmpty && externalSubtitleTracks.isEmpty {
         settingsUnavailableRow("当前视频没有发现字幕", systemName: "captions.bubble")
       }
     }
@@ -1819,11 +1823,7 @@ struct PlayerScreen: View {
                 scrubValue = startValue
                 isScrubbing = true
                 controlsTask?.cancel()
-                if useVLC {
-                  scrubWasPlaying = vlcController.beginInteractiveScrub()
-                } else {
-                  scrubWasPlaying = model.beginInteractiveScrub()
-                }
+                scrubWasPlaying = activeEngine?.beginInteractiveScrub() ?? false
               } else {
                 startValue = scrubStartValue
               }
@@ -1832,21 +1832,13 @@ struct PlayerScreen: View {
 
               // Cached previews follow the finger; AVPlayer commits a single
               // seek on release instead of restarting its network read here.
-              if useVLC {
-                vlcController.interactiveScrub(to: scrubValue)
-              } else {
-                model.interactiveScrub(to: scrubValue)
-              }
+              activeEngine?.interactiveScrub(to: scrubValue)
             }
             .onEnded { value in
               let startValue = isScrubbing ? scrubStartValue : min(max(activeCurrentTime, 0), duration)
               let delta = Double(value.translation.width / width) * duration
               scrubValue = min(max(startValue + delta, 0), duration)
-              if useVLC {
-                vlcController.endInteractiveScrub(to: scrubValue, resumeAfter: scrubWasPlaying)
-              } else {
-                model.endInteractiveScrub(to: scrubValue, resumeAfter: scrubWasPlaying)
-              }
+              activeEngine?.endInteractiveScrub(to: scrubValue, resumeAfter: scrubWasPlaying)
               scrubWasPlaying = false
               scrubStartValue = scrubValue
               isScrubbing = false
@@ -2166,11 +2158,7 @@ struct PlayerScreen: View {
 
   @MainActor
   private func withActiveEngine(_ action: (any CinevaPlaybackEngine) -> Void) {
-    if useVLC {
-      action(vlcController)
-    } else if let model {
-      action(model)
-    }
+    if let activeEngine { action(activeEngine) }
   }
 
   @MainActor
@@ -2216,13 +2204,7 @@ struct PlayerScreen: View {
 
   @MainActor
   private func replayActivePlayer() {
-    if useVLC {
-      vlcController.replay()
-    } else if let model {
-      Task { @MainActor in
-        await model.replay()
-      }
-    }
+    activeEngine?.replayFromStart()
   }
 
   @MainActor
@@ -2238,55 +2220,36 @@ struct PlayerScreen: View {
     isPlayerMuted = safe <= 0.001
   }
 
-  private var activeCurrentTime: Double {
-    useVLC ? vlcController.currentTime : (model?.currentTime ?? 0)
+  private var activeEngine: (any PlayerEngine)? {
+    if useVLC { return vlcController }
+    return model
   }
 
+  private var activeTrackSelector: (any PlayerTrackSelecting)? {
+    activeEngine as? any PlayerTrackSelecting
+  }
+
+  private var activeState: PlayerState { activeEngine?.playbackState ?? .idle }
+  private var activeStatistics: PlayerStatistics { activeEngine?.statistics ?? PlayerStatistics() }
+  private var activeCurrentTime: Double { activeEngine?.currentTime ?? 0 }
   private var activeDuration: Double {
-    if useVLC, vlcController.duration > 0 { return vlcController.duration }
-    if let duration = model?.duration, duration > 0 { return duration }
+    if let duration = activeEngine?.duration, duration > 0 { return duration }
     return appState.libraryStore.knownDuration(for: currentItem)
   }
-
-  private var activeBufferedUntil: Double {
-    useVLC ? activeCurrentTime : (model?.bufferedUntil ?? 0)
-  }
-
-  private var activeBufferedDuration: Double {
-    useVLC ? 0 : (model?.bufferedDuration ?? 0)
-  }
-
-  private var activeIsPlaying: Bool {
-    useVLC ? vlcController.isPlaying : (model?.isPlaying ?? false)
-  }
-
-  private var activeIsBuffering: Bool {
-    useVLC ? vlcController.isBuffering : (model?.isBuffering ?? false)
-  }
-
+  private var activeBufferedUntil: Double { activeEngine?.bufferedUntil ?? 0 }
+  private var activeBufferedDuration: Double { activeStatistics.bufferedSeconds ?? 0 }
+  private var activeIsPlaying: Bool { activeState == .playing }
+  private var activeIsBuffering: Bool { activeState.needsLoadingIndicator }
   private var wantsPlaybackLoading: Bool {
-    !isScrubbing && (activeIsBuffering || activeIsScrubLoading)
+    !isScrubbing && (activeState.needsLoadingIndicator || activeIsScrubLoading)
   }
-
-  private var activeIsScrubLoading: Bool {
-    useVLC ? vlcController.isInteractiveScrubLoading : (model?.isInteractiveScrubLoading ?? false)
-  }
-
-  private var activeDidReachEnd: Bool {
-    useVLC ? vlcController.didReachEnd : (model?.didReachEnd ?? false)
-  }
-
-  private var activeNetworkMbps: Double {
-    useVLC ? vlcController.networkMbps : (model?.networkMbps ?? 0)
-  }
-
+  private var activeIsScrubLoading: Bool { activeEngine?.isInteractiveScrubLoading ?? false }
+  private var activeDidReachEnd: Bool { activeState == .ended }
+  private var activeNetworkMbps: Double { activeStatistics.networkMbps ?? 0 }
   private var activeTransferredMegabytes: Double {
-    useVLC ? vlcController.transferredMegabytes : (model?.transferredMegabytes ?? 0)
+    activeStatistics.downloadedBytes.map { Double($0) / 1_048_576 } ?? 0
   }
-
-  private var activeVolume: Float {
-    useVLC ? vlcController.volume : (model?.player.volume ?? 1)
-  }
+  private var activeVolume: Float { activeEngine?.volume ?? 1 }
 
   private var activeChapters: [PlayerChapter] {
     if let embedded = model?.chapters, !embedded.isEmpty { return embedded }
@@ -2470,7 +2433,7 @@ struct PlayerScreen: View {
       return preferredTokens.contains { token in normalized == token || normalized.contains(".\(token)") || normalized.contains("-\(token)") || normalized.contains("_\(token)") || normalized.contains(token) }
     }
     if let track = preferred ?? (externalSubtitleTracks.count == 1 ? externalSubtitleTracks.first : nil) {
-      model?.selectSubtitle(nil)
+      activeTrackSelector?.selectSubtitle(nil)
       loadExternalSubtitle(track)
     }
   }
@@ -2935,6 +2898,10 @@ private struct PlayerInfoSheet: View {
   let networkMbps: Double
   let bufferedDuration: Double
   let playbackEngine: String
+  let statistics: PlayerStatistics
+  let state: PlayerState
+  let audioTrackCount: Int?
+  let subtitleTrackCount: Int?
 
   var body: some View {
     NavigationStack {
@@ -2966,16 +2933,16 @@ private struct PlayerInfoSheet: View {
           if !item.fileExtension.isEmpty {
             LabeledContent("格式", value: item.fileExtension.uppercased())
           }
-          if let size = model?.videoDisplaySize, size.width > 0, size.height > 0 {
+          if let size = statistics.videoSize, size.width > 0, size.height > 0 {
             LabeledContent("分辨率", value: "\(Int(size.width.rounded())) × \(Int(size.height.rounded()))")
           }
-          if let codec = model?.videoCodec, !codec.isEmpty {
+          if let codec = statistics.codec, !codec.isEmpty {
             LabeledContent("视频编码", value: codec)
           }
-          if let hdr = model?.hdrFormat, !hdr.isEmpty {
+          if let hdr = statistics.hdrFormat, !hdr.isEmpty {
             LabeledContent("HDR", value: hdr)
           }
-          if let fps = model?.nominalFrameRate, fps > 0.1 {
+          if let fps = statistics.fps, fps > 0.1 {
             LabeledContent("帧率", value: String(format: "%.3g fps", fps))
           }
           if item.isDiscImage {
@@ -2992,10 +2959,10 @@ private struct PlayerInfoSheet: View {
           LabeledContent("画面模式", value: videoLayout.title)
           LabeledContent("播放速度", value: playbackRate == 1 ? "1x" : String(format: "%gx", playbackRate))
           LabeledContent("同目录队列", value: "\(playlistCount) 个视频")
-          LabeledContent("音轨", value: "\(model?.audioOptions.count ?? 0) 个可选")
-          LabeledContent("字幕", value: "\(model?.subtitleOptions.count ?? 0) 个可选")
+          LabeledContent("音轨", value: audioTrackCount.map { "\($0) 个可选" } ?? "当前内核未提供")
+          LabeledContent("字幕", value: subtitleTrackCount.map { "\($0) 个可选" } ?? "当前内核未提供")
           LabeledContent("画中画", value: playbackEngine == "AVPlayer" ? "支持" : "当前内核不支持")
-          if model?.hdrFormat == "Dolby Vision" {
+          if statistics.hdrFormat == "Dolby Vision" {
             LabeledContent(
               "Dolby Vision",
               value: AVPlayer.eligibleForHDRPlayback ? "系统原生 HDR 管线" : "当前显示设备不具备 HDR 播放资格"
@@ -3015,6 +2982,16 @@ private struct PlayerInfoSheet: View {
             "已缓冲",
             value: bufferedDuration > 0 ? formatTime(bufferedDuration) : "--"
           )
+        }
+
+        Section("内核诊断") {
+          LabeledContent("统一状态", value: state.title)
+          LabeledContent("解码方式", value: statistics.decoder ?? "当前内核未提供")
+          LabeledContent("画面输出", value: statistics.renderer ?? "未提供")
+          LabeledContent("驻留缓存字节", value: statistics.cachedBytes.map { String($0) } ?? "未提供")
+          LabeledContent("已读取字节", value: statistics.downloadedBytes.map { String($0) } ?? "未提供")
+          LabeledContent("丢帧数", value: statistics.droppedFrames.map { String($0) } ?? "未提供")
+          LabeledContent("音画时差", value: statistics.avSyncOffset.map { String(format: "%.3f s", $0) } ?? "未提供")
         }
 
         Section("手势") {

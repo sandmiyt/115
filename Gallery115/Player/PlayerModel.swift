@@ -6,53 +6,6 @@ import Observation
 import UIKit
 
 
-struct PlayerChapter: Identifiable, Hashable, Sendable {
-  let id: String
-  let title: String
-  let start: Double
-  let end: Double
-}
-
-struct SubtitleCue: Identifiable, Hashable, Sendable {
-  let id: Int
-  let start: Double
-  let end: Double
-  let text: String
-}
-
-@MainActor
-protocol PlaybackEngineControlling: AnyObject {
-  var currentTime: Double { get }
-  var duration: Double { get }
-  var bufferedUntil: Double { get }
-  var bufferedDuration: Double { get }
-  var isPlaying: Bool { get }
-  var isBuffering: Bool { get }
-  var didReachEnd: Bool { get }
-  var networkMbps: Double { get }
-  var transferredMegabytes: Double { get }
-  var volume: Float { get }
-  func pause()
-  func resume()
-  func togglePlayback()
-  func seek(to seconds: Double)
-  func setPlaybackRate(_ rate: Float)
-  func setVolume(_ value: Float)
-  func replayFromStart()
-}
-
-typealias CinevaPlaybackEngine = PlaybackEngineControlling
-
-@MainActor
-extension PlaybackEngineControlling {
-  func enginePause() { pause() }
-  func engineResume() { resume() }
-  func engineTogglePlayback() { togglePlayback() }
-  func engineSeek(to seconds: Double) { seek(to: seconds) }
-  func engineSetPlaybackRate(_ rate: Float) { setPlaybackRate(rate) }
-  func engineSetVolume(_ value: Float) { setVolume(value) }
-}
-
 enum ExternalSubtitleParser {
   nonisolated static func parse(data: Data, fileExtension: String) -> [SubtitleCue] {
     guard let text = decodeText(data) else { return [] }
@@ -142,7 +95,7 @@ struct PlayerMediaOption: Identifiable {
 
 @MainActor
 @Observable
-final class PlayerModel: PlaybackEngineControlling {
+final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
   private(set) var sources: [VideoSource] = []
   private(set) var selectedSource: VideoSource?
   private(set) var isPreparing = false
@@ -169,6 +122,43 @@ final class PlayerModel: PlaybackEngineControlling {
   private(set) var hdrFormat = "SDR"
   private(set) var nominalFrameRate: Float = 0
   private(set) var chapters: [PlayerChapter] = []
+
+  // Phase 1 translates existing backend state without changing its buffering policy.
+  // The future FFmpeg backend must publish its own event-driven state here.
+  var playbackState: PlayerState {
+    if let errorMessage { return .failed(errorMessage) }
+    if requiresVLC { return .stopped }
+    if isPreparing { return .preparing }
+    if interactiveScrubActive || scrubSeekInProgress { return .seeking }
+    if didReachEnd { return .ended }
+    if selectedSource == nil { return .idle }
+    if isBuffering { return .buffering }
+    return isPlaying ? .playing : .paused
+  }
+
+  var statistics: PlayerStatistics {
+    PlayerStatistics(
+      backend: .apple,
+      codec: videoCodec == "读取中" ? nil : videoCodec,
+      videoSize: videoDisplaySize,
+      fps: nominalFrameRate > 0 ? Double(nominalFrameRate) : nil,
+      hdrFormat: videoCodec == "读取中" ? nil : hdrFormat,
+      networkMbps: lastTransferredBytes > 0 ? networkMbps : nil,
+      downloadedBytes: lastTransferredBytes > 0 ? lastTransferredBytes : nil,
+      bufferedSeconds: selectedSource == nil ? nil : bufferedDuration,
+      renderer: "AVPlayerLayer"
+    )
+  }
+
+  var audioTracks: [PlayerTrack] {
+    audioOptions.map { PlayerTrack(id: $0.id, title: $0.title, kind: .audio,
+      language: $0.option.extendedLanguageTag) }
+  }
+
+  var subtitleTracks: [PlayerTrack] {
+    subtitleOptions.map { PlayerTrack(id: $0.id, title: $0.title, kind: .subtitle,
+      language: $0.option.extendedLanguageTag) }
+  }
 
   var errorMessage: String?
   var didFallbackFromOriginal = false
