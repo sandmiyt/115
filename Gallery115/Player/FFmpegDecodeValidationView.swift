@@ -67,7 +67,7 @@ struct FFmpegDecodeValidationView: View {
           Text("设备 HDR 播放资格：\(session.hdrDisplayEligible ? "支持" : "未提供")（不等于当前屏幕实测亮度）")
           Text("实际输出：硬解 \(session.hardwareFrames) 帧 / 软解 \(session.softwareFrames) 帧")
           if let reason = session.fallbackDescription { Text(reason).foregroundStyle(.secondary) }
-          Text("实际解码：视频 \(session.videoFrames) 帧 / 音频 \(session.audioFrames) 帧")
+          Text("目标位置后输出：视频 \(session.videoFrames) 帧 / 音频解码 \(session.audioFrames) 帧")
           Text("队列：\(session.packetBytes / 1024) KB 压缩数据 / \(session.frameCount) 待显示帧")
           if let latency = session.firstFrameSeconds { Text(String(format: "首帧入显示队列：%.2f 秒", latency)) }
           if let latency = session.lastSeekSeconds { Text(String(format: "最近定位至首帧入队：%.2f 秒", latency)) }

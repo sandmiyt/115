@@ -70,7 +70,7 @@ final class FFmpegDecodeSession {
     return "Cineva \(version) (\(build)) · FFmpeg 无声验证\n"
       + "\(mediaDescription)\n\(decoderDescription)\n\(outputDescription)\n\(colorDescription)\n"
       + "状态：\(state.title) · \(pipelineDescription)\n\(timingDescription)\n"
-      + "解码：\(videoFrames) 帧；显示入队：\(submittedFrames)；丢帧：\(droppedFrames)；显示恢复：\(renderRecoveries)\n"
+      + "目标位置后输出：\(videoFrames) 帧；显示入队：\(submittedFrames)；丢帧：\(droppedFrames)；显示恢复：\(renderRecoveries)\n"
       + "队列：\(packetBytes / 1024) KB / \(frameCount) 帧；首帧可显示：\(displayReadiness)\n"
       + "\(containerDescription)\n\(nativeStageDescription)\n\(recoveryDescription)\n"
       + "解码器输出：\(decodedVideoFrames) 帧；目标前预滚：\(prerollFrames) 帧\n"
@@ -276,6 +276,7 @@ final class FFmpegDecodeSession {
       let detail = errorText(snapshot.errorCode)
       let code = snapshot.errorCode
       let av1SoftwareUnavailable = snapshot.fallbackReason > 0 &&
+        (snapshot.failureStage == 4 || snapshot.failureStage == 8) &&
         String(cString: CinevaFFmpegCodecName(snapshot.videoCodec)) == "av1"
       stop()
       state = .failed(av1SoftwareUnavailable
