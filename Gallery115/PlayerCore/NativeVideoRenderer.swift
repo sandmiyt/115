@@ -91,7 +91,10 @@ final class NativeVideoRenderer {
         droppedFrames += 1
         return .dropped
       }
-      if pts > time + 0.15 { blockedSince = nil; waitReason = "按时间戳等待显示"; return .waiting }
+      // Bound retained 4K / 10-bit surfaces by frame count as well as seconds.
+      if pts > time + min(0.15, 3 * duration) {
+        blockedSince = nil; waitReason = "按时间戳等待显示"; return .waiting
+      }
     }
     guard output.isReadyForMoreMediaData else {
       waitReason = "等待原生显示层"

@@ -7,7 +7,7 @@
 沿用现有 VideoSource → FFmpeg 8.0.2 HTTP / demux → 有界队列 → VideoToolbox / 软件解码 → CVPixelBuffer，新增独立 `NativeVideoRenderer` → `AVSampleBufferVideoRenderer` / `AVSampleBufferDisplayLayer`。本阶段选择需求允许的 Apple Native 路线；没有新增 Metal shader，也没有通过 AVPlayer 播放此验证入口。
 
 - 硬解 CVPixelBuffer 直接交给原生输出，不转换 UIImage/CGImage，不做应用侧 RGB 拷贝。NV12/P010、色彩附件、HDR10/HLG 标记仍保留；HDR 屏幕亮度/色准未在 Windows 上验证。
-- 渲染器拥有 host-clock timebase。CADisplayLink 仅有限预送帧（每次最多 8 帧、最多提前 150 ms），显示由原生时间戳调度。后续音频主时钟在第 6 阶段实现。
+- 渲染器拥有 host-clock timebase。CADisplayLink 仅有限预送帧（每次最多 8 帧、最多提前 3 个标称帧时长且不超过 150 ms），限制 4K/10 位显示表面占用，显示由原生时间戳调度。后续音频主时钟在第 6 阶段实现。
 - 缓冲恢复先恢复时钟，再检查显示层 readiness，避免暂停时钟与显示队列互等。持续阻塞超过 1.5 秒且不属于正常预送时，flush 并重新锚定；每次会话最多恢复两次，失败给出错误而不是无限重试。
 - 首帧、seek 首帧和恢复首帧设置 DisplayImmediately；普通连续帧仍按 PTS 显示。seek 清除旧图像和代次，缓冲保留现有画面。
 - 采样带明确帧时长；格式描述仅在匹配像素缓冲格式及附件时复用，改变时重新生成；重复/倒退及严重迟到帧丢弃并计数。
