@@ -586,7 +586,7 @@ private struct FFmpegIntegrationInfoView: View {
         LabeledContent("实际库版本", value: info.version)
         LabeledContent("内存对象检查", value: info.allocationCheckPassed ? "通过" : "失败")
         LabeledContent("许可", value: info.license)
-        Text("当前为第 2 阶段依赖接入，实际播放仍使用 AVPlayer / VLC。以下列表表示编译进库的能力，不代表设备已验证硬解。")
+        Text("当前第 3 阶段已接入软件解封装与解码验证，可在播放详情中打开无声验证入口。日常播放仍使用 AVPlayer / VLC。以下列表表示编译进库的能力，不代表设备已验证硬解。")
           .font(.caption).foregroundStyle(.secondary)
       }
       Section("已编译解码器") { Text(info.decoders.joined(separator: ", ")).textSelection(.enabled) }

@@ -1,8 +1,8 @@
 import Foundation
 import CinevaFFmpeg
 
-/// Phase 2 dependency validation. This is not a playback engine or a metadata-
-/// only substitute for one: demux/decode playback starts in the next phase.
+/// Dependency capabilities only. Actual Phase 3 demux/decode is implemented in
+/// FFmpegDecodeSession, independently of AVPlayer and VLC.
 enum FFmpegRuntime {
   struct BuildInfo {
     let version: String

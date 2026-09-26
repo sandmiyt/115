@@ -29,6 +29,7 @@ struct PlayerScreen: View {
   @State private var didLoadPreferredRate = false
   @State private var localMetadata: LocalMediaMetadata?
   @State private var showInfo = false
+  @State private var isValidatingFFmpeg = false
   @State private var videoLayout: PlayerVideoLayout = .fit
   @State private var playbackRate: Float = 1.0
   @State private var isLocked = false
@@ -266,7 +267,13 @@ struct PlayerScreen: View {
         statistics: activeStatistics,
         state: activeState,
         audioTrackCount: activeTrackSelector?.audioTracks.count,
-        subtitleTrackCount: activeTrackSelector?.subtitleTracks.count
+        subtitleTrackCount: activeTrackSelector?.subtitleTracks.count,
+        beginDecodeValidation: {
+          model?.pause()
+          vlcController.pause()
+          isValidatingFFmpeg = true
+        },
+        endDecodeValidation: { isValidatingFFmpeg = false }
       )
       .presentationDetents([.medium, .large])
       .presentationDragIndicator(.visible)
@@ -2221,6 +2228,7 @@ struct PlayerScreen: View {
   }
 
   private var activeEngine: (any PlayerEngine)? {
+    if isValidatingFFmpeg { return nil }
     if useVLC { return vlcController }
     return model
   }
@@ -2903,6 +2911,8 @@ private struct PlayerInfoSheet: View {
   let state: PlayerState
   let audioTrackCount: Int?
   let subtitleTrackCount: Int?
+  let beginDecodeValidation: () -> Void
+  let endDecodeValidation: () -> Void
 
   var body: some View {
     NavigationStack {
@@ -2986,6 +2996,13 @@ private struct PlayerInfoSheet: View {
         }
 
         Section("内核诊断") {
+          if let source = model?.selectedSource {
+            NavigationLink("FFmpeg 解码验证（无声）") {
+              FFmpegDecodeValidationView(source: source, startTime: model?.currentTime ?? 0)
+                .onAppear(perform: beginDecodeValidation)
+                .onDisappear(perform: endDecodeValidation)
+            }
+          }
           LabeledContent("统一状态", value: state.title)
           LabeledContent("解码方式", value: statistics.decoder ?? "当前内核未提供")
           LabeledContent("画面输出", value: statistics.renderer ?? "未提供")

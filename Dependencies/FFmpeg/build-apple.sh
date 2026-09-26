@@ -63,9 +63,16 @@ _CinevaFFmpegHasDecoder
 _CinevaFFmpegHasDemuxer
 _CinevaFFmpegHasVideoToolbox
 _CinevaFFmpegRuntimeCheck
+_CinevaFFmpegSessionCreate
+_CinevaFFmpegSessionCancel
+_CinevaFFmpegSessionDestroy
+_CinevaFFmpegSessionSeek
+_CinevaFFmpegSessionSnapshot
+_CinevaFFmpegSessionCopyFrame
+_CinevaFFmpegCodecName
 EXPORTS
   "$compiler" -target "$triple" -isysroot "$sdkpath" -dynamiclib \
-    -I "$prefix/include" -I "$ROOT/Bridge" "$ROOT/Bridge/CinevaFFmpeg.c" \
+    -std=c11 -O2 -I "$prefix/include" -I "$ROOT/Bridge" "$ROOT"/Bridge/*.c \
     "${libs[@]}" -Wl,-exported_symbols_list,"$build/exports.txt" \
     -Wl,-install_name,@rpath/CinevaFFmpeg.framework/CinevaFFmpeg \
     -Wl,-compatibility_version,8.0 -Wl,-current_version,8.0.2 \
