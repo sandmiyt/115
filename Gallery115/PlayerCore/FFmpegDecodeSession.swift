@@ -23,7 +23,7 @@ private final class DecodeDisplayLinkTarget: NSObject {
   @objc func tick() { session?.pump() }
 }
 
-/// Phase 4 validation transport. Intentionally not a full PlayerEngine: audio,
+/// Phase 5 validation transport. Intentionally not a full PlayerEngine: audio,
 /// rate stretching, track selection and PiP are not implemented by this path.
 @MainActor @Observable
 final class FFmpegDecodeSession {
@@ -46,34 +46,53 @@ final class FFmpegDecodeSession {
   private(set) var hardwareFrames: Int64 = 0
   private(set) var softwareFrames: Int64 = 0
   let hdrDisplayEligible = AVPlayer.eligibleForHDRPlayback
-  let displayLayer = AVSampleBufferDisplayLayer()
+  let renderer = NativeVideoRenderer()
+  var displayLayer: AVSampleBufferDisplayLayer { renderer.layer }
+  private(set) var renderingDescription = "等待首帧"
+  private(set) var pipelineDescription = "正在打开媒体"
+  private(set) var submittedFrames = 0
+  private(set) var droppedFrames = 0
+  private(set) var renderRecoveries = 0
+  private(set) var displayReady = false
+  private(set) var timingDescription = "等待时间戳"
+
+  var diagnosticText: String {
+    let version = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "unknown"
+    let build = (Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String) ?? "unknown"
+    return "Cineva \(version) (\(build)) · FFmpeg 无声验证\n"
+      + "\(mediaDescription)\n\(decoderDescription)\n\(outputDescription)\n\(colorDescription)\n"
+      + "状态：\(state.title) · \(pipelineDescription)\n\(timingDescription)\n"
+      + "解码：\(videoFrames) 帧；显示入队：\(submittedFrames)；丢帧：\(droppedFrames)；显示恢复：\(renderRecoveries)\n"
+      + "队列：\(packetBytes / 1024) KB / \(frameCount) 帧；首帧可显示：\(displayReady)\n"
+      + (fallbackDescription ?? "")
+  }
 
   @ObservationIgnored private var handle: FFmpegSessionHandle?
   @ObservationIgnored private var displayLink: CADisplayLink?
-  @ObservationIgnored private var timebase: CMTimebase?
   @ObservationIgnored private var pending: (CVPixelBuffer, Double, Int32)?
   @ObservationIgnored private var serial: Int32 = 1
-  @ObservationIgnored private var anchored = false
-  @ObservationIgnored private var lastEnqueuedPTS = -1.0
   @ObservationIgnored private var startedAt = 0.0
   @ObservationIgnored private var seekStartedAt: Double?
   @ObservationIgnored private var lastPublishedAt = 0.0
   @ObservationIgnored private var frameStep = 1.0 / 30.0
 
-  init() {
-    displayLayer.videoGravity = .resizeAspect
-    displayLayer.backgroundColor = UIColor.black.cgColor
-    CMTimebaseCreateWithSourceClock(allocator: kCFAllocatorDefault,
-      sourceClock: CMClockGetHostTimeClock(), timebaseOut: &timebase)
-    displayLayer.controlTimebase = timebase
-    if let timebase { CMTimebaseSetRate(timebase, rate: 0) }
-  }
-
   func start(source: VideoSource, at seconds: Double, preferHardware: Bool = true) {
     guard handle == nil else { return }
-    anchored = false
+    let start = seconds.isFinite ? max(0, seconds) : 0
+    renderer.reset(to: start, newSession: true)
+    pending = nil
+    frameStep = 1.0 / 30.0
+    lastPublishedAt = 0
+    duration = 0
+    videoFrames = 0
+    audioFrames = 0
+    packetBytes = 0
+    frameCount = 0
+    submittedFrames = 0
+    droppedFrames = 0
+    renderRecoveries = 0
+    displayReady = false
     serial = 1
-    lastEnqueuedPTS = -1
     firstFrameSeconds = nil
     lastSeekSeconds = nil
     seekStartedAt = nil
@@ -85,7 +104,7 @@ final class FFmpegDecodeSession {
     hardwareFrames = 0
     softwareFrames = 0
     guard let scheme = source.url.scheme?.lowercased(), ["https", "http"].contains(scheme),
-      let timebase else { state = .failed("验证入口仅支持 HTTP/HTTPS 视频地址。"); return }
+      renderer.available else { state = .failed("验证入口仅支持 HTTP/HTTPS 视频地址。"); return }
     // Prevent header injection. Headers come from the existing provider, not UI.
     let validHeaders = source.headers.allSatisfy { key, value in
       !key.isEmpty && !key.contains(":") && !key.contains(where: { $0.isNewline }) &&
@@ -95,13 +114,12 @@ final class FFmpegDecodeSession {
     let headers = source.headers.sorted { $0.key < $1.key }
       .map { "\($0.key): \($0.value)\r\n" }.joined()
     let pointer = source.url.absoluteString.withCString { url in
-      headers.withCString { CinevaFFmpegSessionCreate(url, $0, seconds, preferHardware ? 1 : 0) }
+      headers.withCString { CinevaFFmpegSessionCreate(url, $0, start, preferHardware ? 1 : 0) }
     }
     guard let pointer else { state = .failed("无法创建 FFmpeg 解码会话。"); return }
     handle = FFmpegSessionHandle(pointer)
     state = .preparing
-    currentTime = max(0, seconds)
-    CMTimebaseSetTime(timebase, time: CMTime(seconds: currentTime, preferredTimescale: 60000))
+    currentTime = start
     startedAt = CACurrentMediaTime()
     let target = DecodeDisplayLinkTarget()
     target.session = self
@@ -114,9 +132,8 @@ final class FFmpegDecodeSession {
   func stop() {
     displayLink?.invalidate()
     displayLink = nil
-    if let timebase { CMTimebaseSetRate(timebase, rate: 0) }
     pending = nil
-    displayLayer.flushAndRemoveImage()
+    renderer.reset(to: currentTime)
     handle = nil
     state = .stopped
   }
@@ -124,8 +141,8 @@ final class FFmpegDecodeSession {
   func toggle() {
     if state == .ended { wantsPlayback = true; seek(to: 0); return }
     wantsPlayback.toggle()
-    if let timebase { CMTimebaseSetRate(timebase, rate: wantsPlayback && anchored ? 1 : 0) }
-    if anchored { state = wantsPlayback ? .playing : .paused }
+    renderer.setPlaying(wantsPlayback)
+    if renderer.anchored { state = wantsPlayback ? (renderer.waitingForData ? .buffering : .playing) : .paused }
   }
 
   func seek(to seconds: Double) {
@@ -133,20 +150,14 @@ final class FFmpegDecodeSession {
     let target = min(max(0, seconds), max(0, duration - 0.1))
     serial = CinevaFFmpegSessionSeek(handle.pointer, target)
     pending = nil
-    anchored = false
-    lastEnqueuedPTS = -1
     currentTime = target
     seekStartedAt = CACurrentMediaTime()
-    if let timebase {
-      CMTimebaseSetRate(timebase, rate: 0)
-      CMTimebaseSetTime(timebase, time: CMTime(seconds: target, preferredTimescale: 60000))
-    }
-    displayLayer.flushAndRemoveImage()
+    renderer.reset(to: target)
     state = .seeking
   }
 
   fileprivate func pump() {
-    guard let handle, let timebase else { return }
+    guard let handle else { return }
     var snapshot = CinevaFFmpegSnapshot()
     CinevaFFmpegSessionSnapshot(handle.pointer, &snapshot)
     if snapshot.status < 0 {
@@ -166,15 +177,11 @@ final class FFmpegDecodeSession {
     if snapshot.serial != serial {
       serial = snapshot.serial
       pending = nil
-      anchored = false
-      lastEnqueuedPTS = -1
       currentTime = snapshot.recoveryTarget
-      CMTimebaseSetRate(timebase, rate: 0)
-      CMTimebaseSetTime(timebase, time: CMTime(seconds: currentTime, preferredTimescale: 60000))
-      displayLayer.flushAndRemoveImage()
+      renderer.reset(to: currentTime)
       state = .seeking
     }
-    if anchored { CinevaFFmpegSessionSetPosition(handle.pointer, CMTimebaseGetTime(timebase).seconds) }
+    if renderer.anchored { CinevaFFmpegSessionSetPosition(handle.pointer, renderer.time) }
     let now = CACurrentMediaTime()
     if now - lastPublishedAt >= 0.25 {
       lastPublishedAt = now
@@ -206,16 +213,27 @@ final class FFmpegDecodeSession {
         let video = String(cString: CinevaFFmpegCodecName(snapshot.videoCodec))
         let audio = snapshot.audioCodec == 0 ? "无音轨" : String(cString: CinevaFFmpegCodecName(snapshot.audioCodec))
         mediaDescription = "\(video) · \(snapshot.width)×\(snapshot.height) · 音频 \(audio)"
-        if snapshot.fps.isFinite, snapshot.fps > 0 { frameStep = 1 / snapshot.fps }
+        if snapshot.fps.isFinite, snapshot.fps > 0 { frameStep = 1 / min(240, max(1, snapshot.fps)) }
       }
-      if anchored { currentTime = max(0, CMTimebaseGetTime(timebase).seconds) }
+      if renderer.anchored { currentTime = max(0, renderer.time) }
+      submittedFrames = renderer.submittedFrames
+      droppedFrames = renderer.droppedFrames
+      renderRecoveries = renderer.recoveryCount
+      renderingDescription = renderer.waitReason
+      displayReady = displayLayer.isReadyForDisplay
+      timingDescription = String(format: "时钟 %.3f s · 最近入队 %.3f s", renderer.time, renderer.lastPTS)
+        + (pending.map { String(format: " · 下一帧 %.3f s", $0.1) } ?? " · 下一帧未就绪")
+      if pending != nil || snapshot.frameCount > 0 {
+        pipelineDescription = "已有解码帧 · " + renderer.waitReason
+      } else if snapshot.packetCount > 0 {
+        pipelineDescription = "已有压缩数据 · 等待视频解码输出"
+      } else {
+        pipelineDescription = snapshot.status == 2 ? "解码已结束" : "等待解封装 / 网络数据"
+      }
     }
-    if displayLayer.status == .failed {
-      stop(); state = .failed("原生画面输出失败，请返回原播放器。"); return
-    }
-    // The native layer schedules PTS against a host-clock timebase. DisplayLink
-    // only feeds a bounded look-ahead; it does not synthesize frame timestamps.
-    for _ in 0..<4 {
+    // Bounded feeding; native output schedules against its host timebase.
+    // Polling never performs network reads, software decoding or pixel copies.
+    for _ in 0..<8 {
       if pending == nil {
         var pts = 0.0
         var frameSerial: Int32 = 0
@@ -225,48 +243,41 @@ final class FFmpegDecodeSession {
       }
       guard let (pixel, pts, frameSerial) = pending else { break }
       guard frameSerial == serial else { pending = nil; continue }
-      let clock = CMTimebaseGetTime(timebase).seconds
-      if anchored && (!wantsPlayback || (state != .buffering && pts > clock + min(0.12, 2 * frameStep))) { break }
-      guard displayLayer.isReadyForMoreMediaData else { break }
-      var format: CMVideoFormatDescription?
-      guard CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault,
-        imageBuffer: pixel, formatDescriptionOut: &format) == noErr, let format else {
-        stop(); state = .failed("无法建立视频帧格式。"); return
-      }
-      var timing = CMSampleTimingInfo(duration: .invalid,
-        presentationTimeStamp: CMTime(seconds: pts, preferredTimescale: 60000), decodeTimeStamp: .invalid)
-      var sample: CMSampleBuffer?
-      guard CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault,
-        imageBuffer: pixel, formatDescription: format, sampleTiming: &timing,
-        sampleBufferOut: &sample) == noErr, let sample else {
-        stop(); state = .failed("无法建立显示采样。"); return
-      }
-      if !anchored || state == .buffering {
-        CMTimebaseSetTime(timebase, time: timing.presentationTimeStamp)
-        CMTimebaseSetRate(timebase, rate: wantsPlayback ? 1 : 0)
-        anchored = true
+      let result = renderer.submit(pixel, pts: pts, duration: frameStep, playing: wantsPlayback, now: now)
+      switch result {
+      case .accepted:
+        pending = nil
         state = wantsPlayback ? .playing : .paused
+        if firstFrameSeconds == nil { firstFrameSeconds = now - startedAt }
+        if let seekStartedAt {
+          lastSeekSeconds = now - seekStartedAt
+          self.seekStartedAt = nil
+        }
+      case .dropped:
+        pending = nil
+      case .failed(let message):
+        stop(); state = .failed(message); return
+      case .waiting:
+        break
       }
-      displayLayer.enqueue(sample)
-      pending = nil
-      lastEnqueuedPTS = pts
-      if firstFrameSeconds == nil { firstFrameSeconds = now - startedAt }
-      if let seekStartedAt {
-        lastSeekSeconds = now - seekStartedAt
-        self.seekStartedAt = nil
-      }
+      if case .waiting = result { break }
     }
-    if anchored && wantsPlayback {
-      let clock = CMTimebaseGetTime(timebase).seconds
-      if clock > lastEnqueuedPTS + max(0.08, frameStep), pending == nil, snapshot.frameCount == 0 {
-        CMTimebaseSetRate(timebase, rate: 0)
+    // The worker changes queues concurrently. Never decide starvation/EOF from
+    // the snapshot taken before consuming frames at the beginning of this tick.
+    CinevaFFmpegSessionSnapshot(handle.pointer, &snapshot)
+    guard snapshot.serial == serial, snapshot.status >= 0 else { return }
+    if renderer.anchored && wantsPlayback && !renderer.waitingForData {
+      if renderer.time > renderer.lastEnd + 0.15, pending == nil, snapshot.frameCount == 0 {
+        renderer.suspendForData()
         state = snapshot.status == 2 ? .ended : .buffering
         if state == .ended { wantsPlayback = false }
       }
     }
-    if !anchored, snapshot.status == 2, snapshot.frameCount == 0, pending == nil {
+    if (!renderer.anchored || renderer.waitingForData), snapshot.status == 2,
+      snapshot.frameCount == 0, pending == nil {
       state = .ended
       wantsPlayback = false
+      renderer.setPlaying(false)
     }
   }
 }

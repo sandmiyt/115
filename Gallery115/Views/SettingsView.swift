@@ -586,7 +586,7 @@ private struct FFmpegIntegrationInfoView: View {
         LabeledContent("实际库版本", value: info.version)
         LabeledContent("内存对象检查", value: info.allocationCheckPassed ? "通过" : "失败")
         LabeledContent("许可", value: info.license)
-        Text("当前第 4 阶段已接入 VideoToolbox 硬解、软件回退及 HDR10/HLG 像素输出，可在播放详情中打开无声验证入口。日常播放仍使用 AVPlayer / VLC。以下列表表示编译进库的能力，不代表设备已验证硬解。")
+        Text("当前第 5 阶段已接入独立原生渲染、显示阻塞恢复及 HDR10/HLG 像素输出，可在播放详情中打开无声验证入口。日常播放仍使用 AVPlayer / VLC。以下列表表示编译进库的能力，不代表设备已验证硬解。")
           .font(.caption).foregroundStyle(.secondary)
       }
       Section("已编译解码器") { Text(info.decoders.joined(separator: ", ")).textSelection(.enabled) }

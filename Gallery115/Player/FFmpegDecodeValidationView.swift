@@ -1,7 +1,7 @@
 import SwiftUI
 import UIKit
 
-/// Explicit Phase 4 acceptance surface. Never selected as the normal backend.
+/// Explicit Phase 5 acceptance surface. Never selected as the normal backend.
 struct FFmpegDecodeValidationView: View {
   @Environment(\.dismiss) private var dismiss
   @Environment(\.scenePhase) private var scenePhase
@@ -11,6 +11,7 @@ struct FFmpegDecodeValidationView: View {
   @State private var slider = 0.0
   @State private var dragging = false
   @State private var preferHardware = true
+  @State private var copiedDiagnostics = false
 
   var body: some View {
     ScrollView {
@@ -20,7 +21,7 @@ struct FFmpegDecodeValidationView: View {
           .frame(height: 230)
           .background(.black)
           .clipped()
-        Text("硬解与 HDR 验证 · 暂不输出声音")
+        Text("原生渲染验证 · 暂不输出声音")
           .font(.headline)
         Text(session.mediaDescription).font(.caption).foregroundStyle(.secondary)
         Text(session.decoderDescription).font(.subheadline.weight(.medium))
@@ -48,6 +49,11 @@ struct FFmpegDecodeValidationView: View {
         VStack(alignment: .leading, spacing: 6) {
           Text(session.outputDescription)
           Text(session.colorDescription)
+          Text("渲染器：Apple Native · NV12 / P010")
+          Text(session.pipelineDescription)
+          Text(session.timingDescription)
+          Text("显示入队 \(session.submittedFrames) 帧 / 丢弃迟到帧 \(session.droppedFrames) / 显示恢复 \(session.renderRecoveries) 次")
+          Text("首帧可显示：\(session.displayReady ? "是" : "否") · \(session.renderingDescription)")
           Text("设备 HDR 播放资格：\(session.hdrDisplayEligible ? "支持" : "未提供")（不等于当前屏幕实测亮度）")
           Text("实际输出：硬解 \(session.hardwareFrames) 帧 / 软解 \(session.softwareFrames) 帧")
           if let reason = session.fallbackDescription { Text(reason).foregroundStyle(.secondary) }
@@ -58,6 +64,10 @@ struct FFmpegDecodeValidationView: View {
           Text("硬解保持原分辨率和像素缓冲，HDR10 / HLG 保留 10 位及色彩标记；软件对照最高 720p，保留 HDR 位深。音频仍仅解码计数。Dolby Vision、字幕、音画同步及画中画尚未接入此入口。")
             .foregroundStyle(.secondary)
         }.font(.caption).frame(maxWidth: .infinity, alignment: .leading)
+        Button(copiedDiagnostics ? "播放诊断已复制" : "复制播放诊断") {
+          UIPasteboard.general.string = session.diagnosticText
+          copiedDiagnostics = true
+        }.font(.caption)
         Spacer(minLength: 0)
       }
       .padding()
