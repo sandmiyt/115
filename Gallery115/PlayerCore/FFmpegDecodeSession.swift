@@ -61,6 +61,10 @@ final class FFmpegDecodeSession {
   private(set) var decodedVideoFrames: Int64 = 0
   private(set) var prerollFrames: Int64 = 0
   private(set) var audioWarning: String?
+  private(set) var ioDescription = "等待读取统计"
+  private(set) var ioTimingDescription = "等待读取耗时"
+  private(set) var ioJumpDescription = "等待包位置统计"
+  private(set) var compressedVideoSeconds = 0.0
 
   var diagnosticText: String {
     let version = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "unknown"
@@ -73,6 +77,8 @@ final class FFmpegDecodeSession {
       + "目标位置后输出：\(videoFrames) 帧；显示入队：\(submittedFrames)；丢帧：\(droppedFrames)；显示恢复：\(renderRecoveries)\n"
       + "队列：\(packetBytes / 1024) KB / \(frameCount) 帧；首帧可显示：\(displayReadiness)\n"
       + "\(containerDescription)\n\(nativeStageDescription)\n\(recoveryDescription)\n"
+      + "\(ioDescription)\n\(ioTimingDescription)\n\(ioJumpDescription)\n"
+      + String(format: "压缩视频队列：%.2f s（尚未解码）\n", compressedVideoSeconds)
       + "解码器输出：\(decodedVideoFrames) 帧；目标前预滚：\(prerollFrames) 帧\n"
       + "\(failure)\n" + (audioWarning ?? "") + "\n" + (fallbackDescription ?? "")
   }
@@ -107,6 +113,10 @@ final class FFmpegDecodeSession {
     decodedVideoFrames = 0
     prerollFrames = 0
     audioWarning = nil
+    ioDescription = "等待读取统计"
+    ioTimingDescription = "等待读取耗时"
+    ioJumpDescription = "等待包位置统计"
+    compressedVideoSeconds = 0
     submittedFrames = 0
     droppedFrames = 0
     renderRecoveries = 0
@@ -256,6 +266,14 @@ final class FFmpegDecodeSession {
     recoveryDescription = "扩展探测 \(snapshot.probeRetried) 次 · 关键帧定位回退 \(snapshot.seekFallbacks) 次"
     decodedVideoFrames = snapshot.decodedVideoFrames
     prerollFrames = snapshot.prerollFrames
+    compressedVideoSeconds = snapshot.queuedSeconds
+    ioDescription = String(format: "AVIO 累计读入 %.2f MiB · 文件位置 %.2f MiB",
+      Double(snapshot.ioBytesRead) / 1048576, Double(snapshot.ioPosition) / 1048576)
+    ioTimingDescription = String(format: "当前 I/O %.2f s · 最近取包 %.3f s",
+      snapshot.activeIOSeconds, snapshot.lastReadSeconds)
+      + (snapshot.lastPacketAge < 0 ? " · 尚未取得媒体包" :
+        String(format: " · 距上次包 %.2f s", snapshot.lastPacketAge))
+    ioJumpDescription = "包位置回退 \(snapshot.backwardPacketJumps) 次 · 前跳超过 1 MiB \(snapshot.largeForwardPacketJumps) 次（不是 HTTP 请求数）"
     audioWarning = snapshot.audioWarningCode == 0 ? nil :
       "音轨验证已跳过：\(errorText(snapshot.audioWarningCode))（\(snapshot.audioWarningCode)）；无声视频验证继续。"
     let container = withUnsafeBytes(of: snapshot.container) { bytes in

@@ -41,6 +41,9 @@ typedef struct {
     int64_t decodedVideoFrames, prerollFrames;
     int videoProfile, videoStreamIndex;
     char container[48];
+    int64_t ioBytesRead, ioPosition, lastPacketPosition;
+    int backwardPacketJumps, largeForwardPacketJumps;
+    double activeIOSeconds, lastReadSeconds, lastPacketAge;
 } CinevaFFmpegSnapshot;
 enum {
     CinevaStageOpen = 1, CinevaStageProbe, CinevaStageSelectVideo,

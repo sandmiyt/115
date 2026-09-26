@@ -59,6 +59,10 @@ struct FFmpegDecodeValidationView: View {
           Text(session.containerDescription)
           Text(session.nativeStageDescription)
           Text(session.recoveryDescription)
+          Text(session.ioDescription)
+          Text(session.ioTimingDescription)
+          Text(session.ioJumpDescription)
+          Text(String(format: "压缩视频队列：%.2f 秒（尚未解码）", session.compressedVideoSeconds))
           Text("解码器输出 \(session.decodedVideoFrames) 帧 · 目标前预滚 \(session.prerollFrames) 帧")
           if let warning = session.audioWarning { Text(warning).foregroundStyle(.secondary) }
           Text(session.timingDescription)
