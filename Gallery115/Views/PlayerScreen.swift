@@ -268,14 +268,19 @@ struct PlayerScreen: View {
         state: activeState,
         audioTrackCount: activeTrackSelector?.audioTracks.count,
         subtitleTrackCount: activeTrackSelector?.subtitleTracks.count,
+        decodeStartTime: activeCurrentTime,
         beginDecodeValidation: {
-          model?.pause()
-          vlcController.pause()
+          pauseActivePlayer()
           isValidatingFFmpeg = true
+          RemotePlaybackCoordinator.shared.deactivate()
         },
-        endDecodeValidation: { isValidatingFFmpeg = false }
+        endDecodeValidation: {
+          isValidatingFFmpeg = false
+          configureRemotePlayback()
+          updateRemotePlaybackInfo()
+        }
       )
-      .presentationDetents([.medium, .large])
+      .presentationDetents(isValidatingFFmpeg ? [.large] : [.medium, .large])
       .presentationDragIndicator(.visible)
     }
     .onChange(of: showInfo) { _, presented in
@@ -2449,6 +2454,7 @@ struct PlayerScreen: View {
 
   @MainActor
   private func configureRemotePlayback() {
+    guard !isValidatingFFmpeg else { return }
     RemotePlaybackCoordinator.shared.activate(
       skipSeconds: appState.doubleTapSeekSeconds,
       onPlay: { resumeActivePlayer() },
@@ -2469,6 +2475,7 @@ struct PlayerScreen: View {
 
   @MainActor
   private func updateRemotePlaybackInfo() {
+    guard !isValidatingFFmpeg else { return }
     RemotePlaybackCoordinator.shared.updatePlayback(
       elapsed: activeCurrentTime,
       duration: activeDuration,
@@ -2911,6 +2918,7 @@ private struct PlayerInfoSheet: View {
   let state: PlayerState
   let audioTrackCount: Int?
   let subtitleTrackCount: Int?
+  let decodeStartTime: Double
   let beginDecodeValidation: () -> Void
   let endDecodeValidation: () -> Void
 
@@ -2998,7 +3006,7 @@ private struct PlayerInfoSheet: View {
         Section("内核诊断") {
           if let source = model?.selectedSource {
             NavigationLink("FFmpeg 解码验证（无声）") {
-              FFmpegDecodeValidationView(source: source, startTime: model?.currentTime ?? 0)
+              FFmpegDecodeValidationView(source: source, startTime: decodeStartTime)
                 .onAppear(perform: beginDecodeValidation)
                 .onDisappear(perform: endDecodeValidation)
             }
