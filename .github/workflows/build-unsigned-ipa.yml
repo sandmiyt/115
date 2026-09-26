@@ -27,7 +27,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: Dependencies/FFmpeg/Generated/CinevaFFmpeg.xcframework
-          key: ${{ runner.os }}-ffmpeg-8.0.2-${{ steps.xcode.outputs.version }}-${{ hashFiles('Dependencies/FFmpeg/build-apple.sh', 'Dependencies/FFmpeg/Bridge/**') }}
+          key: ${{ runner.os }}-ffmpeg-8.0.2-${{ steps.xcode.outputs.version }}-${{ hashFiles('Dependencies/FFmpeg/build-apple.sh', 'Dependencies/FFmpeg/Bridge/**', 'Dependencies/FFmpeg/Patches/**') }}
 
       - name: Build FFmpeg 8.0.2 for Apple platforms
         run: bash Dependencies/FFmpeg/build-apple.sh

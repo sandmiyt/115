@@ -1,4 +1,8 @@
 #include "CinevaFFmpeg.h"
+#include "CinevaVideoOutput.h"
+#include <libavutil/hwcontext.h>
+#include <libavutil/pixdesc.h>
+#include <VideoToolbox/VideoToolbox.h>
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/display.h>
@@ -29,6 +33,9 @@ struct CinevaFFmpegSession {
     double target, origin;
     AVFormatContext *format;
     AVCodecContext *video, *audio;
+    AVCodecParameters *videoParameters;
+    int disableHardware, hardwareAttempted;
+    double playbackPosition;
     int videoIndex, audioIndex;
     AVRational videoTimeBase;
     struct SwsContext *scale;
@@ -93,47 +100,27 @@ static int emitVideo(CinevaFFmpegSession *s, AVFrame *frame, int serial, double 
         1.0 / (s->snapshot.fps > 0 ? s->snapshot.fps : 30);
     *nextPTS = pts + step;
     if (pts + 0.001 < target || serial != atomic_load(&s->generation)) return 0;
-    // Phase 3 is an SDR software validation surface, not an HDR tone mapper.
-    if (frame->color_trc == AVCOL_TRC_SMPTE2084 || frame->color_trc == AVCOL_TRC_ARIB_STD_B67)
-        return AVERROR(ENOTSUP);
-    if (frame->width <= 0 || frame->height <= 0 ||
-        (int64_t)frame->width * frame->height > 4096LL * 2304) return AVERROR(EFBIG);
-    double ratio = fmin(1.0, fmin(1280.0 / frame->width, 720.0 / frame->height));
-    int width = FFMAX(2, (int)(frame->width * ratio) & ~1);
-    int height = FFMAX(2, (int)(frame->height * ratio) & ~1);
     CVPixelBufferRef pixel = NULL;
-    const void *keys[] = { kCVPixelBufferIOSurfacePropertiesKey };
-    CFDictionaryRef empty = CFDictionaryCreate(NULL, NULL, NULL, 0,
-        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    const void *values[] = { empty };
-    CFDictionaryRef attrs = CFDictionaryCreate(NULL, keys, values, 1,
-        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    CVReturn result = CVPixelBufferCreate(NULL, width, height, kCVPixelFormatType_32BGRA, attrs, &pixel);
-    CFRelease(attrs); CFRelease(empty);
-    if (result != kCVReturnSuccess) return AVERROR(ENOMEM);
-    s->scale = sws_getCachedContext(s->scale, frame->width, frame->height, frame->format,
-        width, height, AV_PIX_FMT_BGRA, SWS_BILINEAR, NULL, NULL, NULL);
-    if (!s->scale) { CVPixelBufferRelease(pixel); return AVERROR(ENOMEM); }
-    int colorspace = frame->colorspace == AVCOL_SPC_BT709 ? SWS_CS_ITU709 :
-        (frame->colorspace == AVCOL_SPC_BT2020_NCL ? SWS_CS_BT2020 : SWS_CS_ITU601);
-    const int *coefficients = sws_getCoefficients(colorspace);
-    sws_setColorspaceDetails(s->scale, coefficients, frame->color_range == AVCOL_RANGE_JPEG,
-        coefficients, 1, 0, 1 << 16, 1 << 16);
-    CVPixelBufferLockBaseAddress(pixel, 0);
-    uint8_t *planes[] = { CVPixelBufferGetBaseAddress(pixel), NULL, NULL, NULL };
-    int strides[] = { (int)CVPixelBufferGetBytesPerRow(pixel), 0, 0, 0 };
-    int rows = sws_scale(s->scale, (const uint8_t *const *)frame->data, frame->linesize,
-        0, frame->height, planes, strides);
-    CVPixelBufferUnlockBaseAddress(pixel, 0);
-    if (rows < 0) { CVPixelBufferRelease(pixel); return rows; }
+    CinevaFFmpegSnapshot output = {0};
+    int error = cineva_copy_video_surface(frame, s->videoParameters, &s->scale, &pixel, &output);
+    if (error < 0) return error;
     pthread_mutex_lock(&s->mutex);
-    while (s->frameCount == FRAMES && !atomic_load(&s->cancelled) &&
+    int frameLimit = output.outputWidth * output.outputHeight > 1920 * 1080 ? 3 : FRAMES;
+    while (s->frameCount >= frameLimit && !atomic_load(&s->cancelled) &&
            serial == atomic_load(&s->generation)) pthread_cond_wait(&s->changed, &s->mutex);
     if (atomic_load(&s->cancelled) || serial != atomic_load(&s->generation)) {
         CVPixelBufferRelease(pixel);
     } else {
         s->frames[(s->frameHead + s->frameCount++) % FRAMES] = (Frame){pixel, fmax(0, pts), serial};
         s->snapshot.videoFrames++;
+        s->snapshot.decoderType = output.decoderType;
+        s->snapshot.hardwareFrames += output.decoderType == 2;
+        s->snapshot.softwareFrames += output.decoderType == 1;
+        s->snapshot.outputWidth = output.outputWidth; s->snapshot.outputHeight = output.outputHeight;
+        s->snapshot.outputBitDepth = output.outputBitDepth;
+        s->snapshot.colorPrimaries = output.colorPrimaries; s->snapshot.colorTransfer = output.colorTransfer;
+        s->snapshot.colorMatrix = output.colorMatrix;
+        s->snapshot.hasMastering = output.hasMastering; s->snapshot.hasContentLight = output.hasContentLight;
     }
     pthread_cond_broadcast(&s->changed);
     pthread_mutex_unlock(&s->mutex);
@@ -169,6 +156,28 @@ static int decodePacket(CinevaFFmpegSession *s, AVCodecContext *codec, AVFrame *
     if (result < 0 && result != AVERROR_EOF) return result;
     return receiveFrames(s, codec, frame, video, entry, nextPTS);
 }
+static int openVideoDecoder(CinevaFFmpegSession *s);
+static int recoverSoftware(CinevaFFmpegSession *s, Packet entry) {
+    if (s->disableHardware || !s->hardwareAttempted) return 0;
+    s->disableHardware = 1;
+    avcodec_free_context(&s->video);
+    int result = openVideoDecoder(s);
+    if (result < 0) return result;
+    pthread_mutex_lock(&s->mutex);
+    s->snapshot.fallbackReason = 4;
+    if (entry.serial == atomic_load(&s->generation)) {
+        s->target = fmax(entry.target, s->playbackPosition);
+    }
+    // A user seek may have raced codec reconstruction. Keep its latest target,
+    // but always restart the demuxer so we never discard its new keyframe only.
+    s->snapshot.recoveryTarget = s->target;
+    atomic_fetch_add(&s->generation, 1);
+    clearQueues(s);
+    s->snapshot.status = 1;
+    pthread_cond_broadcast(&s->changed);
+    pthread_mutex_unlock(&s->mutex);
+    return 1;
+}
 static void *decodeLoop(void *opaque) {
     CinevaFFmpegSession *s = opaque;
     AVFrame *frame = av_frame_alloc();
@@ -193,9 +202,13 @@ static void *decodeLoop(void *opaque) {
             serial = entry.serial; nextPTS = entry.target;
         }
         int result;
+        int videoOperation = entry.eof || entry.packet->stream_index == s->videoIndex;
         if (entry.eof) {
             result = decodePacket(s, s->video, frame, 1, entry, &nextPTS);
-            if (result >= 0 && s->audio) result = decodePacket(s, s->audio, frame, 0, entry, &nextPTS);
+            if (result >= 0 && s->audio) {
+                videoOperation = 0;
+                result = decodePacket(s, s->audio, frame, 0, entry, &nextPTS);
+            }
             pthread_mutex_lock(&s->mutex);
             if (entry.serial == atomic_load(&s->generation) && result >= 0) s->snapshot.status = 2;
             pthread_mutex_unlock(&s->mutex);
@@ -203,25 +216,89 @@ static void *decodeLoop(void *opaque) {
             int isVideo = entry.packet->stream_index == s->videoIndex;
             result = decodePacket(s, isVideo ? s->video : s->audio, frame, isVideo, entry, &nextPTS);
         }
+        if (result < 0 && videoOperation && entry.serial == atomic_load(&s->generation) &&
+            !atomic_load(&s->cancelled)) {
+            int recovered = recoverSoftware(s, entry);
+            if (recovered > 0) { av_packet_free(&entry.packet); continue; }
+            if (recovered < 0) result = recovered;
+        }
         av_packet_free(&entry.packet);
-        if (result < 0) { fail(s, result); break; }
+        if (result < 0 && entry.serial == atomic_load(&s->generation)) { fail(s, result); break; }
     }
     av_frame_free(&frame);
     return NULL;
 }
-static int openDecoder(CinevaFFmpegSession *s, int index, AVCodecContext **context) {
-    AVCodecParameters *params = s->format->streams[index]->codecpar;
+static void setFallback(CinevaFFmpegSession *s, int reason) {
+    pthread_mutex_lock(&s->mutex);
+    if (!s->snapshot.fallbackReason) s->snapshot.fallbackReason = reason;
+    pthread_mutex_unlock(&s->mutex);
+}
+static enum AVPixelFormat chooseVideoFormat(AVCodecContext *codec, const enum AVPixelFormat *formats) {
+    CinevaFFmpegSession *s = codec->opaque;
+    if (!s->disableHardware && codec->hw_device_ctx) {
+        for (const enum AVPixelFormat *p = formats; *p != AV_PIX_FMT_NONE; p++)
+            if (*p == AV_PIX_FMT_VIDEOTOOLBOX) { s->hardwareAttempted = 1; return *p; }
+        // FFmpeg calls get_format again without VT when its session rejects the
+        // current profile/pixel format. Choose an actual software format then.
+        s->disableHardware = 1;
+        setFallback(s, 3);
+    }
+    for (const enum AVPixelFormat *p = formats; *p != AV_PIX_FMT_NONE; p++) {
+        const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(*p);
+        if (desc && !(desc->flags & AV_PIX_FMT_FLAG_HWACCEL)) return *p;
+    }
+    return AV_PIX_FMT_NONE;
+}
+static CMVideoCodecType appleCodec(enum AVCodecID codec) {
+    switch (codec) {
+        case AV_CODEC_ID_H264: return kCMVideoCodecType_H264;
+        case AV_CODEC_ID_HEVC: return kCMVideoCodecType_HEVC;
+        case AV_CODEC_ID_VP9: return kCMVideoCodecType_VP9;
+        case AV_CODEC_ID_AV1: return kCMVideoCodecType_AV1;
+        case AV_CODEC_ID_MPEG2VIDEO: return kCMVideoCodecType_MPEG2Video;
+        case AV_CODEC_ID_MPEG4: return kCMVideoCodecType_MPEG4Video;
+        default: return 0;
+    }
+}
+static int allocateDecoder(const AVCodecParameters *params, AVRational timebase, AVCodecContext **context) {
     const AVCodec *codec = avcodec_find_decoder(params->codec_id);
     if (!codec) return AVERROR_DECODER_NOT_FOUND;
     *context = avcodec_alloc_context3(codec);
     if (!*context) return AVERROR(ENOMEM);
     int error = avcodec_parameters_to_context(*context, params);
     if (error < 0) return error;
-    // Deliberately software only in Phase 3. Avoid unbounded auto-thread counts.
     (*context)->thread_count = 2;
-    (*context)->pkt_timebase = s->format->streams[index]->time_base;
+    (*context)->pkt_timebase = timebase;
     (*context)->max_pixels = 4096LL * 2304;
-    return avcodec_open2(*context, codec, NULL);
+    return 0;
+}
+static int openVideoDecoder(CinevaFFmpegSession *s) {
+    int result = allocateDecoder(s->videoParameters, s->videoTimeBase, &s->video);
+    if (result < 0) return result;
+    s->video->opaque = s;
+    s->video->get_format = chooseVideoFormat;
+    s->video->thread_type = FF_THREAD_SLICE;
+    if (!s->disableHardware) {
+        CMVideoCodecType type = appleCodec(s->video->codec_id);
+        int hasConfig = 0;
+        for (int i = 0;; i++) {
+            const AVCodecHWConfig *config = avcodec_get_hw_config(s->video->codec, i);
+            if (!config) break;
+            if (config->device_type == AV_HWDEVICE_TYPE_VIDEOTOOLBOX &&
+                (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX)) { hasConfig = 1; break; }
+        }
+        if (type && hasConfig && VTIsHardwareDecodeSupported(type)) {
+            result = av_hwdevice_ctx_create(&s->video->hw_device_ctx, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, NULL, NULL, 0);
+            if (result < 0) { s->disableHardware = 1; setFallback(s, 2); }
+        } else { s->disableHardware = 1; setFallback(s, 1); }
+    }
+    result = avcodec_open2(s->video, s->video->codec, NULL);
+    if (result < 0 && !s->disableHardware) {
+        s->disableHardware = 1; setFallback(s, 3);
+        avcodec_free_context(&s->video);
+        return openVideoDecoder(s);
+    }
+    return result;
 }
 static void *readLoop(void *opaque) {
     CinevaFFmpegSession *s = opaque;
@@ -246,14 +323,26 @@ static void *readLoop(void *opaque) {
     s->videoIndex = av_find_best_stream(s->format, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
     if (s->videoIndex < 0) { result = s->videoIndex; goto done; }
     s->audioIndex = av_find_best_stream(s->format, AVMEDIA_TYPE_AUDIO, -1, s->videoIndex, NULL, 0);
-    result = openDecoder(s, s->videoIndex, &s->video);
-    if (result < 0) goto done;
-    if (s->audioIndex >= 0) {
-        result = openDecoder(s, s->audioIndex, &s->audio);
-        if (result < 0) goto done;
-    }
     AVStream *video = s->format->streams[s->videoIndex];
     s->videoTimeBase = video->time_base;
+    s->videoParameters = avcodec_parameters_alloc();
+    if (!s->videoParameters) { result = AVERROR(ENOMEM); goto done; }
+    result = avcodec_parameters_copy(s->videoParameters, video->codecpar);
+    if (result < 0) goto done;
+    // Dolby's per-frame pipeline is a later phase; preserve the existing native path.
+    if (av_packet_side_data_get(s->videoParameters->coded_side_data,
+        s->videoParameters->nb_coded_side_data, AV_PKT_DATA_DOVI_CONF)) {
+        result = -70001; goto done;
+    }
+    result = openVideoDecoder(s);
+    if (result < 0) goto done;
+    if (s->audioIndex >= 0) {
+        AVStream *audio = s->format->streams[s->audioIndex];
+        result = allocateDecoder(audio->codecpar, audio->time_base, &s->audio);
+        if (result < 0) goto done;
+        result = avcodec_open2(s->audio, s->audio->codec, NULL);
+        if (result < 0) goto done;
+    }
     s->origin = s->format->start_time != AV_NOPTS_VALUE ? (double)s->format->start_time / AV_TIME_BASE :
         (video->start_time != AV_NOPTS_VALUE ? video->start_time * av_q2d(video->time_base) : 0);
     const AVPacketSideData *matrix = av_packet_side_data_get(video->codecpar->coded_side_data,
@@ -325,7 +414,7 @@ done:
     return NULL;
 }
 
-CinevaFFmpegSession *CinevaFFmpegSessionCreate(const char *url, const char *headers, double startTime) {
+CinevaFFmpegSession *CinevaFFmpegSessionCreate(const char *url, const char *headers, double startTime, int preferHardware) {
     if (strncmp(url, "https://", 8) && strncmp(url, "http://", 7)) return NULL;
     CinevaFFmpegSession *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
@@ -335,6 +424,10 @@ CinevaFFmpegSession *CinevaFFmpegSessionCreate(const char *url, const char *head
     atomic_init(&s->deadline, 0);
     s->url = strdup(url); s->headers = strdup(headers);
     s->target = isfinite(startTime) ? fmax(0, startTime) : 0;
+    s->playbackPosition = s->target;
+    s->snapshot.recoveryTarget = s->target;
+    s->disableHardware = !preferHardware;
+    s->snapshot.fallbackReason = preferHardware ? 0 : 5;
     if (!s->url || !s->headers || pthread_create(&s->reader, NULL, readLoop, s)) {
         CinevaFFmpegSessionDestroy(s); return NULL;
     }
@@ -351,6 +444,7 @@ void CinevaFFmpegSessionDestroy(CinevaFFmpegSession *s) {
     clearQueues(s);
     sws_freeContext(s->scale);
     avcodec_free_context(&s->video); avcodec_free_context(&s->audio);
+    avcodec_parameters_free(&s->videoParameters);
     avformat_close_input(&s->format);
     free(s->url); free(s->headers);
     pthread_cond_destroy(&s->changed); pthread_mutex_destroy(&s->mutex);
@@ -359,11 +453,19 @@ void CinevaFFmpegSessionDestroy(CinevaFFmpegSession *s) {
 int CinevaFFmpegSessionSeek(CinevaFFmpegSession *s, double seconds) {
     pthread_mutex_lock(&s->mutex);
     s->target = isfinite(seconds) ? fmax(0, seconds) : 0;
+    s->playbackPosition = s->target;
+    s->snapshot.recoveryTarget = s->target;
     int serial = atomic_fetch_add(&s->generation, 1) + 1;
     if (s->snapshot.status > 0) s->snapshot.status = 1;
     clearQueues(s);
     pthread_cond_broadcast(&s->changed); pthread_mutex_unlock(&s->mutex);
     return serial;
+}
+void CinevaFFmpegSessionSetPosition(CinevaFFmpegSession *s, double seconds) {
+    if (!isfinite(seconds)) return;
+    pthread_mutex_lock(&s->mutex);
+    s->playbackPosition = fmax(0, seconds);
+    pthread_mutex_unlock(&s->mutex);
 }
 void CinevaFFmpegSessionSnapshot(CinevaFFmpegSession *s, CinevaFFmpegSnapshot *snapshot) {
     pthread_mutex_lock(&s->mutex);

@@ -586,7 +586,7 @@ private struct FFmpegIntegrationInfoView: View {
         LabeledContent("实际库版本", value: info.version)
         LabeledContent("内存对象检查", value: info.allocationCheckPassed ? "通过" : "失败")
         LabeledContent("许可", value: info.license)
-        Text("当前第 3 阶段已接入软件解封装与解码验证，可在播放详情中打开无声验证入口。日常播放仍使用 AVPlayer / VLC。以下列表表示编译进库的能力，不代表设备已验证硬解。")
+        Text("当前第 4 阶段已接入 VideoToolbox 硬解、软件回退及 HDR10/HLG 像素输出，可在播放详情中打开无声验证入口。日常播放仍使用 AVPlayer / VLC。以下列表表示编译进库的能力，不代表设备已验证硬解。")
           .font(.caption).foregroundStyle(.secondary)
       }
       Section("已编译解码器") { Text(info.decoders.joined(separator: ", ")).textSelection(.enabled) }
@@ -594,7 +594,7 @@ private struct FFmpegIntegrationInfoView: View {
       Section("已编译解封装器") { Text(info.demuxers.joined(separator: ", ")).textSelection(.enabled) }
       Section("源码与许可") {
         Link("FFmpeg 8.0.2 原始源码", destination: URL(string: "https://ffmpeg.org/releases/ffmpeg-8.0.2.tar.xz")!)
-        Text("本软件使用 LGPL v2.1 或更新版本许可的 FFmpeg。与二进制对应的未修改源码、配置、桥接源码和构建脚本随框架打包。")
+        Text("本软件使用 LGPL v2.1 或更新版本许可的 FFmpeg。与二进制对应的上游源码、修改补丁、配置、桥接源码和构建脚本随框架打包。")
           .font(.caption)
         NavigationLink("完整许可") {
           ScrollView { Text(FFmpegRuntime.licenseText).font(.footnote).textSelection(.enabled).padding() }

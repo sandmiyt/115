@@ -18,7 +18,7 @@ int CinevaFFmpegHasVideoToolbox(const char * _Nonnull decoder);
 // No network, media playback or hardware session is opened in Phase 2.
 int CinevaFFmpegRuntimeCheck(void);
 
-// Phase 3: independent demux/decode workers. Audio is decoded for validation,
+// Phase 4: hardware-preferred decode workers. Audio is decoded for validation,
 // but not rendered until the audio-clock phase. No libav types cross this ABI.
 typedef struct CinevaFFmpegSession CinevaFFmpegSession;
 typedef struct {
@@ -29,13 +29,20 @@ typedef struct {
     int packetCount, frameCount;
     int64_t packetBytes, videoFrames, audioFrames;
     double duration, fps, rotation, queuedSeconds;
+    int decoderType; // 0 not yet observed, 1 FFmpeg software, 2 required VideoToolbox hardware
+    int fallbackReason; // 0 none, 1 no device/codec support, 2 device init, 3 format init, 4 decode failure, 5 forced software
+    int outputWidth, outputHeight, outputBitDepth;
+    int colorPrimaries, colorTransfer, colorMatrix, hasMastering, hasContentLight;
+    int64_t hardwareFrames, softwareFrames;
+    double recoveryTarget;
 } CinevaFFmpegSnapshot;
 CinevaFFmpegSession * _Nullable CinevaFFmpegSessionCreate(
-    const char * _Nonnull url, const char * _Nonnull headers, double startTime);
+    const char * _Nonnull url, const char * _Nonnull headers, double startTime, int preferHardware);
 void CinevaFFmpegSessionCancel(CinevaFFmpegSession * _Nonnull session);
 // Must run off the main thread, after the consumer has stopped using session.
 void CinevaFFmpegSessionDestroy(CinevaFFmpegSession * _Nonnull session);
 int CinevaFFmpegSessionSeek(CinevaFFmpegSession * _Nonnull session, double seconds);
+void CinevaFFmpegSessionSetPosition(CinevaFFmpegSession * _Nonnull session, double seconds);
 void CinevaFFmpegSessionSnapshot(CinevaFFmpegSession * _Nonnull session,
     CinevaFFmpegSnapshot * _Nonnull snapshot);
 CVPixelBufferRef _Nullable CinevaFFmpegSessionCopyFrame(CinevaFFmpegSession * _Nonnull session,

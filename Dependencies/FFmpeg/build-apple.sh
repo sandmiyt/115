@@ -19,6 +19,14 @@ if [[ ! -f "$ARCHIVE" ]]; then
 fi
 echo "$SHA256  $ARCHIVE" | shasum -a 256 -c -
 if [[ ! -d "$SOURCE" ]]; then tar -xf "$ARCHIVE" -C "$WORK"; fi
+for change in "$ROOT"/Patches/*.patch; do
+  if patch -t --forward --dry-run -p1 -d "$SOURCE" < "$change" >/dev/null; then
+    patch -t --forward -p1 -d "$SOURCE" < "$change"
+  else
+    # Reusing an already patched local source is allowed; drift is not.
+    patch -t --dry-run -R -p1 -d "$SOURCE" < "$change" >/dev/null
+  fi
+done
 
 build_slice() {
   local sdk="$1" triple="$2" platform="$3"
@@ -67,6 +75,7 @@ _CinevaFFmpegSessionCreate
 _CinevaFFmpegSessionCancel
 _CinevaFFmpegSessionDestroy
 _CinevaFFmpegSessionSeek
+_CinevaFFmpegSessionSetPosition
 _CinevaFFmpegSessionSnapshot
 _CinevaFFmpegSessionCopyFrame
 _CinevaFFmpegCodecName
@@ -101,13 +110,14 @@ EXPORTS
 <key>CFBundleSupportedPlatforms</key><array><string>$platform</string></array>
 </dict></plist>
 PLIST
-  # Include the exact unmodified LGPL source and reproducible build inputs in
+  # Include the upstream LGPL source plus every applied patch/build input in
   # each platform framework; only the selected slice is embedded in the IPA.
   cp "$ARCHIVE" "$framework/"
   cp "$SOURCE/COPYING.LGPLv2.1" "$framework/FFmpeg-LICENSE.txt"
   cp "$0" "$framework/FFmpeg-build.sh"
   cp -R "$ROOT/Bridge" "$framework/BridgeSource"
-  printf 'FFmpeg %s\nSource SHA256: %s\nSource modifications: none\n' "$VERSION" "$SHA256" > "$framework/FFmpeg-provenance.txt"
+  cp -R "$ROOT/Patches" "$framework/Patches"
+  printf 'FFmpeg %s\nUpstream SHA256: %s\nSource modifications: bundled Patches/require-hardware.patch\n' "$VERSION" "$SHA256" > "$framework/FFmpeg-provenance.txt"
 }
 
 build_slice iphoneos arm64-apple-ios17.0 iPhoneOS

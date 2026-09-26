@@ -23,7 +23,7 @@ private final class DecodeDisplayLinkTarget: NSObject {
   @objc func tick() { session?.pump() }
 }
 
-/// Phase 3 validation transport. Intentionally not a full PlayerEngine: audio,
+/// Phase 4 validation transport. Intentionally not a full PlayerEngine: audio,
 /// rate stretching, track selection and PiP are not implemented by this path.
 @MainActor @Observable
 final class FFmpegDecodeSession {
@@ -39,6 +39,13 @@ final class FFmpegDecodeSession {
   private(set) var lastSeekSeconds: Double?
   private(set) var rotation = 0.0
   private(set) var wantsPlayback = true
+  private(set) var decoderDescription = "等待实际解码帧"
+  private(set) var outputDescription = "等待画面输出"
+  private(set) var colorDescription = "等待色彩信息"
+  private(set) var fallbackDescription: String?
+  private(set) var hardwareFrames: Int64 = 0
+  private(set) var softwareFrames: Int64 = 0
+  let hdrDisplayEligible = AVPlayer.eligibleForHDRPlayback
   let displayLayer = AVSampleBufferDisplayLayer()
 
   @ObservationIgnored private var handle: FFmpegSessionHandle?
@@ -62,7 +69,7 @@ final class FFmpegDecodeSession {
     if let timebase { CMTimebaseSetRate(timebase, rate: 0) }
   }
 
-  func start(source: VideoSource, at seconds: Double) {
+  func start(source: VideoSource, at seconds: Double, preferHardware: Bool = true) {
     guard handle == nil else { return }
     anchored = false
     serial = 1
@@ -71,6 +78,12 @@ final class FFmpegDecodeSession {
     lastSeekSeconds = nil
     seekStartedAt = nil
     wantsPlayback = true
+    decoderDescription = "等待实际解码帧"
+    outputDescription = "等待画面输出"
+    colorDescription = "等待色彩信息"
+    fallbackDescription = nil
+    hardwareFrames = 0
+    softwareFrames = 0
     guard let scheme = source.url.scheme?.lowercased(), ["https", "http"].contains(scheme),
       let timebase else { state = .failed("验证入口仅支持 HTTP/HTTPS 视频地址。"); return }
     // Prevent header injection. Headers come from the existing provider, not UI.
@@ -82,7 +95,7 @@ final class FFmpegDecodeSession {
     let headers = source.headers.sorted { $0.key < $1.key }
       .map { "\($0.key): \($0.value)\r\n" }.joined()
     let pointer = source.url.absoluteString.withCString { url in
-      headers.withCString { CinevaFFmpegSessionCreate(url, $0, seconds) }
+      headers.withCString { CinevaFFmpegSessionCreate(url, $0, seconds, preferHardware ? 1 : 0) }
     }
     guard let pointer else { state = .failed("无法创建 FFmpeg 解码会话。"); return }
     handle = FFmpegSessionHandle(pointer)
@@ -139,8 +152,25 @@ final class FFmpegDecodeSession {
     if snapshot.status < 0 {
       let code = snapshot.errorCode
       stop()
-      state = .failed("FFmpeg 验证未能继续（\(code)）。本阶段不支持 HDR 输出；也可能是地址过期、网络超时或格式暂不支持。请返回原播放器。"); return
+      state = .failed(code == -70001
+        ? "检测到 Dolby Vision，本阶段尚未接入其动态元数据处理。请返回原播放器使用系统内核。"
+        : "FFmpeg 验证未能继续（\(code)）。可能是地址过期、网络超时或格式暂不支持。请返回原播放器。")
+      return
     }
+    // Decoder failure can trigger an internal keyframe restart in software.
+    // Treat it exactly like a new seek; no old hardware frame may reappear.
+    if snapshot.serial != serial {
+      serial = snapshot.serial
+      pending = nil
+      anchored = false
+      lastEnqueuedPTS = -1
+      currentTime = snapshot.recoveryTarget
+      CMTimebaseSetRate(timebase, rate: 0)
+      CMTimebaseSetTime(timebase, time: CMTime(seconds: currentTime, preferredTimescale: 60000))
+      displayLayer.flushAndRemoveImage()
+      state = .seeking
+    }
+    if anchored { CinevaFFmpegSessionSetPosition(handle.pointer, CMTimebaseGetTime(timebase).seconds) }
     let now = CACurrentMediaTime()
     if now - lastPublishedAt >= 0.25 {
       lastPublishedAt = now
@@ -149,6 +179,24 @@ final class FFmpegDecodeSession {
       audioFrames = snapshot.audioFrames
       packetBytes = snapshot.packetBytes
       frameCount = Int(snapshot.frameCount)
+      hardwareFrames = snapshot.hardwareFrames
+      softwareFrames = snapshot.softwareFrames
+      decoderDescription = snapshot.decoderType == 2 ? "VideoToolbox 硬件解码" :
+        (snapshot.decoderType == 1 ? "FFmpeg 软件解码" : "等待实际解码帧")
+      if snapshot.outputWidth > 0 {
+        outputDescription = "\(snapshot.outputWidth)×\(snapshot.outputHeight) · \(snapshot.outputBitDepth) 位 · 原生显示"
+        let transfer = snapshot.colorTransfer == 16 ? "HDR10 / PQ" : (snapshot.colorTransfer == 18 ? "HLG" : "SDR / 非 PQ、HLG")
+        colorDescription = "\(transfer) · primaries \(snapshot.colorPrimaries) / matrix \(snapshot.colorMatrix)"
+          + " · MDCV \(snapshot.hasMastering == 1 ? "有" : "无") / CLL \(snapshot.hasContentLight == 1 ? "有" : "无")"
+      }
+      switch snapshot.fallbackReason {
+      case 1: fallbackDescription = "当前设备或编码未提供可用硬解，使用软件解码。"
+      case 2: fallbackDescription = "硬解设备初始化失败，已改用软件解码。"
+      case 3: fallbackDescription = "硬解会话不接受当前格式或 Profile，已改用软件解码。"
+      case 4: fallbackDescription = "硬解过程中失败，已从当前位置附近的关键帧重新软件解码。"
+      case 5: fallbackDescription = "本次手动选择软件解码对照。"
+      default: fallbackDescription = nil
+      }
       rotation = snapshot.rotation.isFinite ? snapshot.rotation : 0
       if snapshot.status > 0 {
         let video = String(cString: CinevaFFmpegCodecName(snapshot.videoCodec))
@@ -174,7 +222,7 @@ final class FFmpegDecodeSession {
       guard let (pixel, pts, frameSerial) = pending else { break }
       guard frameSerial == serial else { pending = nil; continue }
       let clock = CMTimebaseGetTime(timebase).seconds
-      if anchored && (!wantsPlayback || (state != .buffering && pts > clock + 0.25)) { break }
+      if anchored && (!wantsPlayback || (state != .buffering && pts > clock + min(0.12, 2 * frameStep))) { break }
       guard displayLayer.isReadyForMoreMediaData else { break }
       var format: CMVideoFormatDescription?
       guard CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault,

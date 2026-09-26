@@ -9,5 +9,5 @@ Pod::Spec.new do |s|
                :sha256 => '5d16962332603c427b3d0887fc12b9166d6ee2cb1108b1865dd2d5eb06a09505' }
   s.ios.deployment_target = '17.0'
   s.vendored_frameworks = 'Generated/CinevaFFmpeg.xcframework'
-  s.preserve_paths = 'Bridge/*', 'build-apple.sh'
+  s.preserve_paths = 'Bridge/*', 'Patches/*', 'build-apple.sh'
 end
