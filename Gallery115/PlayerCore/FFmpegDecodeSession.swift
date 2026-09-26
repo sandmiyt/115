@@ -151,8 +151,12 @@ final class FFmpegDecodeSession {
     CinevaFFmpegSessionSnapshot(handle.pointer, &snapshot)
     if snapshot.status < 0 {
       let code = snapshot.errorCode
+      let av1SoftwareUnavailable = snapshot.fallbackReason > 0 &&
+        String(cString: CinevaFFmpegCodecName(snapshot.videoCodec)) == "av1"
       stop()
-      state = .failed(code == -70001
+      state = .failed(av1SoftwareUnavailable
+        ? "本构建尚未集成 AV1 软件解码器。请尝试开启优先硬解，或返回原播放器使用 VLC。"
+        : code == -70001
         ? "检测到 Dolby Vision，本阶段尚未接入其动态元数据处理。请返回原播放器使用系统内核。"
         : "FFmpeg 验证未能继续（\(code)）。可能是地址过期、网络超时或格式暂不支持。请返回原播放器。")
       return
