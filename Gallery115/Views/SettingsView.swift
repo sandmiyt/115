@@ -567,9 +567,43 @@ private struct AboutSettingsView: View {
         LabeledContent("版本", value: (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "")
         LabeledContent("媒体协议", value: "115 Open API + WebDAV")
         LabeledContent("播放内核", value: "AVPlayer + VLC")
+        NavigationLink("FFmpeg 集成信息") {
+          FFmpegIntegrationInfoView()
+        }
       }
     }
     .navigationTitle("关于")
     .navigationBarTitleDisplayMode(.inline)
+  }
+}
+
+private struct FFmpegIntegrationInfoView: View {
+  private let info = FFmpegRuntime.buildInfo
+
+  var body: some View {
+    List {
+      Section("依赖验证") {
+        LabeledContent("实际库版本", value: info.version)
+        LabeledContent("内存对象检查", value: info.allocationCheckPassed ? "通过" : "失败")
+        LabeledContent("许可", value: info.license)
+        Text("当前为第 2 阶段依赖接入，实际播放仍使用 AVPlayer / VLC。以下列表表示编译进库的能力，不代表设备已验证硬解。")
+          .font(.caption).foregroundStyle(.secondary)
+      }
+      Section("已编译解码器") { Text(info.decoders.joined(separator: ", ")).textSelection(.enabled) }
+      Section("VideoToolbox 编译配置") { Text(info.videoToolboxConfigurations.joined(separator: ", ")).textSelection(.enabled) }
+      Section("已编译解封装器") { Text(info.demuxers.joined(separator: ", ")).textSelection(.enabled) }
+      Section("源码与许可") {
+        Link("FFmpeg 8.0.2 原始源码", destination: URL(string: "https://ffmpeg.org/releases/ffmpeg-8.0.2.tar.xz")!)
+        Text("本软件使用 LGPL v2.1 或更新版本许可的 FFmpeg。与二进制对应的未修改源码、配置、桥接源码和构建脚本随框架打包。")
+          .font(.caption)
+        NavigationLink("完整许可") {
+          ScrollView { Text(FFmpegRuntime.licenseText).font(.footnote).textSelection(.enabled).padding() }
+        }
+        NavigationLink("编译参数") {
+          ScrollView { Text(info.configuration).font(.footnote).textSelection(.enabled).padding() }
+        }
+      }
+    }
+    .navigationTitle("FFmpeg 集成信息")
   }
 }

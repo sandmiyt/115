@@ -326,11 +326,11 @@ struct PlayerScreen: View {
     .task(id: currentItem.id) {
       await prepareCurrentItem()
     }
-    .task(id: wantsPlaybackLoading) {
+    .task(id: activeLoadingFeedback) {
       showPlaybackLoading = false
-      guard wantsPlaybackLoading else { return }
-      do { try await Task.sleep(for: .milliseconds(350)) } catch { return }
-      guard !Task.isCancelled, wantsPlaybackLoading else { return }
+      guard let feedback = activeLoadingFeedback else { return }
+      do { try await Task.sleep(for: .milliseconds(feedback.delayMilliseconds)) } catch { return }
+      guard !Task.isCancelled, activeLoadingFeedback == feedback else { return }
       showPlaybackLoading = true
     }
     .onChange(of: model?.requiresVLC ?? false) { _, requiresVLC in
@@ -2240,9 +2240,10 @@ struct PlayerScreen: View {
   private var activeBufferedDuration: Double { activeStatistics.bufferedSeconds ?? 0 }
   private var activeIsPlaying: Bool { activeState == .playing }
   private var activeIsBuffering: Bool { activeState.needsLoadingIndicator }
-  private var wantsPlaybackLoading: Bool {
-    !isScrubbing && (activeState.needsLoadingIndicator || activeIsScrubLoading)
+  private var activeLoadingFeedback: PlayerLoadingFeedback? {
+    isScrubbing ? nil : activeEngine?.loadingFeedback
   }
+  private var wantsPlaybackLoading: Bool { activeLoadingFeedback != nil }
   private var activeIsScrubLoading: Bool { activeEngine?.isInteractiveScrubLoading ?? false }
   private var activeDidReachEnd: Bool { activeState == .ended }
   private var activeNetworkMbps: Double { activeStatistics.networkMbps ?? 0 }

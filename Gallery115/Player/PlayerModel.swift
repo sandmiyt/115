@@ -136,6 +136,12 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
     return isPlaying ? .playing : .paused
   }
 
+  var loadingFeedback: PlayerLoadingFeedback? {
+    guard playbackState.needsLoadingIndicator || isInteractiveScrubLoading else { return nil }
+    return PlayerLoadingFeedback(delayMilliseconds: lastSeekWasBuffered ? 900 : 350,
+      generation: scrubGeneration)
+  }
+
   var statistics: PlayerStatistics {
     PlayerStatistics(
       backend: .apple,
@@ -214,6 +220,7 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
   @ObservationIgnored private var scrubDispatchTask: Task<Void, Never>?
   private var scrubInFlightTarget: CMTime = .invalid
   private var scrubGeneration = 0
+  private var lastSeekWasBuffered = false
 
   init(
     item: CloudItem, api: APIClient, libraryStore: LibraryStore,
@@ -416,6 +423,7 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
     currentTime = target.seconds
     scrubChaseTime = target
     scrubFinalTarget = target
+    lastSeekWasBuffered = bufferedSeekRange(at: target.seconds) != nil
     scrubResumeAfterFinish = resumeAfter
     scrubDispatchTask?.cancel()
     scrubDispatchTask = nil
@@ -457,11 +465,17 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
     let isFinalPass = scrubFinalTarget != nil
     // Tiny tolerances force a GOP decode even for already-buffered data.
     // AVPlayer's fast path finds a nearby decodable frame while dragging.
-    let tolerance = isFinalPass ? CMTime(seconds: 0.10, preferredTimescale: 600) : .positiveInfinity
+    let cachedRange = isFinalPass ? bufferedSeekRange(at: target.seconds) : nil
+    // Stay inside the loaded range. A bounded half-second landing window can
+    // reuse a nearby decodable frame instead of enforcing a 100 ms GOP decode.
+    let before = cachedRange.map { min(0.5, max(target.seconds - $0.start, 0)) } ?? 0.10
+    let after = cachedRange.map { min(0.5, max($0.end - target.seconds - 0.05, 0)) } ?? 0.10
+    let toleranceBefore = isFinalPass ? CMTime(seconds: before, preferredTimescale: 600) : .positiveInfinity
+    let toleranceAfter = isFinalPass ? CMTime(seconds: after, preferredTimescale: 600) : .positiveInfinity
     scrubSeekInProgress = true
     scrubInFlightTarget = target
     isInteractiveScrubLoading = isFinalPass
-    player.seek(to: target, toleranceBefore: tolerance, toleranceAfter: tolerance) { [weak self] finished in
+    player.seek(to: target, toleranceBefore: toleranceBefore, toleranceAfter: toleranceAfter) { [weak self] finished in
       Task { @MainActor in
         guard let self, self.scrubGeneration == generation, self.player.currentItem === item else { return }
         self.scrubSeekInProgress = false
@@ -474,7 +488,7 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
           if finished, !isFinalPass, abs(self.player.currentTime().seconds - final.seconds) > 0.12 {
             self.performInteractiveScrubSeek()
           } else {
-            self.finishInteractiveScrub()
+            self.finishInteractiveScrub(seekCompleted: finished)
           }
         } else {
           self.isInteractiveScrubLoading = false
@@ -483,7 +497,7 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
     }
   }
 
-  private func finishInteractiveScrub() {
+  private func finishInteractiveScrub(seekCompleted: Bool = false) {
     timelinePreview.end()
     scrubSeekInProgress = false
     scrubFinalTarget = nil
@@ -496,7 +510,17 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
     let shouldResume = scrubResumeAfterFinish
     scrubResumeAfterFinish = false
     if shouldResume {
-      player.play()
+      wantsPlayback = true
+      // One explicit user seek only, after completion and a fresh runway check.
+      // Never force ongoing stall recovery or assume the timeline proves a hit.
+      if seekCompleted, lastSeekWasBuffered, let item = player.currentItem,
+        item.status == .readyToPlay, !item.isPlaybackBufferEmpty,
+        let range = bufferedSeekRange(at: currentTime),
+        range.end - currentTime >= max(2, Double(player.defaultRate) * 2) {
+        player.playImmediately(atRate: player.defaultRate)
+      } else {
+        player.play()
+      }
       isPlaying = true
       isBuffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
     }
@@ -505,6 +529,7 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
   private func cancelInteractiveScrub() {
     timelinePreview.end()
     scrubGeneration &+= 1
+    lastSeekWasBuffered = false
     scrubDispatchTask?.cancel()
     scrubDispatchTask = nil
     if scrubSeekInProgress { player.currentItem?.cancelPendingSeeks() }
@@ -513,6 +538,16 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
     scrubResumeAfterFinish = false
     interactiveScrubActive = false
     isInteractiveScrubLoading = false
+  }
+
+  private func bufferedSeekRange(at seconds: Double) -> PlaybackBufferRange? {
+    guard seconds.isFinite else { return nil }
+    let ranges = PlaybackBufferPolicy.normalized((player.currentItem?.loadedTimeRanges ?? []).map {
+      let range = $0.timeRangeValue
+      return PlaybackBufferRange(start: range.start.seconds, end: CMTimeRangeGetEnd(range).seconds)
+    })
+    // The very end of a range cannot provide even the next few output frames.
+    return ranges.first { $0.start <= seconds && seconds + 0.25 < $0.end }
   }
 
   private func clampedSeekTarget(_ seconds: Double) -> Double {
@@ -880,6 +915,7 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
     // playback appears stalled until it reaches the old pre-seek timestamp.
     let progressed = abs(seconds - lastPlaybackProgressTime) > 0.08
     if progressed {
+      if !interactiveScrubActive { lastSeekWasBuffered = false }
       lastPlaybackProgressTime = seconds
       lastPlaybackProgressAt = now
       if seconds > 0 { hasPlayedCurrentItem = true }

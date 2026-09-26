@@ -68,3 +68,9 @@ struct PlayerStatistics: Sendable {
   var droppedFrames: Int?
   var avSyncOffset: Double?
 }
+
+/// Identity restarts feedback timing when a newer seek supersedes an old one.
+struct PlayerLoadingFeedback: Equatable, Sendable {
+  let delayMilliseconds: Int
+  let generation: Int
+}

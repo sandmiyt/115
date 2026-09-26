@@ -29,6 +29,7 @@ typealias CinevaPlaybackEngine = PlaybackEngineControlling
 protocol PlayerEngine: PlaybackEngineControlling {
   var playbackState: PlayerState { get }
   var statistics: PlayerStatistics { get }
+  var loadingFeedback: PlayerLoadingFeedback? { get }
   var isInteractiveScrubLoading: Bool { get }
   @discardableResult func beginInteractiveScrub() -> Bool
   func interactiveScrub(to seconds: Double)
@@ -55,4 +56,12 @@ extension PlaybackEngineControlling {
   func engineSeek(to seconds: Double) { seek(to: seconds) }
   func engineSetPlaybackRate(_ rate: Float) { setPlaybackRate(rate) }
   func engineSetVolume(_ value: Float) { setVolume(value) }
+}
+
+@MainActor
+extension PlayerEngine {
+  var loadingFeedback: PlayerLoadingFeedback? {
+    guard playbackState.needsLoadingIndicator || isInteractiveScrubLoading else { return nil }
+    return PlayerLoadingFeedback(delayMilliseconds: 350, generation: 0)
+  }
 }

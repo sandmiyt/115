@@ -17,7 +17,19 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Select latest Xcode
-        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+        id: xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          echo "version=$(xcodebuild -version | shasum -a 256 | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pinned FFmpeg XCFramework
+        uses: actions/cache@v4
+        with:
+          path: Dependencies/FFmpeg/Generated/CinevaFFmpeg.xcframework
+          key: ${{ runner.os }}-ffmpeg-8.0.2-${{ steps.xcode.outputs.version }}-${{ hashFiles('Dependencies/FFmpeg/**') }}
+
+      - name: Build FFmpeg 8.0.2 for Apple platforms
+        run: bash Dependencies/FFmpeg/build-apple.sh
 
       - name: Restore CocoaPods download cache
         id: pods-cache

@@ -10,3 +10,5 @@ Payload/
 __pycache__/
 cineva-auth-server/.env
 cineva-auth-server/*.sqlite3
+
+Dependencies/FFmpeg/Generated/
