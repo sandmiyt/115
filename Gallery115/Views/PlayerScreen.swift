@@ -30,6 +30,8 @@ struct PlayerScreen: View {
   @State private var useFFmpeg = false
   @State private var ffmpegReason: String?
   @State private var didFFmpegFallback = false
+  @State private var backendSwitchTask: Task<Void,Never>?
+  @State private var backendSwitchGeneration = UUID()
   @State private var didLoadPreferredRate = false
   @State private var localMetadata: LocalMediaMetadata?
   @State private var showInfo = false
@@ -405,6 +407,7 @@ struct PlayerScreen: View {
 
 
   private func handlePlayerDisappear() {
+    backendSwitchTask?.cancel(); backendSwitchGeneration=UUID()
     let thumbnails = appState.thumbnailService
     let owner = thumbnailPlaybackOwner
     thumbnailOwnerActive = false
@@ -1533,8 +1536,8 @@ struct PlayerScreen: View {
           settingsAirPlayButton()
         }
         settingsActionButton(
-          systemPresentationController.isPictureInPictureActive ? "退出小窗" : "小窗播放",
-          systemName: systemPresentationController.isPictureInPictureActive ? "pip.exit" : "pip.enter",
+          (useFFmpeg ? ffmpegEngine.pip?.active == true : systemPresentationController.isPictureInPictureActive) ? "退出小窗" : "小窗播放",
+          systemName: (useFFmpeg ? ffmpegEngine.pip?.active == true : systemPresentationController.isPictureInPictureActive) ? "pip.exit" : "pip.enter",
           enabled: useFFmpeg ? (ffmpegEngine.pip?.supported ?? false) : (!useVLC && systemPresentationController.isPictureInPictureSupported)
         ) {
           closeSettingsPanel(scheduleHide: false)
@@ -1827,7 +1830,13 @@ struct PlayerScreen: View {
             .frame(width: trackWidth, height: trackHeight)
             .offset(x: trackInset)
 
-          if !useVLC {
+          if useFFmpeg {
+            let start=min(max(activeCurrentTime/duration,0),1)
+            let end=min(max(ffmpegEngine.bufferedUntil/duration,start),1)
+            Capsule().fill(.white.opacity(0.48))
+              .frame(width:trackWidth*CGFloat(end-start),height:trackHeight)
+              .offset(x:trackInset+trackWidth*CGFloat(start))
+          } else if !useVLC {
             ForEach(model.bufferedRanges, id: \.start) { range in
               let start = min(max(range.start / duration, 0), 1)
               let end = min(max(range.end / duration, start), 1)
@@ -2151,6 +2160,8 @@ struct PlayerScreen: View {
   @MainActor
   private func switchPlaybackBackend(_ backend: PlayerBackend) {
     guard let model, let source=model.selectedSource else { return }
+    backendSwitchTask?.cancel()
+    let generation=UUID(); backendSwitchGeneration=generation
     let position=activeCurrentTime, playing=useFFmpeg ? ffmpegEngine.wantsPlayback : activeIsPlaying
     let volume=activeVolume
     pauseActivePlayer()
@@ -2173,8 +2184,10 @@ struct PlayerScreen: View {
       ffmpegReason="兼容内核 VLC：实际格式及输出能力以当前播放结果为准"
     case .apple:
       ffmpegReason="兼容内核 AVPlayer：正在按原位置重新打开媒体"
-      Task { @MainActor in
+      backendSwitchTask=Task { @MainActor in
+        guard !Task.isCancelled, backendSwitchGeneration==generation else { return }
         await model.select(source)
+        guard !Task.isCancelled, backendSwitchGeneration==generation else { return }
         model.pause(); model.seek(to:position); model.setPlaybackRate(playbackRate); model.setVolume(volume)
         if playing { model.resume() }
       }
