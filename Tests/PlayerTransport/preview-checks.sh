@@ -15,12 +15,14 @@ ffmpeg -hide_banner -loglevel error -y -i "$MEDIA/bframes.mp4" -r 24000/1001 -c:
 ffmpeg -hide_banner -loglevel error -y -i "$MEDIA/bframes.mp4" -vf "select='if(lt(t,3),1,not(mod(n,2)))'" \
   -fps_mode vfr -c:v libx264 -c:a copy "$MEDIA/vfr.mp4"
 ffmpeg -hide_banner -loglevel error -y -i "$MEDIA/bframes.mp4" -an -c:v copy "$MEDIA/noaudio.mp4"
-ffmpeg -hide_banner -loglevel error -y -i "$MEDIA/bframes.mp4" -c copy -metadata:s:v rotate=90 "$MEDIA/rotated.mp4"
+ffmpeg -hide_banner -loglevel error -y -display_rotation:v:0 90 -i "$MEDIA/bframes.mp4" -c copy "$MEDIA/rotated.mp4"
 ffmpeg -hide_banner -loglevel error -y -i "$MEDIA/bframes.mp4" -c copy -output_ts_offset 2 "$MEDIA/origin.mp4"
 printf '1\n00:00:01,000 --> 00:00:05,000\nFixture subtitles\n' > "$MEDIA/text.srt"
 ffmpeg -hide_banner -loglevel error -y -i "$MEDIA/bframes.mp4" -i "$MEDIA/text.srt" -map 0 -map 1 -c copy -c:s srt "$MEDIA/subtitles.mkv"
 ffmpeg -hide_banner -loglevel error -y -f lavfi -i 'color=c=blue:size=3840x2160:rate=24:duration=6' \
   -f lavfi -i 'sine=frequency=440:duration=6' -c:v libx264 -preset ultrafast -g 24 -c:a aac "$MEDIA/4k.mp4"
+ffprobe -v error -select_streams v:0 -show_entries stream_side_data=rotation -of json "$MEDIA/rotated.mp4" | \
+  python3 -c 'import json,sys; j=json.load(sys.stdin); assert any(abs(x.get("rotation",0))==90 for s in j["streams"] for x in s.get("side_data_list",[])), "Fixture has no rotation matrix"; print("Fixture rotation matrix verified")'
 python3 Tests/PlayerTransport/range_server.py --port-file "$RUNNER_TEMP/preview-port" --media-dir "$MEDIA" &
 SERVER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT

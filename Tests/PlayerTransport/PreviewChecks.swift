@@ -4,6 +4,7 @@ import Foundation
 
 @main struct PreviewChecks {
   static func main() async {
+    setbuf(stdout,nil)
     let base=CommandLine.arguments[1]
     var checks=0
     func expect(_ ok:Bool,_ text:String) { precondition(ok,text); checks+=1 }
