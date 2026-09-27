@@ -2250,9 +2250,9 @@ struct PlayerScreen: View {
       ffmpegReason="兼容内核 AVPlayer：正在按原位置重新打开媒体"
       backendSwitchTask=Task { @MainActor in
         guard !Task.isCancelled, backendSwitchGeneration==generation else { return }
-        await model.select(source)
+        await model.select(source,autoplay:false,resumeAt:position)
         guard !Task.isCancelled, backendSwitchGeneration==generation else { return }
-        model.pause(); model.seek(to:position); model.setPlaybackRate(playbackRate); model.setVolume(volume)
+        model.setPlaybackRate(playbackRate); model.setVolume(volume)
         if playing { model.resume() }
       }
     }

@@ -68,6 +68,8 @@ check("@State private var useFFmpeg = true" in player_source and "prepareAndPlay
       "Normal playback resolves externally before creating the default FFmpeg session")
 check(all(token not in player_source+settings_source for token in ['settingsChip("FFmpeg"', 'settingsChip("AVPlayer"', 'settingsChip("VLC"', 'Picker("原画播放内核"', 'FFmpegDecodeValidationView', 'isValidatingFFmpeg']),
       "Shipping UI has no manual engine or validation route")
+check("model.select(source,autoplay:false,resumeAt:position)" in player_source,
+      "Compatibility fallback prepares at the real position without momentary autoplay")
 check("FFmpegDecodeSession.swift" not in project_source and "FFmpegDecodeValidationView.swift" not in project_source,
       "Deleted diagnostic pages have no shipping target references")
 

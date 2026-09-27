@@ -325,10 +325,10 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
     }
   }
 
-  func select(_ source: VideoSource, external: Bool = false) async {
+  func select(_ source: VideoSource, external: Bool = false, autoplay: Bool = true, resumeAt: Double? = nil) async {
     externallyControlled = external
     didFallbackFromOriginal = false
-    await play(source, allowFallback: true)
+    await play(source, allowFallback: true, autoplay:autoplay, resumeAt:resumeAt)
     if !externallyControlled { installTimeObserverIfNeeded() }
   }
 
@@ -628,13 +628,13 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
     max(PlaybackBufferPolicy.contiguousEnd(at: currentTime, ranges: bufferedRanges) - currentTime, 0)
   }
 
-  private func play(_ source: VideoSource, allowFallback: Bool) async {
+  private func play(_ source: VideoSource, allowFallback: Bool, autoplay: Bool = true, resumeAt: Double? = nil) async {
     cancelInteractiveScrub()
     bufferedRanges = []
     bufferedUntil = 0
     selectedSource = source
     hasPlayedCurrentItem = false
-    pendingInitialPosition = libraryStore.resumePosition(for: item)
+    pendingInitialPosition = resumeAt.flatMap { $0.isFinite ? max(0,$0) : nil } ?? libraryStore.resumePosition(for: item)
     engineSwitchReason = nil
     engineSwitchResumePosition = nil
     bufferingStartedAt = nil
@@ -642,7 +642,7 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
     sustainedStalls = []
     bufferStallCount = 0
     preferredBufferSeconds = 0
-    wantsPlayback = true
+    wantsPlayback = autoplay
     errorMessage = nil
     didReachEnd = false
     isBuffering = true
@@ -723,21 +723,21 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
     installItemObservers(for: playerItem)
     player.replaceCurrentItem(with: playerItem)
 
-    let resumePosition = libraryStore.resumePosition(for: item)
-    if resumePosition > 2, duration <= 0 || resumePosition < duration - 15 {
+    let resumePosition = pendingInitialPosition
+    if resumeAt != nil || (resumePosition > 2 && (duration <= 0 || resumePosition < duration - 15)) {
       currentTime = resumePosition
       player.seek(
         to: CMTime(seconds: resumePosition, preferredTimescale: 600),
-        toleranceBefore: CMTime(seconds: 1, preferredTimescale: 600),
-        toleranceAfter: CMTime(seconds: 1, preferredTimescale: 600)
+        toleranceBefore: resumeAt == nil ? CMTime(seconds: 1, preferredTimescale: 600) : .zero,
+        toleranceAfter: resumeAt == nil ? CMTime(seconds: 1, preferredTimescale: 600) : .zero
       ) { _ in }
     } else {
       currentTime = 0
     }
-    player.play()
+    if autoplay { player.play() }
     configureTimelinePreviewSource()
-    isPlaying = true
-    isBuffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
+    isPlaying = autoplay
+    isBuffering = autoplay && player.timeControlStatus == .waitingToPlayAtSpecifiedRate
 
     let generation = mediaInfoGeneration
     Task { @MainActor [weak self] in

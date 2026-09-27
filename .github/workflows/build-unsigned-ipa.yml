@@ -66,9 +66,9 @@ jobs:
       - name: Build iPhone app without signing
         run: |
           set -euo pipefail
-          # Exercise the production buffering policy with synthetic time before
+          # Retain legacy buffer assertions with synthetic time before
           # compiling iOS. No extra workflow, regression job or test artifact.
-          cat Gallery115/PlayerCore/DiagnosticBufferPolicy.swift > "$RUNNER_TEMP/buffer-policy.swift"
+          cat Tests/PlayerTransport/DiagnosticBufferPolicy.swift > "$RUNNER_TEMP/buffer-policy.swift"
           cat >> "$RUNNER_TEMP/buffer-policy.swift" <<'SWIFT'
           var policy = DiagnosticBufferPolicy()
           var checks = 0

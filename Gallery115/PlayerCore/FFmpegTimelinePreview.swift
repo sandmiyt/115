@@ -67,9 +67,13 @@ actor FFmpegPreviewWorker {
     // need more work, but never monopolizes the worker or resets the main engine.
     while !ended && !Task.isCancelled && ProcessInfo.processInfo.systemUptime-began<5 {
       var snapshot=CinevaFFmpegSnapshot(); CinevaFFmpegSessionSnapshot(handle.pointer,&snapshot)
+      if snapshot.serial != serial { serial=snapshot.serial; cursor=snapshot.recoveryTarget }
       if snapshot.status<0 { self.handle=nil; return result(nil,"预览读取失败（\(snapshot.errorCode)），播放不受影响") }
       var pts=0.0,duration=0.0,generation:Int32=0
       if let pixel=CinevaFFmpegSessionCopyFrame(handle.pointer,&pts,&duration,&generation) {
+        // The first frame may arrive between the earlier snapshot and dequeue.
+        CinevaFFmpegSessionSnapshot(handle.pointer,&snapshot)
+        serial=snapshot.serial
         guard generation==serial else { continue }
         cursor=pts+abs(duration)
         if cursor<=target && !tailFallback { continue }

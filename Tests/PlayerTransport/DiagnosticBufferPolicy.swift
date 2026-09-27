@@ -1,6 +1,6 @@
 import Foundation
 
-/// Only used by the experimental FFmpeg validation session. All units are seconds.
+/// Retained legacy buffer-policy assertions. Not linked into the shipping app.
 struct DiagnosticBufferPolicy {
   let startupBufferTarget = 0.75
   private(set) var rebufferTarget = 2.0

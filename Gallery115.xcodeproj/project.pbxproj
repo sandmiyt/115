@@ -42,7 +42,6 @@
 		B50720260927000000000002 /* FFmpegPlayerEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = F50720260927000000000002 /* FFmpegPlayerEngine.swift */; };
 		B50720260927000000000003 /* NativeAudioRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = F50720260927000000000003 /* NativeAudioRenderer.swift */; };
 		B50720260927000000000004 /* FFmpegPlayerSurface.swift in Sources */ = {isa = PBXBuildFile; fileRef = F50720260927000000000004 /* FFmpegPlayerSurface.swift */; };
-		922F2A6B13434AFDB8F02F01 /* DiagnosticBufferPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 922F2A6B13434AFDB8F02F02 /* DiagnosticBufferPolicy.swift */; };
 		1561BE576F784771041017BE /* PlaybackPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4C4AD432C55E4C6BE28F327 /* PlaybackPolicy.swift */; };
 		A619AF983110441A96300F15 /* NativeVideoRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACFE059152C54351BE512502 /* NativeVideoRenderer.swift */; };
 		9CA51D6A583CB00AC6189E50 /* FFmpegTimelinePreview.swift in Sources */ = {isa = PBXBuildFile; fileRef = 032C06D4B612338B5F7000D8 /* FFmpegTimelinePreview.swift */; };
@@ -86,7 +85,6 @@
 		F50720260927000000000002 /* FFmpegPlayerEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "PlayerCore/FFmpegPlayerEngine.swift"; sourceTree = "<group>"; };
 		F50720260927000000000003 /* NativeAudioRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "PlayerCore/NativeAudioRenderer.swift"; sourceTree = "<group>"; };
 		F50720260927000000000004 /* FFmpegPlayerSurface.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Player/FFmpegPlayerSurface.swift"; sourceTree = "<group>"; };
-		922F2A6B13434AFDB8F02F02 /* DiagnosticBufferPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "PlayerCore/DiagnosticBufferPolicy.swift"; sourceTree = "<group>"; };
 		A4C4AD432C55E4C6BE28F327 /* PlaybackPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "PlayerCore/PlaybackPolicy.swift"; sourceTree = "<group>"; };
 		ACFE059152C54351BE512502 /* NativeVideoRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "PlayerCore/NativeVideoRenderer.swift"; sourceTree = "<group>"; };
 		032C06D4B612338B5F7000D8 /* FFmpegTimelinePreview.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "PlayerCore/FFmpegTimelinePreview.swift"; sourceTree = "<group>"; };
@@ -115,7 +113,6 @@
 			F50720260927000000000002 /* FFmpegPlayerEngine.swift */,
 			F50720260927000000000003 /* NativeAudioRenderer.swift */,
 			F50720260927000000000004 /* FFmpegPlayerSurface.swift */,
-			922F2A6B13434AFDB8F02F02 /* DiagnosticBufferPolicy.swift */,
 			A4C4AD432C55E4C6BE28F327 /* PlaybackPolicy.swift */,
 			ACFE059152C54351BE512502 /* NativeVideoRenderer.swift */,
 			49208E12BD7D72D7A072D03B /* PlayerModel.swift */,
@@ -198,7 +195,6 @@
 			B50720260927000000000002 /* FFmpegPlayerEngine.swift in Sources */,
 			B50720260927000000000003 /* NativeAudioRenderer.swift in Sources */,
 			B50720260927000000000004 /* FFmpegPlayerSurface.swift in Sources */,
-			922F2A6B13434AFDB8F02F01 /* DiagnosticBufferPolicy.swift in Sources */,
 			1561BE576F784771041017BE /* PlaybackPolicy.swift in Sources */,
 			A619AF983110441A96300F15 /* NativeVideoRenderer.swift in Sources */,
 			552EA1BE15BB2B70FD49DF66 /* PlayerModel.swift in Sources */,
