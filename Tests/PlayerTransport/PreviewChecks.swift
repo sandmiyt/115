@@ -128,7 +128,9 @@ import CoreImage
         for _ in 0..<500 where abs(timeline.display.imageTime-301.125)>0.1 { try? await Task.sleep(for:.milliseconds(10)) }
         expect(timeline.display.image != nil && abs(timeline.display.imageTime-301.125)<0.1,"Cancelled/old drag cannot overwrite a new drag")
         timeline.finish(keepOverlay:true)
-        for target in [0.0,330.0,650.0,10.0,500.0] {
+        // Include targets between keyframes so the main A/V path must preroll,
+        // not merely land on the five-second GOP boundaries of this fixture.
+        for target in [0.0,330.731,650.517,10.333,500.917] {
           let began=ProcessInfo.processInfo.systemUptime
           let generation=CinevaFFmpegSessionSeek(localHandle.pointer,target)
           var gotVideo=false,gotPCM=false
