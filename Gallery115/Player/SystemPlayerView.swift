@@ -364,7 +364,9 @@ struct TimelinePreviewOverlay: View {
         .background(.black)
         .clipped()
         .overlay(alignment: .topLeading) {
-          Text("目标 \(PlaybackPolicy.timestamp(previews.requestedPreviewTime)) · 画面 \(PlaybackPolicy.timestamp(previews.imageTime))" + (previews.previewNote.map { " · " + $0 } ?? ""))
+          Text(previews.previewNote.map {
+            "目标 \(PlaybackPolicy.timestamp(previews.requestedPreviewTime)) · 画面 \(PlaybackPolicy.timestamp(previews.imageTime)) · \($0)"
+          } ?? "预览 \(PlaybackPolicy.timestamp(previews.imageTime))")
             .font(.caption.monospacedDigit())
             .padding(6)
             .background(.black.opacity(0.55), in: Capsule())
