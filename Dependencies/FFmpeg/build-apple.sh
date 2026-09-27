@@ -36,6 +36,8 @@ build_slice() {
   prefix="$WORK/$sdk/install"
   build="$WORK/$sdk/build"
   framework="$WORK/$sdk/CinevaFFmpeg.framework"
+  bash "$ROOT/../Subtitles/build-apple.sh" "$sdk" "$triple"
+  local subtitles="$ROOT/../Subtitles/Generated/$sdk/install"
   mkdir -p "$build" "$framework/Headers" "$framework/Modules"
   (
     cd "$build"
@@ -82,18 +84,25 @@ _CinevaFFmpegSessionCopyAudio
 _CinevaFFmpegSessionAudioTrackCount
 _CinevaFFmpegSessionAudioTrack
 _CinevaFFmpegSessionSelectAudio
+_CinevaFFmpegSessionSubtitleTrackCount
+_CinevaFFmpegSessionSubtitleTrack
+_CinevaFFmpegSessionSelectSubtitle
+_CinevaFFmpegSessionCopySubtitle
+_CinevaFFmpegSessionExternalSubtitle
+_CinevaFFmpegSessionSubtitleError
 _CinevaFFmpegCodecName
 _CinevaFFmpegErrorText
 EXPORTS
   "$compiler" -target "$triple" -isysroot "$sdkpath" -dynamiclib \
-    -std=c11 -O2 -I "$prefix/include" -I "$ROOT/Bridge" "$ROOT"/Bridge/*.c \
+    -std=c11 -O2 -I "$prefix/include" -I "$subtitles/include" -I "$ROOT/Bridge" "$ROOT"/Bridge/*.c \
     "${libs[@]}" -Wl,-exported_symbols_list,"$build/exports.txt" \
     -Wl,-install_name,@rpath/CinevaFFmpeg.framework/CinevaFFmpeg \
     -Wl,-compatibility_version,8.0 -Wl,-current_version,8.0.2 \
     -framework Foundation -framework CoreFoundation -framework CoreMedia \
     -framework CoreVideo -framework VideoToolbox -framework AudioToolbox \
     -framework CoreAudio -framework Security -framework QuartzCore \
-    -lz -lbz2 -liconv -lresolv -lm \
+    "$subtitles/lib/libass.a" "$subtitles/lib/libharfbuzz.a" "$subtitles/lib/libfreetype.a" "$subtitles/lib/libfribidi.a" \
+    -framework CoreText -framework CoreGraphics -lc++ -lz -lbz2 -liconv -lresolv -lm \
     -o "$framework/CinevaFFmpeg"
   xcrun nm -gjU "$framework/CinevaFFmpeg" > "$build/actual-exports.txt"
   if grep -Ev '^_CinevaFFmpeg[A-Za-z]+$' "$build/actual-exports.txt"; then
@@ -122,6 +131,7 @@ PLIST
   cp "$0" "$framework/FFmpeg-build.sh"
   cp -R "$ROOT/Bridge" "$framework/BridgeSource"
   cp -R "$ROOT/Patches" "$framework/Patches"
+  cp -R "$subtitles/provenance" "$framework/SubtitleSources"
   printf 'FFmpeg %s\nUpstream SHA256: %s\nSource modifications: bundled Patches/require-hardware.patch\n' "$VERSION" "$SHA256" > "$framework/FFmpeg-provenance.txt"
 }
 

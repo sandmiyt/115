@@ -1,5 +1,6 @@
 #include "CinevaFFmpeg.h"
 #include "CinevaVideoOutput.h"
+#include "CinevaSubtitles.h"
 #include <libavutil/hwcontext.h>
 #include <libavutil/pixdesc.h>
 #include <VideoToolbox/VideoToolbox.h>
@@ -76,6 +77,7 @@ struct CinevaFFmpegSession {
     int frameHead, frameCount;
     double frameSeconds;
     CinevaFFmpegSnapshot snapshot;
+    CinevaSubtitles *subtitles;
 };
 
 static int interrupted(void *opaque) {
@@ -752,6 +754,10 @@ static void *readLoop(void *opaque) {
     atomic_store(&s->wantedAudioIndex,s->audioIndex);
     s->origin = s->format->start_time != AV_NOPTS_VALUE ? (double)s->format->start_time / AV_TIME_BASE :
         (video->start_time != AV_NOPTS_VALUE ? video->start_time * av_q2d(video->time_base) : 0);
+    if(s->options.outputAudio && !s->videoOnly) {
+        CinevaSubtitles *subtitles=cineva_sub_create(s->format,s->origin);
+        pthread_mutex_lock(&s->mutex); s->subtitles=subtitles; pthread_mutex_unlock(&s->mutex);
+    }
     if (s->audio) {
         s->hasAudioWorker = 1;
         if (pthread_create(&s->audioWorker,NULL,audioDecodeLoop,s)) {
@@ -779,12 +785,14 @@ static void *readLoop(void *opaque) {
             if (!s->videoOnly) {
                 s->audioIndex=atomic_load(&s->wantedAudioIndex);
                 for (unsigned i=0;i<s->format->nb_streams;i++)
-                    s->format->streams[i]->discard=((int)i==s->videoIndex || (int)i==s->audioIndex)?AVDISCARD_DEFAULT:AVDISCARD_ALL;
+                    s->format->streams[i]->discard=((int)i==s->videoIndex || (int)i==s->audioIndex ||
+                        (int)i==cineva_sub_index(s->subtitles))?AVDISCARD_DEFAULT:AVDISCARD_ALL;
                 pthread_mutex_lock(&s->mutex); s->snapshot.selectedAudioIndex=s->audioIndex; pthread_mutex_unlock(&s->mutex);
             }
             pthread_mutex_lock(&s->mutex);
             target = s->target;
             clearQueues(s);
+            cineva_sub_reset(s->subtitles,wanted);
             if (!atomic_load(&s->cancelled)) s->snapshot.status = 1;
             pthread_cond_broadcast(&s->changed);
             pthread_mutex_unlock(&s->mutex);
@@ -841,6 +849,9 @@ static void *readLoop(void *opaque) {
             putPacket(s, (Packet){NULL, serial, 1, 0, target}); eof = 1; continue;
         }
         if (result < 0) { av_packet_free(&packet); goto done; }
+        if (packet->stream_index == cineva_sub_index(s->subtitles)) {
+            cineva_sub_put(s->subtitles,packet,serial); av_packet_free(&packet); continue;
+        }
         if (packet->stream_index != s->videoIndex && packet->stream_index != s->audioIndex) {
             av_packet_free(&packet); continue;
         }
@@ -921,6 +932,7 @@ void CinevaFFmpegSessionCancel(CinevaFFmpegSession *s) {
 void CinevaFFmpegSessionDestroy(CinevaFFmpegSession *s) {
     CinevaFFmpegSessionCancel(s);
     if (s->hasReader) pthread_join(s->reader, NULL);
+    cineva_sub_destroy(s->subtitles);
     clearQueues(s);
     sws_freeContext(s->scale);
     swr_free(&s->resampler); av_channel_layout_uninit(&s->inputLayout);
@@ -1010,6 +1022,25 @@ CVPixelBufferRef CinevaFFmpegSessionCopyFrame(CinevaFFmpegSession *s, double *pt
     return result;
 }
 const char *CinevaFFmpegCodecName(int codec) { return avcodec_get_name(codec); }
+static CinevaSubtitles *subtitles(CinevaFFmpegSession *s) {
+    pthread_mutex_lock(&s->mutex); CinevaSubtitles *value=s->subtitles; pthread_mutex_unlock(&s->mutex); return value;
+}
+int CinevaFFmpegSessionSubtitleTrackCount(CinevaFFmpegSession *s) { return cineva_sub_count(subtitles(s)); }
+int CinevaFFmpegSessionSubtitleTrack(CinevaFFmpegSession *s,int ordinal,CinevaFFmpegSubtitleTrack *track) {
+    return cineva_sub_track(subtitles(s),ordinal,track);
+}
+int CinevaFFmpegSessionSubtitleError(CinevaFFmpegSession *s) { return cineva_sub_error(subtitles(s)); }
+int CinevaFFmpegSessionSelectSubtitle(CinevaFFmpegSession *s,int index) {
+    if(cineva_sub_select(subtitles(s),index)<0) return -1;
+    pthread_mutex_lock(&s->mutex); double position=s->playbackPosition; pthread_mutex_unlock(&s->mutex);
+    return CinevaFFmpegSessionSeek(s,position);
+}
+CVPixelBufferRef CinevaFFmpegSessionCopySubtitle(CinevaFFmpegSession *s,double time,int serial,int *changed) {
+    CVPixelBufferRef pixel=NULL; *changed=cineva_sub_render(subtitles(s),time,serial,&pixel); return pixel;
+}
+int CinevaFFmpegSessionExternalSubtitle(CinevaFFmpegSession *s,const uint8_t *data,int size,const char *format) {
+    return cineva_sub_external(subtitles(s),data,size,format);
+}
 int CinevaFFmpegSessionAudioTrackCount(CinevaFFmpegSession *s) {
     pthread_mutex_lock(&s->mutex); int count=s->trackCount; pthread_mutex_unlock(&s->mutex); return count;
 }

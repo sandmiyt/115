@@ -5,7 +5,7 @@ import UIKit
 
 /// Owns one native session. Cancellation is immediate; joining workers and
 /// freeing FFmpeg objects never blocks SwiftUI or a display-link callback.
-final class FFmpegSessionHandle {
+final class FFmpegSessionHandle: @unchecked Sendable {
   let pointer: OpaquePointer
   let io: RangeCoordinator?
   init(_ pointer: OpaquePointer, io: RangeCoordinator? = nil) { self.pointer = pointer; self.io = io }

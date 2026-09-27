@@ -73,6 +73,15 @@ typedef struct {
     int selectedAudioIndex;
 } CinevaFFmpegSnapshot;
 typedef struct { int index, codec, channels, sampleRate; char language[32], title[128]; } CinevaFFmpegAudioTrack;
+typedef struct { int index, codec; char language[32], title[128]; } CinevaFFmpegSubtitleTrack;
+int CinevaFFmpegSessionSubtitleTrackCount(CinevaFFmpegSession * _Nonnull session);
+int CinevaFFmpegSessionSubtitleTrack(CinevaFFmpegSession * _Nonnull session, int ordinal, CinevaFFmpegSubtitleTrack * _Nonnull track);
+int CinevaFFmpegSessionSelectSubtitle(CinevaFFmpegSession * _Nonnull session, int streamIndex);
+int CinevaFFmpegSessionSubtitleError(CinevaFFmpegSession * _Nonnull session);
+CVPixelBufferRef _Nullable CinevaFFmpegSessionCopySubtitle(CinevaFFmpegSession * _Nonnull session,
+    double time, int serial, int * _Nonnull changed) CF_RETURNS_RETAINED;
+int CinevaFFmpegSessionExternalSubtitle(CinevaFFmpegSession * _Nonnull session,
+    const uint8_t * _Nonnull data, int length, const char * _Nonnull format);
 int CinevaFFmpegSessionAudioTrackCount(CinevaFFmpegSession * _Nonnull session);
 int CinevaFFmpegSessionAudioTrack(CinevaFFmpegSession * _Nonnull session, int ordinal, CinevaFFmpegAudioTrack * _Nonnull track);
 int CinevaFFmpegSessionSelectAudio(CinevaFFmpegSession * _Nonnull session, int streamIndex);

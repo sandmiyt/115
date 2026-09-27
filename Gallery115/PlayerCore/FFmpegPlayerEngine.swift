@@ -1,6 +1,7 @@
 import AVFoundation
 import CinevaFFmpeg
 import CryptoKit
+import CoreImage
 import Observation
 import UIKit
 
@@ -26,9 +27,15 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   private(set) var audioUnderruns = 0
   private(set) var rebufferCount = 0
   private(set) var audioTracks: [PlayerTrack] = []
-  var subtitleTracks: [PlayerTrack] { [] } // Embedded subtitle capability is reported separately until implemented.
+  private(set) var subtitleTracks: [PlayerTrack] = []
   private(set) var selectedAudioOptionID: String?
-  var selectedSubtitleOptionID: String? { nil }
+  private(set) var selectedSubtitleOptionID: String?
+  private(set) var subtitleImage: UIImage?
+  private(set) var subtitleWarning: String?
+  var subtitleDelay = 0.0
+  @ObservationIgnored private var subtitleEpoch = UUID()
+  @ObservationIgnored private var subtitleTask: Task<Void,Never>?
+  @ObservationIgnored private var lastSubtitleRender = 0.0
   private(set) var isInteractiveScrubLoading = false
   let renderer = NativeVideoRenderer()
   private(set) var audio = NativeAudioRenderer()
@@ -85,6 +92,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     wantsPlayback=playing; waiting=true; resumeTarget=0.75; serial=1
     rebufferCount=0; audioUnderruns=0; firstFrameAt=nil
     audioTracks=[]; selectedAudioOptionID=nil; audioTail=false; restoredAudioPreference=false
+    subtitleTracks=[]; selectedSubtitleOptionID=nil; subtitleWarning=nil
     errorMessage=nil; startAt=CACurrentMediaTime(); waitStarted=startAt
     lastPublished=0; lastNetworkAt=startAt; lastNetworkBytes=0
     duration=item.duration; playbackState = .preparing
@@ -127,6 +135,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     RunLoop.main.add(timer,forMode:.common); ticker=timer
   }
   func stop() {
+    resetSubtitleImage()
     interruptTrial("提前停止 / 切换模式")
     pip?.stop()
     scrubTask?.cancel(); scrubTask=nil
@@ -150,12 +159,20 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     } else { playbackState = .buffering }
   }
   func togglePlayback() { wantsPlayback ? pause() : resume() }
+  func clearSegmentCache() {
+    guard let source=currentSource, let item=sourceItem, let api, let library else { return }
+    let position=currentTime, playing=wantsPlayback, record=recordsHistory
+    stop()
+    SegmentDiskCache.shared.clear()
+    start(source:source,item:item,api:api,library:library,at:position,playing:playing,recordsHistory:record)
+  }
   func setPlaybackRate(_ value: Float) {
     rate=min(2,max(0.5,value)); audio.setRate(rate)
     renderer.alignClock(to:currentTime,rate:Double(rate),running:isPlaying)
   }
   func setVolume(_ value: Float) { volume=min(1,max(0,value)); audio.setVolume(volume) }
   func seek(to seconds: Double) {
+    resetSubtitleImage()
     interruptTrial("含手动定位，观察窗口未完成")
     guard let handle, seconds.isFinite else { return }
     target=min(max(0,seconds),duration>0 ? max(0,duration-0.01) : max(0,seconds))
@@ -194,9 +211,49 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     }
   }
   func selectSubtitle(_ id: String?) {
-    // Normal-screen sidecar selection is already owned by PlayerScreen. Never
-    // claim an embedded track was selected when no subtitle decoder owns it.
-    if id != nil { errorMessage="此内封字幕尚未接入 FFmpeg；请选择兼容内核。" }
+    guard let handle else { return }
+    let index=id.flatMap(Int32.init) ?? -1
+    let next=CinevaFFmpegSessionSelectSubtitle(handle.pointer,index)
+    guard next>0 else { subtitleWarning="字幕轨无法选择"; return }
+    selectedSubtitleOptionID=id; subtitleWarning=nil; resetSubtitleImage()
+    audio.pause(); renderer.setPlaying(false)
+    serial=next; target=currentTime; audio.reset(to:target,generation:next); renderer.reset(to:target)
+    pending=nil; waiting=true; resumeTarget=0.75; waitStarted=CACurrentMediaTime(); audioTail=false
+    playbackState = .seeking
+  }
+  private func resetSubtitleImage() {
+    subtitleEpoch=UUID(); subtitleTask?.cancel(); subtitleTask=nil; subtitleImage=nil; lastSubtitleRender=0
+  }
+  func loadExternalSubtitle(data: Data, fileExtension: String) async throws {
+    guard let handle else { throw URLError(.resourceUnavailable) }
+    guard data.count<=4*1024*1024,
+      let text=String(data:data,encoding:.utf8) ?? String(data:data,encoding:.utf16) ?? String(data:data,encoding:.windowsCP1252)
+    else { throw URLError(.cannotDecodeContentData) }
+    let normalized=Data(text.utf8), epoch=subtitleEpoch
+    let result=await Task.detached(priority:.utility) {
+      normalized.withUnsafeBytes { bytes in
+        fileExtension.lowercased().withCString {
+          CinevaFFmpegSessionExternalSubtitle(handle.pointer,bytes.bindMemory(to:UInt8.self).baseAddress!,Int32(normalized.count),$0)
+        }
+      }
+    }.value
+    guard epoch==subtitleEpoch, self.handle === handle else { throw CancellationError() }
+    guard result>=0 else { subtitleWarning="外挂字幕解析失败（\(result)）"; throw URLError(.cannotDecodeContentData) }
+    subtitleWarning=nil; selectedSubtitleOptionID=nil; subtitleImage=nil
+  }
+  private func renderSubtitle(now: Double) {
+    guard subtitleTask==nil, now-lastSubtitleRender>=0.1, let handle else { return }
+    lastSubtitleRender=now
+    let time=currentTime-subtitleDelay, generation=serial, epoch=subtitleEpoch
+    subtitleTask=Task { @MainActor [weak self] in
+      let output=await Task.detached(priority:.utility) {
+        FFmpegSubtitleImages.render(handle:handle,time:time,serial:generation)
+      }.value
+      guard let self, self.subtitleEpoch==epoch, self.handle === handle else { return }
+      self.subtitleTask=nil
+      if output.changed { self.subtitleImage=output.image }
+      if output.error<0 { self.subtitleWarning="字幕解码 / 队列受限（\(output.error)）；音视频继续播放" }
+    }
   }
   private func fail(_ message: String) {
     interruptTrial("播放失败，观察窗口未完成")
@@ -259,6 +316,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
       fail(snapshot.errorCode == -70001 ? "检测到 Dolby Vision，当前 FFmpeg 路径未实现动态元数据输出，请使用兼容内核。" : "FFmpeg 阶段 \(snapshot.failureStage)：\(String(cString:message))（\(snapshot.errorCode)）"); return
     }
     if snapshot.serial != serial {
+      resetSubtitleImage()
       serial=snapshot.serial; target=snapshot.recoveryTarget
       audio.reset(to:target,generation:serial); renderer.reset(to:target); pending=nil
       waiting=true; waitStarted=now; resumeTarget=0.75
@@ -338,6 +396,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
       pause(); playbackState = .ended; saveProgress(force:true)
     }
     if !wantsPlayback, firstFrameAt != nil { playbackState = .paused }
+    renderSubtitle(now:now)
     if now-lastPublished>=0.25 {
       lastPublished=now
       if hasAudio, !waiting, wantsPlayback { renderer.disciplineClock(to:audio.audibleTime,rate:Double(rate)) }
@@ -355,6 +414,15 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
         tracks.append(PlayerTrack(id:String(track.index),title:"\(title.isEmpty ? language : title) · \(track.channels)ch · \(String(cString:CinevaFFmpegCodecName(track.codec)))",kind:.audio,language:language))
       }
       audioTracks=tracks; selectedAudioOptionID=String(snapshot.selectedAudioIndex)
+      var subtitles:[PlayerTrack]=[]
+      for ordinal in 0..<CinevaFFmpegSessionSubtitleTrackCount(handle.pointer) {
+        var track=CinevaFFmpegSubtitleTrack()
+        if CinevaFFmpegSessionSubtitleTrack(handle.pointer,ordinal,&track)==0 { continue }
+        let language=withUnsafeBytes(of:track.language) { String(decoding:$0.prefix { $0 != 0 },as:UTF8.self) }
+        let title=withUnsafeBytes(of:track.title) { String(decoding:$0.prefix { $0 != 0 },as:UTF8.self) }
+        subtitles.append(PlayerTrack(id:String(track.index),title:"\(title.isEmpty ? language : title) · \(String(cString:CinevaFFmpegCodecName(track.codec)))",kind:.subtitle,language:language))
+      }
+      subtitleTracks=subtitles
       if !restoredAudioPreference, snapshot.status==1, hasAudio, !tracks.isEmpty, let item=sourceItem {
         restoredAudioPreference=true
         if let saved=UserDefaults.standard.string(forKey:"cineva.ffmpeg.audio."+item.id), saved != selectedAudioOptionID,
@@ -389,5 +457,19 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
         + (io.map { "HTTP requests \($0.requests) · 200/206/416 \($0.responses200)/\($0.responses206)/\($0.responses416) · 网络 bytes \($0.networkBytes)\n内存命中字节 \($0.memoryHitBytes) · 磁盘命中字节 \($0.diskHitBytes) · miss \($0.misses) · refresh \($0.refreshes)\n\($0.lastError ?? "")" } ?? "HTTP 请求数不可获得")
       saveProgress()
     }
+  }
+}
+
+private enum FFmpegSubtitleImages {
+  struct Result: @unchecked Sendable { let changed: Bool; let image: UIImage?; let error: Int32 }
+  static let context=CIContext(options:[.cacheIntermediates:false])
+  static func render(handle:FFmpegSessionHandle,time:Double,serial:Int32) -> Result {
+    var changed:Int32=0
+    let pixel=CinevaFFmpegSessionCopySubtitle(handle.pointer,time,serial,&changed)
+    let error=CinevaFFmpegSessionSubtitleError(handle.pointer)
+    guard let pixel else { return Result(changed:changed != 0,image:nil,error:error) }
+    let source=CIImage(cvPixelBuffer:pixel)
+    let image=context.createCGImage(source,from:source.extent).map { UIImage(cgImage:$0) }
+    return Result(changed:changed != 0,image:image,error:error)
   }
 }

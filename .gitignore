@@ -12,3 +12,4 @@ cineva-auth-server/.env
 cineva-auth-server/*.sqlite3
 
 Dependencies/FFmpeg/Generated/
+Dependencies/Subtitles/Generated/

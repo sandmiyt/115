@@ -7,13 +7,17 @@ struct FFmpegPlayerSurface: UIViewRepresentable {
   func makeUIView(context: Context) -> Surface {
     let view=Surface(); view.engine=engine
     view.layer.addSublayer(engine.renderer.layer)
+    view.addSubview(view.subtitles)
     return view
   }
   func updateUIView(_ view: Surface, context: Context) {
     engine.renderer.layer.videoGravity=layout.gravity
+    view.subtitles.image=engine.subtitleImage
+    view.subtitles.contentMode=layout.gravity == .resizeAspectFill ? .scaleAspectFill : layout.gravity == .resize ? .scaleToFill : .scaleAspectFit
     view.setNeedsLayout()
   }
   final class Surface: UIView {
+    let subtitles=UIImageView()
     weak var engine: FFmpegPlayerEngine?
     override func layoutSubviews() {
       super.layoutSubviews()
@@ -25,6 +29,10 @@ struct FFmpegPlayerSurface: UIViewRepresentable {
       layer.bounds=CGRect(origin:.zero,size:quarter ? CGSize(width:bounds.height,height:bounds.width) : bounds.size)
       layer.position=CGPoint(x:bounds.midX,y:bounds.midY)
       layer.setAffineTransform(CGAffineTransform(rotationAngle:angle))
+      subtitles.transform = .identity
+      subtitles.bounds=layer.bounds; subtitles.center=layer.position
+      subtitles.transform=CGAffineTransform(rotationAngle:angle)
+      subtitles.clipsToBounds=true
       CATransaction.commit()
     }
   }

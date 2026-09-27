@@ -1312,6 +1312,9 @@ struct PlayerScreen: View {
               if useFFmpeg {
                 Text(ffmpegEngine.diagnostics).font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
                 Button("复制 FFmpeg 播放诊断") { UIPasteboard.general.string=ffmpegEngine.diagnostics }
+                Button("清空 FFmpeg 分段缓存并重新读取") { ffmpegEngine.clearSegmentCache() }
+                if let failure=ffmpegEngine.pip?.failure { Text(failure).font(.caption).foregroundStyle(.orange) }
+                if let warning=ffmpegEngine.subtitleWarning { Text(warning).font(.caption).foregroundStyle(.orange) }
               }
             }
             settingsSpeedSection(model: model)
@@ -2175,6 +2178,7 @@ struct PlayerScreen: View {
       ffmpegEngine.start(source:source,item:currentItem,api:appState.api,library:appState.libraryStore,
         at:position,playing:playing)
       ffmpegEngine.setPlaybackRate(playbackRate); ffmpegEngine.setVolume(volume)
+      ffmpegEngine.subtitleDelay=appState.subtitleDelaySeconds
     case .vlc:
       model.suspendForExternalEngine(); useVLC=true
       vlcController.configure(source:source,item:currentItem,libraryStore:appState.libraryStore,
@@ -2202,6 +2206,7 @@ struct PlayerScreen: View {
       ffmpegEngine.start(source:source,item:currentItem,api:appState.api,library:appState.libraryStore,
         at:appState.libraryStore.resumePosition(for:currentItem))
       ffmpegEngine.setPlaybackRate(playbackRate)
+      ffmpegEngine.subtitleDelay=appState.subtitleDelaySeconds
       return
     }
     guard let source = playerModel.selectedSource else {
@@ -2507,6 +2512,12 @@ struct PlayerScreen: View {
 
     subtitleLoadTask = Task { @MainActor in
       do {
+        if useFFmpeg {
+          let data=try await appState.api.subtitleData(for:track)
+          guard !Task.isCancelled, currentItem.id==expectedID, selectedExternalSubtitleID==track.id else { return }
+          try await ffmpegEngine.loadExternalSubtitle(data:data,fileExtension:track.fileExtension)
+          return
+        }
         let cues = try await appState.api.subtitleCues(for: track)
         guard !Task.isCancelled,
           currentItem.id == expectedID,

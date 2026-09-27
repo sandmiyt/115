@@ -30,6 +30,8 @@ final class SegmentDiskCache: @unchecked Sendable {
   private let root: URL
   private var entries: [URL:(Int64,Date)] = [:]
   private var indexed = false
+  private var revision: UInt64 = 0
+  var epoch: UInt64 { queue.sync { revision } }
   private func indexIfNeeded() {
     guard !indexed else { return }; indexed=true
     let files=(try? FileManager.default.contentsOfDirectory(at:root,includingPropertiesForKeys:[.fileSizeKey,.contentModificationDateKey])) ?? []
@@ -58,9 +60,10 @@ final class SegmentDiskCache: @unchecked Sendable {
       return Data(data)
     }
   }
-  func write(_ data: Data, key: String, offset: Int64) {
+  func write(_ data: Data, key: String, offset: Int64, epoch: UInt64) {
     // Serial backpressure prevents unlimited pending page copies in the disk queue.
     queue.sync {
+      guard epoch == revision else { return }
       let fm = FileManager.default
       indexIfNeeded()
       try? fm.createDirectory(at: root, withIntermediateDirectories: true)
@@ -78,7 +81,10 @@ final class SegmentDiskCache: @unchecked Sendable {
       }
     }
   }
-  func clear() { queue.sync { try? FileManager.default.removeItem(at: root); entries.removeAll(); indexed=false } }
+  func clear() { queue.sync {
+    revision &+= 1
+    try? FileManager.default.removeItem(at: root); entries.removeAll(); indexed=false
+  } }
 }
 
 /// Synchronous AVIO callers wait only on a dedicated demux worker. URLSession's
@@ -106,6 +112,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
   private let memoryLimit = 32 * 1024 * 1024
   private let identity: RangeCacheIdentity
   private let disk: SegmentDiskCache
+  private let diskEpoch: UInt64
   private let persistent: Bool
   private let refresh: Refresh?
   private var source: VideoSource
@@ -124,6 +131,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
   init(source: VideoSource, identity: RangeCacheIdentity, disk: SegmentDiskCache = .shared,
        refresh: Refresh? = nil) {
     self.source = source; self.identity = identity; self.disk = disk; self.refresh = refresh
+    diskEpoch=disk.epoch
     length = identity.size > 0 ? identity.size : -1
     persistent = !identity.validator.isEmpty && identity.size > 0
     super.init()
@@ -160,8 +168,9 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
   func read(offset: Int64, buffer: UnsafeMutablePointer<UInt8>, count: Int, generation wanted: Int32) -> Int32 {
     guard offset >= 0, count > 0 else { return -1 }
     let base = offset / page * page
-    let deadline = Date().addingTimeInterval(12)
+    let deadline = Date().addingTimeInterval(9)
     var attempts = 0
+    var observedFlights = Set<Int>()
     var checkedDisk = false
     condition.lock()
     defer { condition.unlock() }
@@ -192,6 +201,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
       }
       if Date() >= deadline { stats.lastError = "Range 读取超时"; return -2 }
       if let flight = flights.values.first(where: { $0.start <= offset && offset <= $0.end }) {
+        if let id=flight.task?.taskIdentifier, observedFlights.insert(id).inserted { stats.coalesced += 1 }
         let start = Int(offset - flight.start)
         if flight.accepted, start < flight.data.count {
           let n = min(count, flight.data.count-start)
@@ -214,13 +224,15 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
           }
           continue
         }
-        stats.coalesced += 1
       } else if !refreshing {
         // Prioritize this demand. Only two active transfer windows are retained.
         if flights.count >= 2, let old = flights.values.first(where: { $0.finished }) {
           if let id = old.task?.taskIdentifier { flights.removeValue(forKey: id) }
         }
-        if flights.count < 2 { startFlight(at: base, generation: wanted) }
+        if flights.count < 2 {
+          let id=startFlight(at:base,generation:wanted)
+          observedFlights.insert(id)
+        }
       }
       _ = condition.wait(until: min(deadline, Date().addingTimeInterval(0.1)))
     }
@@ -234,7 +246,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
       order.removeFirst()
     }
   }
-  private func startFlight(at start: Int64, generation: Int32) {
+  private func startFlight(at start: Int64, generation: Int32) -> Int {
     let end = min(start / window * window + window - 1, length > 0 ? length - 1 : Int64.max)
     let flight = Flight(start: start, end: end, generation: generation)
     var request = URLRequest(url: source.url)
@@ -246,6 +258,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     flights[task.taskIdentifier] = flight
     stats.requests += 1; stats.misses += 1
     task.resume()
+    return task.taskIdentifier
   }
   private func didRefresh(_ newSource: VideoSource?) {
     condition.lock(); defer { condition.broadcast(); condition.unlock() }
@@ -342,7 +355,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
       }
     }
     condition.broadcast(); condition.unlock()
-    if persistent { for (offset,data) in pages { disk.write(data, key: identity.key, offset: offset) } }
+    if persistent { for (offset,data) in pages { disk.write(data, key: identity.key, offset: offset, epoch:diskEpoch) } }
   }
   func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
                   newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {

@@ -64,6 +64,12 @@ import Foundation
     expect(read(timeout,0)<0,"Timeout bounded failure"); timeout.close()
     expect(RangeCoordinator.contentRange("bytes 5-4/9")==nil,"Invalid range")
     expect(RangeCoordinator.contentRange("bytes 0-9/9")==nil,"End outside total")
+    let epoch=disk.epoch
+    disk.clear()
+    disk.write(Data([1,2,3]),key:"old",offset:0,epoch:epoch)
+    expect(disk.read(key:"old",offset:0,length:3)==nil,"Old download cannot repopulate cleared disk")
+    disk.write(Data([1,2,3]),key:"new",offset:0,epoch:disk.epoch)
+    expect(disk.read(key:"new",offset:0,length:3)==Data([1,2,3]),"New cache epoch accepts writes")
     print("Range transport checks passed: \(checks)")
   }
 }
