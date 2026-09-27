@@ -8,7 +8,7 @@ mkdir -p "$WORK/sources" "$PREFIX"
 fetch() {
   local archive="$1" hash="$2" url="$3"
   if [[ ! -f "$WORK/sources/$archive" ]]; then
-    curl --fail --location --retry 3 --connect-timeout 20 "$url" -o "$WORK/sources/$archive"
+    curl --fail --location --retry 3 --connect-timeout 20 --max-time 300 "$url" -o "$WORK/sources/$archive"
   fi
   echo "$hash  $WORK/sources/$archive" | shasum -a 256 -c -
   tar -xf "$WORK/sources/$archive" -C "$WORK/sources"
@@ -64,7 +64,7 @@ meson_build() {
 }
 meson_build fribidi fribidi-1.0.16 -Ddocs=false -Dbin=false -Dtests=false
 meson_build harfbuzz harfbuzz-10.2.0 -Dfreetype=enabled -Dcoretext=enabled
-meson_build libass libass-0.17.4 -Dcoretext=enabled
+meson_build libass libass-0.17.4 -Dcoretext=enabled -Dasm=enabled
 mkdir -p "$PREFIX/provenance"
 cp "$WORK/sources/"*.tar.* "$PREFIX/provenance/"
 cp "$WORK/sources/libass-0.17.4/COPYING" "$PREFIX/provenance/libass-LICENSE"

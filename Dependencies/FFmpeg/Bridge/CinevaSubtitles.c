@@ -14,6 +14,9 @@
 #define BITMAP_EVENTS 32
 typedef struct { AVPacket *packet; int serial; } SubPacket;
 typedef struct { AVSubtitle sub; double start,end; int64_t bytes; } BitmapEvent;
+typedef struct { const uint8_t *data; int size,offset; } TextInput;
+static int textRead(void *opaque,uint8_t *buffer,int count);
+static int64_t textSeek(void *opaque,int64_t offset,int whence);
 struct CinevaSubtitles {
     pthread_mutex_t lock;
     pthread_cond_t changed;
@@ -24,7 +27,7 @@ struct CinevaSubtitles {
     double origin, time;
     SubPacket packets[SUB_PACKETS];
     BitmapEvent bitmaps[BITMAP_EVENTS];
-    int bitmapCount, dirty;
+    int bitmapCount, dirty, width, height;
     AVCodecParameters *parameters[32];
     AVRational bases[32];
     CinevaFFmpegSubtitleTrack tracks[32];
@@ -32,7 +35,17 @@ struct CinevaSubtitles {
     ASS_Library *library;
     ASS_Renderer *renderer;
     ASS_Track *track;
+    AVFormatContext *externalDemux;
+    AVIOContext *externalIO;
+    TextInput input;
+    int externalEOF, externalNeedsSeek;
+    double externalReadThrough;
 };
+static void closeExternal(CinevaSubtitles *s) {
+    avformat_close_input(&s->externalDemux);
+    if(s->externalIO) { av_freep(&s->externalIO->buffer); avio_context_free(&s->externalIO); }
+    av_free((void *)s->input.data); s->input=(TextInput){0};
+}
 static const char *defaultHeader =
 "[Script Info]\nScriptType: v4.00+\nPlayResX: 1280\nPlayResY: 720\n"
 "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
@@ -119,8 +132,31 @@ static void *worker(void *opaque) {
     pthread_mutex_lock(&s->lock);
     int active=-2;
     while(!s->stop) {
-        while(!s->stop && !s->queued) pthread_cond_wait(&s->changed,&s->lock);
+        while(!s->stop && !s->queued && !(s->external==2 &&
+            (s->externalNeedsSeek || (!s->externalEOF && s->externalReadThrough<s->time+5))))
+            pthread_cond_wait(&s->changed,&s->lock);
         if(s->stop) break;
+        if(s->external==2 && s->externalDemux) {
+            if(s->externalNeedsSeek) {
+                // SUP's sparse/nonexistent index is rebuilt from bounded memory,
+                // never by downloading the video from its beginning.
+                avio_seek(s->externalIO,0,SEEK_SET); avformat_flush(s->externalDemux);
+                avcodec_flush_buffers(s->decoder); clearBitmap(s);
+                s->externalEOF=0; s->externalNeedsSeek=0; s->externalReadThrough=-INFINITY;
+            }
+            AVPacket *packet=av_packet_alloc();
+            int result=packet?av_read_frame(s->externalDemux,packet):AVERROR(ENOMEM);
+            if(result>=0) {
+                double origin=s->origin; s->origin=0; decode(s,packet); s->origin=origin;
+                if(packet->pts!=AV_NOPTS_VALUE) s->externalReadThrough=packet->pts*av_q2d(s->decoder->pkt_timebase);
+                if(s->error<0)s->externalEOF=1;
+            } else { s->externalEOF=1; if(result!=AVERROR_EOF)s->error=result; }
+            av_packet_free(&packet);
+            // Release between packets so seek/stop/render cannot be starved by
+            // scanning a sidecar after a large forward seek.
+            pthread_mutex_unlock(&s->lock); pthread_mutex_lock(&s->lock);
+            continue;
+        }
         SubPacket item=s->packets[s->head]; s->head=(s->head+1)%SUB_PACKETS; s->queued--; s->bytes-=item.packet->size;
         if(item.serial==s->serial && !s->external) {
             if(active!=s->selected || !s->decoder) { s->error=openSelected(s); active=s->selected; }
@@ -130,15 +166,17 @@ static void *worker(void *opaque) {
     }
     pthread_mutex_unlock(&s->lock); return NULL;
 }
-CinevaSubtitles *cineva_sub_create(AVFormatContext *format,double origin) {
+CinevaSubtitles *cineva_sub_create(AVFormatContext *format,double origin,int width,int height) {
     CinevaSubtitles *s=calloc(1,sizeof(*s)); if(!s) return NULL;
     pthread_mutex_init(&s->lock,NULL); pthread_cond_init(&s->changed,NULL);
     s->origin=origin; s->selected=-1; s->serial=1;
     s->library=ass_library_init();
     if(s->library) s->renderer=ass_renderer_init(s->library);
     if(!s->renderer) { cineva_sub_destroy(s); return NULL; }
-    ass_set_frame_size(s->renderer,1280,720);
-    ass_set_storage_size(s->renderer,1280,720);
+    double scale=fmin(1280.0/fmax(1,width),720.0/fmax(1,height));
+    s->width=fmax(1,lround(width*scale)); s->height=fmax(1,lround(height*scale));
+    ass_set_frame_size(s->renderer,s->width,s->height);
+    ass_set_storage_size(s->renderer,width,height);
     ass_set_cache_limits(s->renderer,1000,24);
     int64_t fontBytes=0;
     for(unsigned i=0;i<format->nb_streams;i++) {
@@ -171,6 +209,7 @@ void cineva_sub_destroy(CinevaSubtitles *s) {
     pthread_mutex_lock(&s->lock); s->stop=1; pthread_cond_broadcast(&s->changed); pthread_mutex_unlock(&s->lock);
     if(s->started) pthread_join(s->worker,NULL);
     clearPackets(s); clearBitmap(s); avcodec_free_context(&s->decoder);
+    closeExternal(s);
     for(int i=0;i<32;i++) avcodec_parameters_free(&s->parameters[i]);
     if(s->track) ass_free_track(s->track);
     if(s->renderer) ass_renderer_done(s->renderer);
@@ -180,7 +219,8 @@ void cineva_sub_destroy(CinevaSubtitles *s) {
 void cineva_sub_reset(CinevaSubtitles *s,int serial) {
     if(!s) return;
     pthread_mutex_lock(&s->lock); s->serial=serial; clearPackets(s); clearBitmap(s);
-    avcodec_free_context(&s->decoder);
+    if(s->external==2) { s->externalNeedsSeek=1; pthread_cond_signal(&s->changed); }
+    else avcodec_free_context(&s->decoder);
     if(!s->external) makeTrack(s,NULL);
     s->dirty=1; pthread_mutex_unlock(&s->lock);
 }
@@ -189,7 +229,7 @@ int cineva_sub_select(CinevaSubtitles *s,int index) {
     pthread_mutex_lock(&s->lock);
     int found=index==-1;
     for(int i=0;i<s->count;i++) if(s->tracks[i].index==index) found=1;
-    if(found) { s->selected=index; s->external=0; s->error=0; clearPackets(s); clearBitmap(s); avcodec_free_context(&s->decoder); makeTrack(s,NULL); }
+    if(found) { closeExternal(s); s->selected=index; s->external=0; s->error=0; clearPackets(s); clearBitmap(s); avcodec_free_context(&s->decoder); makeTrack(s,NULL); }
     pthread_mutex_unlock(&s->lock); return found?0:-1;
 }
 int cineva_sub_index(CinevaSubtitles *s) { if(!s)return -1; pthread_mutex_lock(&s->lock); int n=s->selected; pthread_mutex_unlock(&s->lock); return n; }
@@ -221,6 +261,10 @@ int cineva_sub_render(CinevaSubtitles *s,double time,int serial,CVPixelBufferRef
     *pixel=NULL; if(!s || !isfinite(time))return 0;
     pthread_mutex_lock(&s->lock);
     if(s->serial!=serial) { pthread_mutex_unlock(&s->lock); return 0; }
+    if(s->external==2) {
+        if(time<s->time-0.1 || time>s->time+2) s->externalNeedsSeek=1;
+        pthread_cond_signal(&s->changed);
+    }
     s->time=time; pruneBitmaps(s,time);
     int changed=0;
     ASS_Image *images=s->track?ass_render_frame(s->renderer,s->track,(long long)(time*1000),&changed):NULL;
@@ -231,24 +275,24 @@ int cineva_sub_render(CinevaSubtitles *s,double time,int serial,CVPixelBufferRef
     for(int i=0;i<s->bitmapCount;i++) if(s->bitmaps[i].start<=time && time<s->bitmaps[i].end) bitmap=&s->bitmaps[i];
     if(!images && (!bitmap || !bitmap->sub.num_rects)) { pthread_mutex_unlock(&s->lock); return 1; }
     CVPixelBufferRef buffer=NULL;
-    if(CVPixelBufferCreate(NULL,1280,720,kCVPixelFormatType_32BGRA,NULL,&buffer)!=kCVReturnSuccess) { pthread_mutex_unlock(&s->lock); return 0; }
+    if(CVPixelBufferCreate(NULL,s->width,s->height,kCVPixelFormatType_32BGRA,NULL,&buffer)!=kCVReturnSuccess) { pthread_mutex_unlock(&s->lock); return 0; }
     CVPixelBufferLockBaseAddress(buffer,0);
     uint8_t *base=CVPixelBufferGetBaseAddress(buffer); size_t stride=CVPixelBufferGetBytesPerRow(buffer);
-    memset(base,0,stride*720);
+    memset(base,0,stride*s->height);
     for(ASS_Image *image=images;image;image=image->next) {
         int r=image->color>>24,g=(image->color>>16)&255,b=(image->color>>8)&255,alpha=255-(image->color&255);
         for(int y=0;y<image->h;y++) for(int x=0;x<image->w;x++) {
             int dx=image->dst_x+x,dy=image->dst_y+y;
-            if(dx>=0 && dx<1280 && dy>=0 && dy<720) blend(base+dy*stride+dx*4,r,g,b,(image->bitmap[y*image->stride+x]*alpha+127)/255);
+            if(dx>=0 && dx<s->width && dy>=0 && dy<s->height) blend(base+dy*stride+dx*4,r,g,b,(image->bitmap[y*image->stride+x]*alpha+127)/255);
         }
     }
     if(bitmap && s->decoder) {
-        double sx=1280.0/fmax(1,s->decoder->width),sy=720.0/fmax(1,s->decoder->height);
+        double sx=(double)s->width/fmax(1,s->decoder->width),sy=(double)s->height/fmax(1,s->decoder->height);
         for(unsigned i=0;i<bitmap->sub.num_rects;i++) {
             AVSubtitleRect *rect=bitmap->sub.rects[i];
             if(rect->type!=SUBTITLE_BITMAP || !rect->data[0] || !rect->data[1] || rect->w<=0 || rect->h<=0) continue;
             int left=fmax(0,floor(rect->x*sx)),top=fmax(0,floor(rect->y*sy));
-            int right=fmin(1280,ceil((rect->x+rect->w)*sx)),bottom=fmin(720,ceil((rect->y+rect->h)*sy));
+            int right=fmin(s->width,ceil((rect->x+rect->w)*sx)),bottom=fmin(s->height,ceil((rect->y+rect->h)*sy));
             for(int y=top;y<bottom;y++) for(int x=left;x<right;x++) {
                 int px=fmin(rect->w-1,fmax(0,(int)(x/sx)-rect->x)),py=fmin(rect->h-1,fmax(0,(int)(y/sy)-rect->y));
                 int index=rect->data[0][py*rect->linesize[0]+px];
@@ -261,15 +305,52 @@ int cineva_sub_render(CinevaSubtitles *s,double time,int serial,CVPixelBufferRef
     CVPixelBufferUnlockBaseAddress(buffer,0); *pixel=buffer;
     pthread_mutex_unlock(&s->lock); return 1;
 }
-typedef struct { const uint8_t *data; int size,offset; } TextInput;
 static int textRead(void *opaque,uint8_t *buffer,int count) {
     TextInput *input=opaque; int n=FFMIN(count,input->size-input->offset);
     if(n<=0)return AVERROR_EOF;
     memcpy(buffer,input->data+input->offset,n); input->offset+=n; return n;
 }
+static int64_t textSeek(void *opaque,int64_t offset,int whence) {
+    TextInput *input=opaque;
+    if(whence==AVSEEK_SIZE)return input->size;
+    whence&=~AVSEEK_FORCE;
+    int64_t base=whence==SEEK_SET?0:whence==SEEK_CUR?input->offset:whence==SEEK_END?input->size:-1;
+    if(base<0 || offset < -base || offset > input->size-base) return AVERROR(EINVAL);
+    input->offset=(int)(base+offset); return input->offset;
+}
 int cineva_sub_external(CinevaSubtitles *s,const uint8_t *data,int size,const char *format) {
-    if(!s || size<=0 || size>4*1024*1024)return AVERROR(EFBIG);
+    if(!s || size<=0 || size>(!strcmp(format,"sup")?8:4)*1024*1024)return AVERROR(EFBIG);
     pthread_mutex_lock(&s->lock);
+    if(!strcmp(format,"sup")) {
+        closeExternal(s);
+        s->input=(TextInput){av_memdup(data,size),size,0};
+        s->externalDemux=avformat_alloc_context(); uint8_t *buffer=av_malloc(32768);
+        s->externalIO=buffer?avio_alloc_context(buffer,32768,0,&s->input,textRead,NULL,textSeek):NULL;
+        int result=AVERROR(ENOMEM);
+        if(s->input.data && s->externalDemux && s->externalIO) {
+            s->externalDemux->pb=s->externalIO; s->externalDemux->flags|=AVFMT_FLAG_CUSTOM_IO;
+            result=avformat_open_input(&s->externalDemux,NULL,av_find_input_format("sup"),NULL);
+            if(result>=0 && !s->externalDemux->nb_streams)result=AVERROR_INVALIDDATA;
+            if(result>=0 && s->externalDemux->nb_streams) {
+                AVStream *stream=s->externalDemux->streams[0];
+                const AVCodec *codec=avcodec_find_decoder(stream->codecpar->codec_id);
+                AVCodecContext *context=codec?avcodec_alloc_context3(codec):NULL;
+                result=context?avcodec_parameters_to_context(context,stream->codecpar):AVERROR_DECODER_NOT_FOUND;
+                if(context) { context->pkt_timebase=stream->time_base; context->max_pixels=4096LL*2304; }
+                if(result>=0)result=avcodec_open2(context,codec,NULL);
+                if(result>=0) {
+                    clearPackets(s); clearBitmap(s); avcodec_free_context(&s->decoder); s->decoder=context; context=NULL;
+                    s->selected=-1; s->external=2; s->externalEOF=0; s->externalReadThrough=-INFINITY;
+                    s->externalNeedsSeek=0; s->error=0; makeTrack(s,NULL); pthread_cond_signal(&s->changed);
+                }
+                avcodec_free_context(&context);
+            }
+        } else if(!s->externalIO) av_free(buffer);
+        if(result<0) { closeExternal(s); s->external=0; s->error=result; }
+        pthread_mutex_unlock(&s->lock); return result;
+    }
+    closeExternal(s);
+    if(s->external==2) s->external=0;
     if(!strcmp(format,"srt") || !strcmp(format,"vtt")) {
         TextInput input={data,size,0};
         AVFormatContext *demux=avformat_alloc_context();
@@ -281,6 +362,7 @@ int cineva_sub_external(CinevaSubtitles *s,const uint8_t *data,int size,const ch
         demux->pb=io; demux->flags|=AVFMT_FLAG_CUSTOM_IO;
         const AVInputFormat *type=av_find_input_format(!strcmp(format,"vtt")?"webvtt":"srt");
         int result=avformat_open_input(&demux,NULL,type,NULL);
+        if(result>=0 && !demux->nb_streams) result=AVERROR_INVALIDDATA;
         if(result>=0 && demux->nb_streams>0) {
             const AVCodec *codec=avcodec_find_decoder(demux->streams[0]->codecpar->codec_id);
             AVCodecContext *context=codec?avcodec_alloc_context3(codec):NULL;

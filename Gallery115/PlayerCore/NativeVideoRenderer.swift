@@ -26,6 +26,9 @@ final class NativeVideoRenderer {
   init() {
     layer.videoGravity = .resizeAspect
     layer.backgroundColor = UIColor.black.cgColor
+    // Preserve eligible HDR pixels beyond SDR white. Attachments alone do not
+    // opt a CALayer into extended-range compositing on iOS 17+.
+    layer.wantsExtendedDynamicRangeContent = true
     CMTimebaseCreateWithSourceClock(allocator: kCFAllocatorDefault,
       sourceClock: CMClockGetHostTimeClock(), timebaseOut: &timebase)
     layer.controlTimebase = timebase

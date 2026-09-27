@@ -71,6 +71,7 @@ typedef struct {
     double audioQueuedSeconds, pcmSeconds;
     double audioDecodedTime, audioStart, audioEnd, videoStart, videoEnd;
     int selectedAudioIndex;
+    int audioProfile, atmosMetadataDetected;
 } CinevaFFmpegSnapshot;
 typedef struct { int index, codec, channels, sampleRate; char language[32], title[128]; } CinevaFFmpegAudioTrack;
 typedef struct { int index, codec; char language[32], title[128]; } CinevaFFmpegSubtitleTrack;

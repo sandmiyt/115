@@ -3,7 +3,7 @@
 #include "CinevaFFmpeg.h"
 #include <libavformat/avformat.h>
 typedef struct CinevaSubtitles CinevaSubtitles;
-CinevaSubtitles *cineva_sub_create(AVFormatContext *format, double origin);
+CinevaSubtitles *cineva_sub_create(AVFormatContext *format, double origin, int width, int height);
 void cineva_sub_destroy(CinevaSubtitles *s);
 void cineva_sub_reset(CinevaSubtitles *s, int serial);
 int cineva_sub_index(CinevaSubtitles *s);

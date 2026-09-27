@@ -32,6 +32,8 @@ struct PlayerScreen: View {
   @State private var didFFmpegFallback = false
   @State private var backendSwitchTask: Task<Void,Never>?
   @State private var backendSwitchGeneration = UUID()
+  @State private var pendingAudioPreference: PlayerTrack?
+  @State private var pendingSubtitlePreference: PlayerTrack?
   @State private var didLoadPreferredRate = false
   @State private var localMetadata: LocalMediaMetadata?
   @State private var showInfo = false
@@ -341,6 +343,21 @@ struct PlayerScreen: View {
 
   private var playbackObservedView: some View {
     playerPresentationView
+    .onChange(of:appState.subtitleDelaySeconds) { _, value in ffmpegEngine.subtitleDelay=value }
+    .onChange(of:activeTrackSelector?.audioTracks ?? []) { _, tracks in
+      guard let preference=pendingAudioPreference, !tracks.isEmpty else { return }
+      pendingAudioPreference=nil
+      if let match=tracks.first(where:{ $0.title==preference.title || (preference.language != nil && $0.language==preference.language) }) {
+        activeTrackSelector?.selectAudio(match.id)
+      }
+    }
+    .onChange(of:activeTrackSelector?.subtitleTracks ?? []) { _, tracks in
+      guard let preference=pendingSubtitlePreference, !tracks.isEmpty else { return }
+      pendingSubtitlePreference=nil
+      if let match=tracks.first(where:{ $0.title==preference.title || (preference.language != nil && $0.language==preference.language) }) {
+        activeTrackSelector?.selectSubtitle(match.id)
+      }
+    }
     .task(id: currentItem.id) {
       await prepareCurrentItem()
     }
@@ -1312,9 +1329,14 @@ struct PlayerScreen: View {
               if useFFmpeg {
                 Text(ffmpegEngine.diagnostics).font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
                 Button("复制 FFmpeg 播放诊断") { UIPasteboard.general.string=ffmpegEngine.diagnostics }
-                Button("清空 FFmpeg 分段缓存并重新读取") { ffmpegEngine.clearSegmentCache() }
+                Button("清空 FFmpeg 分段缓存并重新读取") { Task { await ffmpegEngine.clearSegmentCache() } }
                 if let failure=ffmpegEngine.pip?.failure { Text(failure).font(.caption).foregroundStyle(.orange) }
                 if let warning=ffmpegEngine.subtitleWarning { Text(warning).font(.caption).foregroundStyle(.orange) }
+                if ffmpegEngine.hasAtmosMetadata {
+                  Button("尝试系统音频输出") { switchPlaybackBackend(.apple) }
+                  Text("当前为立体声；系统能否输出空间音频取决于文件和音频设备。")
+                    .font(.caption).foregroundStyle(.secondary)
+                }
               }
             }
             settingsSpeedSection(model: model)
@@ -1420,6 +1442,16 @@ struct PlayerScreen: View {
   private func settingsSubtitleSection(model: PlayerModel) -> some View {
     VStack(alignment: .leading, spacing: 8) {
       settingsSectionTitle("字幕")
+      if useFFmpeg {
+        Menu("外挂字幕编码：\(ffmpegEngine.subtitleTextEncoding)") {
+          ForEach(["自动","UTF-8","UTF-16","GB18030","Big5","Windows-1252"],id:\.self) { encoding in
+            Button(encoding) {
+              ffmpegEngine.subtitleTextEncoding=encoding
+              if let track=externalSubtitleTracks.first(where:{ $0.id==selectedExternalSubtitleID }) { loadExternalSubtitle(track) }
+            }
+          }
+        }
+      }
       settingsRow(
         title: "关闭字幕",
         systemName: "captions.bubble",
@@ -1446,7 +1478,7 @@ struct PlayerScreen: View {
         }
       }
 
-      ForEach(externalSubtitleTracks) { track in
+      ForEach(externalSubtitleTracks.filter { useFFmpeg || $0.fileExtension.lowercased() != "sup" }) { track in
         settingsRow(
           title: track.title,
           systemName: "captions.bubble.fill",
@@ -2165,6 +2197,8 @@ struct PlayerScreen: View {
     guard let model, let source=model.selectedSource else { return }
     backendSwitchTask?.cancel()
     let generation=UUID(); backendSwitchGeneration=generation
+    pendingAudioPreference=activeTrackSelector?.audioTracks.first { $0.id==activeTrackSelector?.selectedAudioOptionID }
+    pendingSubtitlePreference=activeTrackSelector?.subtitleTracks.first { $0.id==activeTrackSelector?.selectedSubtitleOptionID }
     let position=activeCurrentTime, playing=useFFmpeg ? ffmpegEngine.wantsPlayback : activeIsPlaying
     let volume=activeVolume
     pauseActivePlayer()
@@ -2529,6 +2563,7 @@ struct PlayerScreen: View {
         }
       } catch {
         guard !Task.isCancelled, currentItem.id == expectedID else { return }
+        if useFFmpeg { ffmpegEngine.selectSubtitle(nil) }
         selectedExternalSubtitleID = nil
         externalSubtitleCues = []
         showGestureHUD("字幕读取失败", systemName: "exclamationmark.triangle.fill")
@@ -2538,13 +2573,14 @@ struct PlayerScreen: View {
 
   @MainActor
   private func autoSelectExternalSubtitleIfNeeded() {
-    guard appState.autoLoadExternalSubtitles, !externalSubtitleTracks.isEmpty else { return }
+    let available=externalSubtitleTracks.filter { useFFmpeg || $0.fileExtension.lowercased() != "sup" }
+    guard appState.autoLoadExternalSubtitles, !available.isEmpty else { return }
     let preferredTokens = ["zh", "chs", "cht", "chi", "cn", "中文", "简体", "繁体"]
-    let preferred = externalSubtitleTracks.first { track in
+    let preferred = available.first { track in
       let normalized = track.title.lowercased()
       return preferredTokens.contains { token in normalized == token || normalized.contains(".\(token)") || normalized.contains("-\(token)") || normalized.contains("_\(token)") || normalized.contains(token) }
     }
-    if let track = preferred ?? (externalSubtitleTracks.count == 1 ? externalSubtitleTracks.first : nil) {
+    if let track = preferred ?? (available.count == 1 ? available.first : nil) {
       activeTrackSelector?.selectSubtitle(nil)
       loadExternalSubtitle(track)
     }
@@ -3081,7 +3117,7 @@ private struct PlayerInfoSheet: View {
           LabeledContent("同目录队列", value: "\(playlistCount) 个视频")
           LabeledContent("音轨", value: audioTrackCount.map { "\($0) 个可选" } ?? "当前内核未提供")
           LabeledContent("字幕", value: subtitleTrackCount.map { "\($0) 个可选" } ?? "当前内核未提供")
-          LabeledContent("画中画", value: playbackEngine == "AVPlayer" ? "支持" : "当前内核不支持")
+          LabeledContent("画中画", value: playbackEngine == "AVPlayer" ? "系统画中画" : playbackEngine == "FFmpeg" ? "系统画中画；不含字幕叠层" : "当前内核不支持")
           if statistics.hdrFormat == "Dolby Vision" {
             LabeledContent(
               "Dolby Vision",

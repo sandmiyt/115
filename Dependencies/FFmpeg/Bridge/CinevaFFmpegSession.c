@@ -237,6 +237,11 @@ static int putPCM(CinevaFFmpegSession *s, float *samples, int count, double pts,
         s->pcm[(s->pcmHead+s->pcmCount++)%PCM_LIMIT] = (PCM){samples,pts,count,serial};
         s->pcmSeconds += count/48000.0;
         s->snapshot.audioDecodedTime = pts+count/48000.0;
+        s->snapshot.audioCodec=s->audio->codec_id;
+        s->snapshot.audioProfile=s->audio->profile;
+        s->snapshot.atmosMetadataDetected=
+            (s->audio->codec_id==AV_CODEC_ID_EAC3 && s->audio->profile==AV_PROFILE_EAC3_DDP_ATMOS) ||
+            (s->audio->codec_id==AV_CODEC_ID_TRUEHD && s->audio->profile==AV_PROFILE_TRUEHD_ATMOS);
     } else av_free(samples);
     pthread_cond_broadcast(&s->changed); pthread_mutex_unlock(&s->mutex);
     return 0;
@@ -276,8 +281,12 @@ static int emitAudio(CinevaFFmpegSession *s, AVFrame *frame, Packet entry) {
         putPCM(s,silence,gap,s->nextAudioPTS,entry.serial,entry.target);
         s->nextAudioPTS += gap/48000.0;
     }
-    s->nextAudioPTS = pts+count/48000.0;
-    return putPCM(s,samples,count,pts,entry.serial,entry.target);
+    // Trim overlapping timestamps instead of scheduling duplicated source time.
+    int trim=(int)fmin(count,ceil(fmax(0,s->nextAudioPTS-pts)*48000));
+    if(trim) { count-=trim; pts+=trim/48000.0; memmove(samples,samples+2*trim,count*2*sizeof(float)); }
+    s->nextAudioPTS = fmax(s->nextAudioPTS,pts+count/48000.0);
+    putPCM(s,samples,count,pts,entry.serial,entry.target);
+    return frame ? 0 : count;
 }
 
 static int emitVideo(CinevaFFmpegSession *s, AVFrame *frame, int serial, double target,
@@ -481,7 +490,14 @@ static void *audioDecodeLoop(void *opaque) {
         int stage=CinevaStageAudioDecode;
         double unused=0;
         int error=decodePacket(s,s->audio,frame,0,entry,&unused,&stage);
-        if (entry.eof && error >= 0) error=emitAudio(s,NULL,entry);
+        if (entry.eof && error >= 0) {
+            // Drain until Swr actually reports no remaining samples. A single
+            // null input is not a general guarantee for every sample-rate ratio.
+            int drains=0;
+            do { error=emitAudio(s,NULL,entry); }
+            while(error>0 && ++drains<16 && serial==atomic_load(&s->generation) && !atomic_load(&s->cancelled));
+            if(error>0 && drains>=16) error=AVERROR_INVALIDDATA;
+        }
         av_packet_free(&entry.packet);
         if (error < 0 && serial == atomic_load(&s->generation)) { fail(s,error,CinevaStageAudioDecode); break; }
         if (entry.eof) {
@@ -755,7 +771,7 @@ static void *readLoop(void *opaque) {
     s->origin = s->format->start_time != AV_NOPTS_VALUE ? (double)s->format->start_time / AV_TIME_BASE :
         (video->start_time != AV_NOPTS_VALUE ? video->start_time * av_q2d(video->time_base) : 0);
     if(s->options.outputAudio && !s->videoOnly) {
-        CinevaSubtitles *subtitles=cineva_sub_create(s->format,s->origin);
+        CinevaSubtitles *subtitles=cineva_sub_create(s->format,s->origin,s->videoParameters->width,s->videoParameters->height);
         pthread_mutex_lock(&s->mutex); s->subtitles=subtitles; pthread_mutex_unlock(&s->mutex);
     }
     if (s->audio) {

@@ -119,6 +119,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
   private var length: Int64
   private var generation: Int32 = 1
   private var closed = false
+  private var fatalError: Int32?
   private var refreshing = false
   private var refreshed = false
   private var responseValidator: String?
@@ -176,6 +177,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     defer { condition.unlock() }
     while true {
       if closed || wanted != generation { return -3 }
+      if let fatalError { return fatalError }
       if length >= 0, offset >= length { return 0 }
       if let data = memory[base], Int(offset - base) < data.count {
         let start = Int(offset - base), n = min(count, data.count - start)
@@ -264,7 +266,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     condition.lock(); defer { condition.broadcast(); condition.unlock() }
     refreshing = false
     if let newSource, newSource.isOriginal == source.isOriginal { source = newSource }
-    else { closed = true; stats.lastError = "播放地址刷新失败" }
+    else { fatalError = -1; stats.lastError = "播放地址刷新失败" }
   }
   func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
                   completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {

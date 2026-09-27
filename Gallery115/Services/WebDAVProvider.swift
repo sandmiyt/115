@@ -381,7 +381,7 @@ actor WebDAVProvider: CloudProvider {
 
     let stem = URL(fileURLWithPath: item.name).deletingPathExtension().lastPathComponent
     let normalizedStem = stem.lowercased()
-    let supported: Set<String> = ["srt", "ass", "ssa", "vtt"]
+    let supported: Set<String> = ["srt", "ass", "ssa", "vtt", "sup"]
     return entries.compactMap { candidate in
       guard !candidate.isDirectory, supported.contains(candidate.fileExtension.lowercased()) else { return nil }
       let candidateStem = URL(fileURLWithPath: candidate.name).deletingPathExtension().lastPathComponent

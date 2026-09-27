@@ -40,8 +40,17 @@ final class FFmpegPiPController: NSObject, AVPictureInPictureSampleBufferPlaybac
   }
   func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
     skipByInterval skipInterval: CMTime, completion completionHandler: @escaping () -> Void) {
-    if let engine { engine.seek(to:engine.currentTime+skipInterval.seconds) }
-    completionHandler()
+    guard let engine else { completionHandler(); return }
+    engine.seek(to:engine.currentTime+skipInterval.seconds)
+    Task { @MainActor [weak engine] in
+      // Complete after the new generation leaves seeking, not before a frame
+      // for that target exists. The bounded error path also releases PiP's UI.
+      for _ in 0..<100 {
+        guard let engine, engine.playbackState == .seeking else { break }
+        try? await Task.sleep(for:.milliseconds(100))
+      }
+      completionHandler()
+    }
   }
   func pictureInPictureControllerDidStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) { active=true }
   func pictureInPictureControllerDidStopPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) { active=false }
@@ -50,6 +59,6 @@ final class FFmpegPiPController: NSObject, AVPictureInPictureSampleBufferPlaybac
   }
   func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
     restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void) {
-    completionHandler(engine != nil)
+    completionHandler(engine?.renderer.layer.superlayer != nil)
   }
 }

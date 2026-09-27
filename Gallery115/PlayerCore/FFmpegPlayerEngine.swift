@@ -32,7 +32,9 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   private(set) var selectedSubtitleOptionID: String?
   private(set) var subtitleImage: UIImage?
   private(set) var subtitleWarning: String?
+  private(set) var hasAtmosMetadata = false
   var subtitleDelay = 0.0
+  var subtitleTextEncoding = "自动"
   @ObservationIgnored private var subtitleEpoch = UUID()
   @ObservationIgnored private var subtitleTask: Task<Void,Never>?
   @ObservationIgnored private var lastSubtitleRender = 0.0
@@ -78,7 +80,14 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   @ObservationIgnored private var scrubTask: Task<Void,Never>?
   @ObservationIgnored private var audioTail = false
   @ObservationIgnored private var restoredAudioPreference = false
+  @ObservationIgnored private var defaultAudioID: String?
+  @ObservationIgnored private var audioPreferenceKey: String?
   @ObservationIgnored private var recordsHistory = true
+  @ObservationIgnored private var lifecycleEpoch = UUID()
+  @ObservationIgnored private var toneMapTask: Task<Void,Never>?
+  @ObservationIgnored private var pendingToneMapped = false
+  @ObservationIgnored private let toneMapper = FFmpegSDRToneMapper()
+  private(set) var toneMappedSDR = false
 
   func start(source: VideoSource, item: CloudItem, api: APIClient, library: LibraryStore,
              at position: Double, playing: Bool = true, useCache: Bool = true, preferHardware: Bool = true,
@@ -92,7 +101,10 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     wantsPlayback=playing; waiting=true; resumeTarget=0.75; serial=1
     rebufferCount=0; audioUnderruns=0; firstFrameAt=nil
     audioTracks=[]; selectedAudioOptionID=nil; audioTail=false; restoredAudioPreference=false
+    defaultAudioID=nil; audioPreferenceKey=nil
     subtitleTracks=[]; selectedSubtitleOptionID=nil; subtitleWarning=nil
+    hasAtmosMetadata=false
+    toneMappedSDR=false
     errorMessage=nil; startAt=CACurrentMediaTime(); waitStarted=startAt
     lastPublished=0; lastNetworkAt=startAt; lastNetworkBytes=0
     duration=item.duration; playbackState = .preparing
@@ -114,6 +126,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
       } else { scope=ThumbnailService.currentNamespace() }
       let identity=RangeCacheIdentity(account:scope,fileID:item.id,size:item.size,
         validator:item.sha1.isEmpty ? "" : "sha1:"+item.sha1.lowercased())
+      audioPreferenceKey="cineva.ffmpeg.audio."+identity.key
       let coordinator=RangeCoordinator(source:source,identity:identity,refresh:{
         let response=try await api.initialVideoSources(for:item,preferOriginal:true)
         guard let fresh=response.sources.first(where: \.isOriginal) else { throw URLError(.resourceUnavailable) }
@@ -135,6 +148,9 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     RunLoop.main.add(timer,forMode:.common); ticker=timer
   }
   func stop() {
+    lifecycleEpoch=UUID()
+    toneMapTask?.cancel(); toneMapTask=nil; pendingToneMapped=false
+    toneMapper.reset()
     resetSubtitleImage()
     interruptTrial("提前停止 / 切换模式")
     pip?.stop()
@@ -159,11 +175,13 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     } else { playbackState = .buffering }
   }
   func togglePlayback() { wantsPlayback ? pause() : resume() }
-  func clearSegmentCache() {
+  func clearSegmentCache() async {
     guard let source=currentSource, let item=sourceItem, let api, let library else { return }
     let position=currentTime, playing=wantsPlayback, record=recordsHistory
     stop()
-    SegmentDiskCache.shared.clear()
+    let epoch=lifecycleEpoch
+    await Task.detached(priority:.utility) { SegmentDiskCache.shared.clear() }.value
+    guard lifecycleEpoch==epoch else { return }
     start(source:source,item:item,api:api,library:library,at:position,playing:playing,recordsHistory:record)
   }
   func setPlaybackRate(_ value: Float) {
@@ -173,6 +191,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   func setVolume(_ value: Float) { volume=min(1,max(0,value)); audio.setVolume(volume) }
   func seek(to seconds: Double) {
     resetSubtitleImage()
+    toneMapTask?.cancel(); toneMapTask=nil; pendingToneMapped=false
     interruptTrial("含手动定位，观察窗口未完成")
     guard let handle, seconds.isFinite else { return }
     target=min(max(0,seconds),duration>0 ? max(0,duration-0.01) : max(0,seconds))
@@ -199,15 +218,19 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   }
   func selectAudio(_ id: String?) {
     interruptTrial("切换音轨，观察窗口未完成")
-    guard let id, let index=Int32(id), let handle else { return }
+    guard let selected=id ?? defaultAudioID, let index=Int32(selected), let handle else { return }
+    if selected==selectedAudioOptionID { return }
+    resetSubtitleImage()
+    toneMapTask?.cancel(); toneMapTask=nil; pendingToneMapped=false
     audio.pause(); renderer.setPlaying(false)
     let next=CinevaFFmpegSessionSelectAudio(handle.pointer,index)
     guard next>0 else { if wantsPlayback { resume() }; return }
     serial=next; target=currentTime; audio.reset(to:target,generation:next); renderer.reset(to:target)
     pending=nil; waiting=true; resumeTarget=0.75; waitStarted=CACurrentMediaTime(); audioTail=false
     playbackState = .seeking
-    if let item=sourceItem {
-      UserDefaults.standard.set(id,forKey:"cineva.ffmpeg.audio."+item.id)
+    if recordsHistory, let key=audioPreferenceKey {
+      if let id { UserDefaults.standard.set(id,forKey:key) }
+      else { UserDefaults.standard.removeObject(forKey:key) }
     }
   }
   func selectSubtitle(_ id: String?) {
@@ -216,6 +239,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     let next=CinevaFFmpegSessionSelectSubtitle(handle.pointer,index)
     guard next>0 else { subtitleWarning="字幕轨无法选择"; return }
     selectedSubtitleOptionID=id; subtitleWarning=nil; resetSubtitleImage()
+    toneMapTask?.cancel(); toneMapTask=nil; pendingToneMapped=false
     audio.pause(); renderer.setPlaying(false)
     serial=next; target=currentTime; audio.reset(to:target,generation:next); renderer.reset(to:target)
     pending=nil; waiting=true; resumeTarget=0.75; waitStarted=CACurrentMediaTime(); audioTail=false
@@ -226,10 +250,24 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   }
   func loadExternalSubtitle(data: Data, fileExtension: String) async throws {
     guard let handle else { throw URLError(.resourceUnavailable) }
-    guard data.count<=4*1024*1024,
-      let text=String(data:data,encoding:.utf8) ?? String(data:data,encoding:.utf16) ?? String(data:data,encoding:.windowsCP1252)
-    else { throw URLError(.cannotDecodeContentData) }
-    let normalized=Data(text.utf8), epoch=subtitleEpoch
+    guard !data.isEmpty else { throw URLError(.cannotDecodeContentData) }
+    let normalized:Data
+    if fileExtension.lowercased()=="sup" {
+      guard data.count<=8*1024*1024 else { throw URLError(.dataLengthExceedsMaximum) }
+      normalized=data
+    } else {
+      guard data.count<=4*1024*1024 else { throw URLError(.dataLengthExceedsMaximum) }
+      let gb=String.Encoding(rawValue:CFStringConvertEncodingToNSStringEncoding(0x0632))
+      let big5=String.Encoding(rawValue:CFStringConvertEncodingToNSStringEncoding(0x0A03))
+      let choices:[String:String.Encoding]=["UTF-8":.utf8,"UTF-16":.utf16,"GB18030":gb,"Big5":big5,"Windows-1252":.windowsCP1252]
+      let text:String?
+      if let encoding=choices[subtitleTextEncoding] { text=String(data:data,encoding:encoding) }
+      else if data.starts(with:[0xff,0xfe]) || data.starts(with:[0xfe,0xff]) { text=String(data:data,encoding:.utf16) }
+      else { text=String(data:data,encoding:.utf8) ?? String(data:data,encoding:gb) ?? String(data:data,encoding:big5) ?? String(data:data,encoding:.windowsCP1252) }
+      guard let text else { throw URLError(.cannotDecodeContentData) }
+      normalized=Data(text.utf8)
+    }
+    let epoch=subtitleEpoch
     let result=await Task.detached(priority:.utility) {
       normalized.withUnsafeBytes { bytes in
         fileExtension.lowercased().withCString {
@@ -317,6 +355,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     }
     if snapshot.serial != serial {
       resetSubtitleImage()
+      toneMapTask?.cancel(); toneMapTask=nil; pendingToneMapped=false
       serial=snapshot.serial; target=snapshot.recoveryTarget
       audio.reset(to:target,generation:serial); renderer.reset(to:target); pending=nil
       waiting=true; waitStarted=now; resumeTarget=0.75
@@ -338,10 +377,28 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
         var pts=0.0, duration=0.0, generation:Int32=0
         if let pixel=CinevaFFmpegSessionCopyFrame(handle.pointer,&pts,&duration,&generation) {
           pending=(pixel,pts,duration,generation)
+          pendingToneMapped=false
         }
       }
       guard let frame=pending else { break }
       if frame.3 != serial { pending=nil; continue }
+      if [16,18].contains(snapshot.colorTransfer), !AVPlayer.eligibleForHDRPlayback, !pendingToneMapped {
+        guard #available(iOS 18.0, *) else {
+          fail("当前显示需要 HDR → SDR 映射，此系统版本转交兼容内核。"); return
+        }
+        if toneMapTask==nil {
+          let epoch=lifecycleEpoch, mapper=toneMapper
+          toneMapTask=Task { @MainActor [weak self] in
+            let mapped=await Task.detached(priority:.userInitiated) { mapper.convert(frame.0) }.value
+            guard let self, !Task.isCancelled, self.lifecycleEpoch==epoch,
+              self.serial==frame.3, self.pending?.1==frame.1 else { return }
+            self.toneMapTask=nil
+            guard let mapped else { self.fail("HDR → SDR 映射无法建立可靠色彩输出，转交兼容内核。"); return }
+            self.pending=(mapped,frame.1,frame.2,frame.3); self.pendingToneMapped=true; self.toneMappedSDR=true
+          }
+        }
+        break
+      }
       switch renderer.submit(frame.0,pts:frame.1,duration:frame.2,playing:wantsPlayback && !waiting,now:now) {
       case .accepted: pending=nil; if firstFrameAt==nil { firstFrameAt=now }
       case .dropped: pending=nil
@@ -374,7 +431,8 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     if !waiting, wantsPlayback, audioEmpty || videoEmpty {
       audio.pause(); renderer.suspendForData(); waiting=true
       rebufferCount += 1; if audioEmpty { audioUnderruns += 1 }
-      resumeTarget=min(4,2+Double(min(rebufferCount-1,2)))
+      let ioTarget=min(4,max(2,2*max(snapshot.activeIOSeconds,snapshot.lastReadSeconds)))
+      resumeTarget=max(ioTarget,min(4,2+Double(min(rebufferCount-1,2))))
       waitStarted=now; playbackState = .buffering
     }
     if waiting, wantsPlayback, renderer.anchored, !hasAudio || audio.hasScheduledAudio {
@@ -402,9 +460,6 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
       if hasAudio, !waiting, wantsPlayback { renderer.disciplineClock(to:audio.audibleTime,rate:Double(rate)) }
       rotation=snapshot.rotation; videoSize=CGSize(width:Int(snapshot.width),height:Int(snapshot.height))
       pip?.update()
-      if [16,18].contains(snapshot.colorTransfer), !AVPlayer.eligibleForHDRPlayback {
-        fail("媒体标记为 HDR，当前显示路径不具备 HDR 资格且尚未实现色调映射，转交兼容内核。"); return
-      }
       var tracks:[PlayerTrack]=[]
       for ordinal in 0..<CinevaFFmpegSessionAudioTrackCount(handle.pointer) {
         var track=CinevaFFmpegAudioTrack()
@@ -414,6 +469,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
         tracks.append(PlayerTrack(id:String(track.index),title:"\(title.isEmpty ? language : title) · \(track.channels)ch · \(String(cString:CinevaFFmpegCodecName(track.codec)))",kind:.audio,language:language))
       }
       audioTracks=tracks; selectedAudioOptionID=String(snapshot.selectedAudioIndex)
+      if defaultAudioID==nil, snapshot.selectedAudioIndex>=0 { defaultAudioID=selectedAudioOptionID }
       var subtitles:[PlayerTrack]=[]
       for ordinal in 0..<CinevaFFmpegSessionSubtitleTrackCount(handle.pointer) {
         var track=CinevaFFmpegSubtitleTrack()
@@ -423,12 +479,13 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
         subtitles.append(PlayerTrack(id:String(track.index),title:"\(title.isEmpty ? language : title) · \(String(cString:CinevaFFmpegCodecName(track.codec)))",kind:.subtitle,language:language))
       }
       subtitleTracks=subtitles
-      if !restoredAudioPreference, snapshot.status==1, hasAudio, !tracks.isEmpty, let item=sourceItem {
+      if !restoredAudioPreference, recordsHistory, snapshot.status==1, hasAudio, !tracks.isEmpty, let key=audioPreferenceKey {
         restoredAudioPreference=true
-        if let saved=UserDefaults.standard.string(forKey:"cineva.ffmpeg.audio."+item.id), saved != selectedAudioOptionID,
+        if let saved=UserDefaults.standard.string(forKey:key), saved != selectedAudioOptionID,
           tracks.contains(where: { $0.id==saved }) { selectAudio(saved); return }
       }
       let io=cache?.statistics
+      hasAtmosMetadata=snapshot.atmosMetadataDetected != 0
       if !trialFrozen {
         trial.firstFrame=firstFrameAt.map { $0-startAt }
         trial.firstPlayback=trialPlaybackAt.map { $0-startAt }
@@ -450,12 +507,56 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
         renderer:"Apple Native + AVAudioEngine PCM",droppedFrames:renderer.droppedFrames,
         avSyncOffset:hasAudio ? renderer.time-audio.audibleTime : nil)
       diagnostics="FFmpeg · \(cache == nil ? "旧 HTTP" : "Custom AVIO / 分段缓存") · \(playbackState.title)\n"
+        + "色彩：\(statistics.hdrFormat ?? "未知") · 系统 HDR 资格 \(AVPlayer.eligibleForHDRPlayback ? "有" : "无") · 已请求 EDR；实际屏幕输出待设备确认\n"
+        + "SDR 映射：\(toneMappedSDR ? "Core Image Reference White → sRGB" : "未启用；原生像素路径")\n"
+        + "当前音轨：\(String(cString:CinevaFFmpegCodecName(snapshot.audioCodec))) · 切轨警告 \(snapshot.audioWarningCode) · 输出 PCM 非 Atmos\n"
+        + "Atmos 元数据：\(hasAtmosMetadata ? "解码器已识别" : "尚未识别；不据 EAC3 名称推断") · 输出能力由系统格式和路由决定\n"
         + String(format:"主时钟 %.3f · 音频 decoded %.3f / submitted %.3f / rendered %.3f / audible估算 %.3f\n",currentTime,snapshot.audioDecodedTime,audio.submittedEnd,audio.renderedTime,audio.audibleTime)
         + String(format:"A/V偏差估算 %.3f s · A连续 %.2f / V连续 %.2f s · 恢复 %.2f s\n",renderer.time-audio.audibleTime,max(0,audioEnd-currentTime),max(0,videoEnd-currentTime),resumeTarget)
         + "音频欠载 \(audioUnderruns) · rebuffer \(rebufferCount) · AAC/其他音轨 → Swr → Float32 48kHz stereo PCM（非 Atmos）\n"
         + "AVIO bytes \(snapshot.ioBytesRead) · packet jumps \(snapshot.backwardPacketJumps)/\(snapshot.largeForwardPacketJumps)（不是 HTTP 请求）\n"
         + (io.map { "HTTP requests \($0.requests) · 200/206/416 \($0.responses200)/\($0.responses206)/\($0.responses416) · 网络 bytes \($0.networkBytes)\n内存命中字节 \($0.memoryHitBytes) · 磁盘命中字节 \($0.diskHitBytes) · miss \($0.misses) · refresh \($0.refreshes)\n\($0.lastError ?? "")" } ?? "HTTP 请求数不可获得")
       saveProgress()
+    }
+  }
+}
+
+/// Only unsupported-HDR displays enter this bounded GPU path. Eligible HDR
+/// continues directly from VideoToolbox to the native sample-buffer layer.
+private final class FFmpegSDRToneMapper: @unchecked Sendable {
+  private let queue=DispatchQueue(label:"cineva.tonemap",qos:.userInitiated)
+  private let context=CIContext(options:[.cacheIntermediates:false,
+    .workingColorSpace:CGColorSpace(name:CGColorSpace.extendedLinearSRGB)!])
+  private let outputSpace=CGColorSpace(name:CGColorSpace.sRGB)!
+  private var pool: CVPixelBufferPool?
+  private var width=0, height=0
+  func reset() { queue.async { self.pool=nil; self.context.clearCaches() } }
+  @available(iOS 18.0, *)
+  func convert(_ source: CVPixelBuffer) -> CVPixelBuffer? {
+    queue.sync {
+      let image=CIImage(cvPixelBuffer:source)
+      // Unknown source headroom is not permission to guess a tone curve.
+      guard image.contentHeadroom>1, let filter=CIFilter(name:"CIToneMapHeadroom") else { return nil }
+      filter.setValue(image,forKey:kCIInputImageKey)
+      filter.setValue(1.0,forKey:"inputTargetHeadroom")
+      guard let mapped=filter.outputImage else { return nil }
+      let w=CVPixelBufferGetWidth(source),h=CVPixelBufferGetHeight(source)
+      if pool==nil || width != w || height != h {
+        width=w; height=h
+        let attributes:[String:Any]=[kCVPixelBufferWidthKey as String:w,kCVPixelBufferHeightKey as String:h,
+          kCVPixelBufferPixelFormatTypeKey as String:kCVPixelFormatType_32BGRA,
+          kCVPixelBufferIOSurfacePropertiesKey as String:[:],kCVPixelBufferMetalCompatibilityKey as String:true]
+        guard CVPixelBufferPoolCreate(nil,nil,attributes as CFDictionary,&pool)==kCVReturnSuccess else { return nil }
+      }
+      guard let pool else { return nil }
+      var pixel:CVPixelBuffer?
+      let budget=[kCVPixelBufferPoolAllocationThresholdKey as String:4] as CFDictionary
+      guard CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(nil,pool,budget,&pixel)==kCVReturnSuccess,let pixel else { return nil }
+      context.render(mapped,to:pixel,bounds:image.extent,colorSpace:outputSpace)
+      CVBufferSetAttachment(pixel,kCVImageBufferCGColorSpaceKey,outputSpace,.shouldPropagate)
+      CVBufferSetAttachment(pixel,kCVImageBufferColorPrimariesKey,kCVImageBufferColorPrimaries_ITU_R_709_2,.shouldPropagate)
+      CVBufferSetAttachment(pixel,kCVImageBufferTransferFunctionKey,kCVImageBufferTransferFunction_sRGB,.shouldPropagate)
+      return pixel
     }
   }
 }
