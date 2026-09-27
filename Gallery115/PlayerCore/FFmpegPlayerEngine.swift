@@ -186,11 +186,12 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   func clearSegmentCache() async {
     guard let source=currentSource, let item=sourceItem, let api, let library else { return }
     let position=currentTime, playing=wantsPlayback, record=recordsHistory
+    let backend=inputBackend, hardware=trial.hardware
     stop()
     let epoch=lifecycleEpoch
     await Task.detached(priority:.utility) { SegmentDiskCache.shared.clear() }.value
     guard lifecycleEpoch==epoch else { return }
-    start(source:source,item:item,api:api,library:library,at:position,playing:playing,recordsHistory:record)
+    start(source:source,item:item,api:api,library:library,at:position,playing:playing,preferHardware:hardware,recordsHistory:record,inputBackend:backend)
   }
   func setPlaybackRate(_ value: Float) {
     rate=min(2,max(0.5,value)); audio.setRate(rate)
@@ -312,7 +313,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
       lastFailure=FFmpegFailureSnapshot(session:sessionID,generation:serial,backend:inputBackend,
         build:build,stage:FFmpegFailureSnapshot.stageName(snapshot.failureStage)+" / "+(function.isEmpty ? "函数不可获得" : function),
         nativeError:snapshot.errorCode,transport:io?.text ?? "原生 HTTP：传输细节不可获得；未启用未脱敏 verbose 日志",
-        operations:"read offset=\(snapshot.lastReadOffset) count=\(snapshot.lastReadCapacity) result=\(snapshot.lastReadResult)\n"
+        operations:inputBackend == .ffmpegHTTP ? "原生 HTTP 最后 read/seek 参数不可获得；AVIO position=\(snapshot.ioPosition)" : "read offset=\(snapshot.lastReadOffset) count=\(snapshot.lastReadCapacity) result=\(snapshot.lastReadResult)\n"
           + "seek offset=\(snapshot.lastSeekOffset) whence=\(snapshot.lastSeekWhence) result=\(snapshot.lastSeekResult)\n"
           + "hint=\(io?.hintedLength ?? -1) verified=\(io?.verifiedLength ?? -1) · subsequent clues=\(io?.clues.joined(separator: "; ") ?? "none")")
       diagnostics=lastFailure!.text

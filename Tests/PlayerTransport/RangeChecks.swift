@@ -56,7 +56,8 @@ import Foundation
     let redirect=client("/redirect",headers:["Authorization":"secret","Cookie":"private","X-Private":"private", "uSeR-aGeNt":"Cineva-iOS/2.0", "Referer":"https://private.invalid/?token=secret", "Origin":"https://private.invalid"])
     expect(read(redirect,0)>0,"Cross-origin redirect strips credentials"); redirect.close()
     for path in ["/short64", "/short10"] {
-      let c=client(path)
+      let cacheID="short-warm-"+path
+      let c=client(path,id:cacheID)
       var offset:Int64=0
       while offset<size {
         let n=read(c,offset,65536)
@@ -66,7 +67,12 @@ import Foundation
       expect(read(c,size)==0,"Short 206 verified EOF")
       expect(read(c,7777)>0 && read(c,2*1048576+37)>0,"Short 206 backward/random reads")
       expect(c.statistics.requests<400,"Short 206 finite request count")
+      for _ in 0..<100 where c.statistics.memoryBytes<Int(size) { Thread.sleep(forTimeInterval:0.01) }
       c.close()
+      let warmShort=client(path,id:cacheID)
+      expect(read(warmShort,size-1)>0 && read(warmShort,0)>0,"Short 206 warm validation/read")
+      expect(warmShort.statistics.diskHitBytes>0,"Only assembled complete short-response pages persist")
+      warmShort.close()
     }
     for hint in [size-1,size+1] {
       let c=client("/ok",size:hint,id:"warm")
@@ -92,6 +98,27 @@ import Foundation
       expect(c.statistics.terminalFailure != nil,"Typed terminal snapshot retained")
       c.close()
     }
+    for path in ["/overbody","/underbody"] {
+      let c=client(path)
+      expect(read(c,0) != 0,"Malformed body never false EOF")
+      for _ in 0..<100 where c.statistics.terminalFailure==nil { Thread.sleep(forTimeInterval:0.01) }
+      expect(c.statistics.terminalFailure?.kind == .malformedResponse,"Chunked body length validated on completion")
+      expect(c.statistics.memoryBytes==0 && read(c,9999)<0,"Malformed body cannot persist a page")
+      c.close()
+    }
+    let sparse=client("/short10")
+    for offset in [Int64(32000),0,15000,65530,999999,2000000,10000] {
+      expect(read(sparse,offset,12000)>0,"Sparse holes must fetch real coverage, never zero-fill")
+    }
+    sparse.close()
+    let newHTTPVersion=client("/v2",id:"warm")
+    expect(read(newHTTPVersion,size-1)>0 && read(newHTTPVersion,0)>0,"New HTTP version independently validates")
+    expect(newHTTPVersion.statistics.diskHitBytes==0,"Changed HTTP ETag cannot reuse old version disk pages")
+    newHTTPVersion.close()
+    let noValidator=client("/novalidator")
+    expect(read(noValidator,0)>0 && read(noValidator,2*1048576)>0,"No-validator source still streams")
+    expect(noValidator.statistics.memoryBytes==0 && noValidator.statistics.diskHitBytes==0,"No-validator responses never merge cached fragments")
+    noValidator.close()
     let auth=client("/expired",headers:["Authorization":"do-not-log", "User-Agent":"Cineva-iOS/2.0"])
     expect(read(auth,0)<0 && auth.statistics.terminalFailure?.kind == .authentication,"Authentication is typed")
     let evidence=auth.statistics.terminalFailure!.text
@@ -112,6 +139,8 @@ import Foundation
     expect(read(timeout,0)<0,"Timeout bounded failure"); timeout.close()
     expect(RangeCoordinator.contentRange("bytes 5-4/9")==nil,"Invalid range")
     expect(RangeCoordinator.contentRange("bytes 0-9/9")==nil,"End outside total")
+    expect(RangeCoordinator.contentRange("bytes -1-5/9")==nil,"Negative syntax is not silently stripped")
+    expect(RangeCoordinator.contentRange("bytes +0-5/9")==nil,"Range requires decimal digits")
     let epoch=disk.epoch
     disk.clear()
     disk.write(Data([1,2,3]),key:"old",offset:0,epoch:epoch)

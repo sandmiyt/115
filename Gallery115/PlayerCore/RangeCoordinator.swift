@@ -134,6 +134,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     let start: Int64, end: Int64, generation: Int32
     var data = Data()
     var expected = 0
+    var receivedBytes = 0
     var receivedEnd: Int64 = -1
     var consumedThrough: Int64
     var accepted = false, finished = false
@@ -219,19 +220,20 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     let domain=native.map { [NSURLErrorDomain,NSPOSIXErrorDomain,"kCFErrorDomainCFNetwork"].contains($0.domain) ? $0.domain : "other" } ?? "none"
     let evidence=RangeFailureEvidence(kind:kind,generation:f.generation,status:f.status,
       requestedStart:f.start,requestedEnd:f.end,contentRange:f.contentRange,
-      declaredBytes:f.declaredBytes,receivedBytes:f.data.count,hintedLength:identity.size,
+      declaredBytes:f.declaredBytes,receivedBytes:f.receivedBytes,hintedLength:identity.size,
       verifiedLength:length,observedLength:f.observedLength,redirects:f.redirects,
       applicationUAPreserved:f.uaPreserved,networkDomain:domain,networkCode:native?.code ?? 0)
+    if stats.terminalFailure != nil, stats.clues.count<4 { stats.clues.append("subsequent transport=\(kind.rawValue)") }
     f.issue=evidence; stats.lastIssue=evidence; stats.lastError=kind.rawValue
     if [.malformedResponse,.metadataConflict,.resourceChanged,.unsupportedBackend,.redirectPolicy].contains(kind) {
       if stats.terminalFailure==nil { stats.terminalFailure=evidence }
-      fatalError=code
+      if fatalError==nil { fatalError=code }
     }
   }
   private func terminate(_ f:Flight) -> Int32 {
     if stats.terminalFailure==nil { stats.terminalFailure=f.issue }
     // Resource/protocol failures invalidate this session; never serve its stale pages afterwards.
-    fatalError=f.error == 0 ? -1 : f.error
+    if fatalError==nil { fatalError=f.error == 0 ? -1 : f.error }
     return fatalError!
   }
   /// Returns 0 only after HTTP confirms EOF. Negative outcomes retain typed evidence.
@@ -344,8 +346,10 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     refreshing=false
     if let value, value.isOriginal==source.isOriginal { source=value }
     else {
-      let f=Flight(start:stats.lastReadOffset,end:stats.lastReadOffset,generation:generation)
-      issue(.authentication,flight:f,code:-5); _=terminate(f)
+      // Preserve the original 401/403 facts if refreshing the signed URL fails.
+      if stats.terminalFailure==nil { stats.terminalFailure=stats.lastIssue }
+      if stats.clues.count<4 { stats.clues.append("URL refresh failed") }
+      fatalError = -5
     }
   }
   private func verifyIdentity(total:Int64,validator:String?,flight f:Flight) -> Bool {
@@ -400,15 +404,16 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
   }
   static func contentRange(_ text:String)->(start:Int64,end:Int64,total:Int64)? {
     guard text.hasPrefix("bytes ") else { return nil }
-    let parts=text.dropFirst(6).split(separator:"/")
+    let parts=text.dropFirst(6).split(separator:"/",omittingEmptySubsequences:false)
     guard parts.count==2,let total=Int64(parts[1]),total>0 else { return nil }
-    let span=parts[0].split(separator:"-")
-    guard span.count==2,let start=Int64(span[0]),let end=Int64(span[1]),start>=0,end>=start,end<total else { return nil }
+    let span=parts[0].split(separator:"-",omittingEmptySubsequences:false)
+    guard span.count==2, (span+[parts[1]]).allSatisfy({ !$0.isEmpty && $0.utf8.allSatisfy { $0>=48 && $0<=57 } }),let start=Int64(span[0]),let end=Int64(span[1]),start>=0,end>=start,end<total else { return nil }
     return(start,end,total)
   }
   func urlSession(_ session:URLSession,dataTask:URLSessionDataTask,didReceive data:Data) {
     condition.lock(); stats.networkBytes+=Int64(data.count)
     guard let f=flights[dataTask.taskIdentifier],f.accepted,!f.finished else { condition.unlock(); return }
+    f.receivedBytes+=data.count
     guard data.count<=f.expected-f.data.count else {
       issue(.malformedResponse,flight:f,code:-6); f.finished=true
       condition.broadcast(); condition.unlock(); dataTask.cancel(); return
@@ -424,6 +429,9 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
         let native=error as NSError?
         issue(native?.code==NSURLErrorTimedOut ? .timeout : error == nil ? .malformedResponse : .network,
           flight:f,code:native?.code==NSURLErrorTimedOut ? -2 : -1,native:native)
+        // A partially delivered response that later breaks is not a legal short
+        // prefix. Do not turn repeated disconnects into unbounded prefix retries.
+        if f.receivedBytes>0 { _=terminate(f) }
       }
     }
     let pages=f.error==0 && f.accepted ? storeVerified(f.data,at:f.start) : []

@@ -33,14 +33,23 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0"); self.end_headers(); return
         if path in ("/short64", "/short10", "/shortchange"):
             end = min(end, start + (65536 if path == "/short64" else 10000) - 1)
+        if path in ("/overbody", "/underbody"):
+            end = min(end, start + 9999)
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+            self.send_header("ETag", '"v1"')
+            self.send_header("Transfer-Encoding", "chunked"); self.end_headers()
+            payload = bytes(i % 251 for i in range(start, end + 1 + (1 if path == "/overbody" else -1)))
+            self.wfile.write(f"{len(payload):x}\r\n".encode() + payload + b"\r\n0\r\n\r\n")
+            self.wfile.flush(); return
         status = 200 if path in ("/bad200", "/small200") else 206
         if status == 200: start, end = 0, total - 1
         self.send_response(status); self.send_header("Content-Length", str(end - start + 1 + (1 if path == "/badlength" else 0)))
         if status == 206:
             declared = start + 1 if path == "/wrongrange" else start
             self.send_header("Content-Range", f"bytes {declared}-{end}/{total}")
-        if not (path == "/missingetag" and start >= 1048576):
-            changed = (path == "/changed" and start >= 1048576) or (path == "/shortchange" and start >= 10000)
+        if path != "/novalidator" and not (path == "/missingetag" and start >= 1048576):
+            changed = path == "/v2" or (path == "/changed" and start >= 1048576) or (path == "/shortchange" and start >= 10000)
             self.send_header("ETag", '"v2"' if changed else '"v1"')
         self.end_headers()
         for pos in range(start, end + 1, 16384):
