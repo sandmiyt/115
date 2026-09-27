@@ -31,8 +31,11 @@ import CoreImage
           let oracle=AVAssetImageGenerator(asset:AVURLAsset(url:source.url))
           oracle.appliesPreferredTrackTransform=true
           oracle.requestedTimeToleranceBefore = .zero; oracle.requestedTimeToleranceAfter = .zero
-          let reference=try! await oracle.image(at:CMTime(seconds:frame.pts,preferredTimescale:60000))
-          expect(abs(reference.actualTime.seconds-frame.pts)<0.002,"Orientation oracle uses the same actual frame")
+          // Query INSIDE the known interval: converting 2.583333333333333
+          // to CMTime at a boundary can round down into the preceding frame.
+          let oracleTime=frame.pts+abs(frame.duration)*0.25
+          let reference=try! await oracle.image(at:CMTime(seconds:oracleTime,preferredTimescale:60000))
+          expect(abs(reference.actualTime.seconds-frame.pts)<0.002,"Orientation oracle uses the same actual frame: expected=\(frame.pts), got=\(reference.actualTime.seconds)")
           let normalized=CIContext().createCGImage(CIImage(cgImage:reference.image),from:CGRect(x:0,y:0,width:CGFloat(reference.image.width),height:CGFloat(reference.image.height)),format:.RGBA8,colorSpace:CGColorSpace(name:CGColorSpace.sRGB)!)!
           expect(image.width==normalized.width && image.height==normalized.height,"Rotated bounds match track transform")
           let rawA=image.dataProvider!.data!, rawB=normalized.dataProvider!.data!
