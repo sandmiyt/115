@@ -682,6 +682,7 @@ final class ArtworkCacheTests: XCTestCase {
     await gate.release()
     _ = await visible.value
     for task in speculative { _ = await task.value }
+    await cache.flushPersistence() // Finish atomic writes before tearDown removes the fixture directory.
   }
 
   private func waitForQueue(_ cache: ThumbnailService, visible: Int, prefetch: Int) async {
