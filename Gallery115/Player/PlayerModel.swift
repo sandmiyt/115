@@ -169,6 +169,17 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
   var errorMessage: String?
   var didFallbackFromOriginal = false
   var allowsAutomaticEngineSwitch = true
+  private var externallyControlled = false
+
+  func suspendForExternalEngine() {
+    pause()
+    externallyControlled = true
+    deferredSourcesTask?.cancel()
+    mediaInfoGeneration = UUID()
+    playbackTimer?.invalidate(); playbackTimer = nil
+    timelinePreview.reset()
+    player.replaceCurrentItem(with: nil)
+  }
 
   let player = AVPlayer()
   let timelinePreview = TimelinePreviewController()
@@ -263,7 +274,8 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
     }
   }
 
-  func prepareAndPlay() async {
+  func prepareAndPlay(external: Bool = false) async {
+    externallyControlled=external
     guard !Task.isCancelled, !isPreparing else { return }
     activateAudioSession()
     isPreparing = true
@@ -289,7 +301,7 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
       if let preferred {
         await play(preferred, allowFallback: true)
       }
-      installTimeObserverIfNeeded()
+      if !externallyControlled { installTimeObserverIfNeeded() }
       if initial.hasDeferredTranscodes { loadRemainingSources() }
     } catch {
       guard !Task.isCancelled else { return }
@@ -308,12 +320,13 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
         guard let self, !Task.isCancelled else { return }
         let existingIDs = Set(self.sources.map(\.id))
         self.sources.append(contentsOf: remaining.filter { !existingIDs.contains($0.id) })
-        self.configureTimelinePreviewSource()
+        if !self.externallyControlled { self.configureTimelinePreviewSource() }
       } catch { /* Original playback continues even when other qualities are unavailable. */ }
     }
   }
 
-  func select(_ source: VideoSource) async {
+  func select(_ source: VideoSource, external: Bool = false) async {
+    externallyControlled = external
     didFallbackFromOriginal = false
     await play(source, allowFallback: true)
   }
@@ -332,6 +345,7 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
   }
 
   func resume() {
+    guard !externallyControlled else { return }
     wantsPlayback = true
     lastPlaybackProgressAt = Date()
     didReachEnd = false
@@ -657,6 +671,12 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
     stallProbeTask = nil
     lastStallRecoveryAt = .distantPast
     player.automaticallyWaitsToMinimizeStalling = true
+
+    if externallyControlled {
+      player.replaceCurrentItem(with:nil)
+      isPlaying=false; isBuffering=false
+      return
+    }
 
     // Containers that AVPlayer commonly rejects should go straight to VLC when
     // the VLC runtime is actually bundled. MP4/MOV and other Apple-friendly
@@ -1218,6 +1238,7 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
   }
 
   private func saveProgress(force: Bool) {
+    guard !externallyControlled else { return }
     guard hasPlayedCurrentItem else { return }
     let seconds = player.currentTime().seconds
     guard seconds.isFinite, seconds >= 0 else { return }

@@ -113,6 +113,13 @@ jobs:
           print("Buffer policy checks passed: \(checks)")
           SWIFT
           swift "$RUNNER_TEMP/buffer-policy.swift"
+          swiftc Gallery115/Models/VideoSource.swift Gallery115/PlayerCore/RangeCoordinator.swift \
+            Tests/PlayerTransport/RangeChecks.swift -o "$RUNNER_TEMP/range-checks"
+          python3 Tests/PlayerTransport/range_server.py --port-file "$RUNNER_TEMP/range-port" &
+          RANGE_PID=$!
+          trap 'kill "$RANGE_PID" 2>/dev/null || true' EXIT
+          for attempt in {1..50}; do test -s "$RUNNER_TEMP/range-port" && break; sleep 0.1; done
+          "$RUNNER_TEMP/range-checks" "http://127.0.0.1:$(cat "$RUNNER_TEMP/range-port")"
           xcodebuild \
             -workspace Gallery115.xcworkspace \
             -scheme Gallery115 \

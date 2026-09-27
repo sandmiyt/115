@@ -5,14 +5,17 @@ import UIKit
 
 /// Owns one native session. Cancellation is immediate; joining workers and
 /// freeing FFmpeg objects never blocks SwiftUI or a display-link callback.
-private final class FFmpegSessionHandle {
+final class FFmpegSessionHandle {
   let pointer: OpaquePointer
-  init(_ pointer: OpaquePointer) { self.pointer = pointer }
+  let io: RangeCoordinator?
+  init(_ pointer: OpaquePointer, io: RangeCoordinator? = nil) { self.pointer = pointer; self.io = io }
   deinit {
     CinevaFFmpegSessionCancel(pointer)
     let address = UInt(bitPattern: pointer)
+    let retainedIO = io
     DispatchQueue.global(qos: .utility).async {
       if let pointer = OpaquePointer(bitPattern: address) { CinevaFFmpegSessionDestroy(pointer) }
+      withExtendedLifetime(retainedIO) {}
     }
   }
 }
@@ -160,9 +163,12 @@ final class FFmpegDecodeSession {
     guard validHeaders else { state = .failed("播放请求头格式无效。"); return }
     let headers = source.headers.sorted { $0.key < $1.key }
       .map { "\($0.key): \($0.value)\r\n" }.joined()
+    var options = CinevaFFmpegSessionOptions()
+    options.preferHardware = preferHardware ? 1 : 0
+    options.videoOnly = mode.videoOnly ? 1 : 0
+    options.sequentialVideoOnly = mode == .videoOnlySequential ? 1 : 0
     let pointer = source.url.absoluteString.withCString { url in
-      headers.withCString { CinevaFFmpegSessionCreate(url, $0, start,
-        CinevaFFmpegSessionOptions(preferHardware: preferHardware ? 1 : 0, videoOnly: mode.videoOnly ? 1 : 0)) }
+      headers.withCString { CinevaFFmpegSessionCreate(url, $0, start, options) }
     }
     guard let pointer else { state = .failed("无法创建 FFmpeg 解码会话。"); return }
     handle = FFmpegSessionHandle(pointer)

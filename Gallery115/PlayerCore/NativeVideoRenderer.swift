@@ -11,6 +11,7 @@ final class NativeVideoRenderer {
   private var timebase: CMTimebase?
   private var format: CMVideoFormatDescription?
   private var blockedSince: Double?
+  private var playbackRate = 1.0
   private(set) var anchored = false
   private(set) var waitingForData = true
   private(set) var lastPTS = -1.0
@@ -47,7 +48,18 @@ final class NativeVideoRenderer {
   }
 
   func setPlaying(_ playing: Bool) {
-    setRate(playing && anchored && !waitingForData ? 1 : 0)
+    setRate(playing && anchored && !waitingForData ? playbackRate : 0)
+  }
+  func setPlaybackRate(_ rate: Double) { playbackRate=rate; if anchored && !waitingForData { setRate(rate) } }
+  func alignClock(to seconds: Double, rate: Double, running: Bool) {
+    // Called at startup/seek/rebuffer/rate boundaries, never per video frame.
+    playbackRate=rate; setTime(seconds); setRate(running ? rate : 0)
+  }
+  func disciplineClock(to audio: Double, rate: Double) {
+    guard anchored, !waitingForData else { return }
+    let drift = audio-time
+    // Gentle bounded rate correction; no repeated timebase jumps hiding drift.
+    setRate(rate * (1 + min(0.03,max(-0.03,drift*0.2))))
   }
 
   /// The controller must approve the buffered runway before advancing time.
@@ -57,7 +69,7 @@ final class NativeVideoRenderer {
     waitingForData = false
     blockedSince = nil
     waitReason = "缓冲余量已满足 · 按时间戳显示"
-    setRate(1)
+    setRate(playbackRate)
   }
 
   func suspendForData() {

@@ -13,7 +13,10 @@ gaps >1 MiB, and about 1.07 s compressed video queued. This supports an I/O
 starvation hypothesis. Packet positions alone do not establish HTTP request
 count or prove the private file's physical track layout.
 
-**Status: suspected remote MP4 track-interleave I/O bottleneck; device A/B pending.**
+**Status: Confirmed remote MP4 track-interleave I/O bottleneck (user device report: the formerly stalling H.264/AAC file is smooth in video-only sequential mode).**
+
+The full audio-enabled Custom AVIO path still requires its own device acceptance;
+this observation must not be represented as an audio-enabled playback test.
 Only after same-file, same-position device A/B repeatedly shows substantially
 fewer jumps, faster reads, deeper video runway and sustained B playback should
 the result be recorded as: `Confirmed remote MP4 track-interleave I/O bottleneck`.

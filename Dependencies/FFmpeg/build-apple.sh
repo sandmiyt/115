@@ -78,6 +78,10 @@ _CinevaFFmpegSessionSeek
 _CinevaFFmpegSessionSetPosition
 _CinevaFFmpegSessionSnapshot
 _CinevaFFmpegSessionCopyFrame
+_CinevaFFmpegSessionCopyAudio
+_CinevaFFmpegSessionAudioTrackCount
+_CinevaFFmpegSessionAudioTrack
+_CinevaFFmpegSessionSelectAudio
 _CinevaFFmpegCodecName
 _CinevaFFmpegErrorText
 EXPORTS

@@ -26,6 +26,10 @@ struct PlayerScreen: View {
   @State private var vlcController = VLCPlaybackController()
   @State private var systemPresentationController = SystemPlayerPresentationController()
   @State private var useVLC = false
+  @State private var ffmpegEngine = FFmpegPlayerEngine()
+  @State private var useFFmpeg = false
+  @State private var ffmpegReason: String?
+  @State private var didFFmpegFallback = false
   @State private var didLoadPreferredRate = false
   @State private var localMetadata: LocalMediaMetadata?
   @State private var showInfo = false
@@ -354,12 +358,20 @@ struct PlayerScreen: View {
     .onChange(of: vlcController.errorMessage) { _, message in
       if let message, useVLC { model?.errorMessage = message }
     }
+    .onChange(of: ffmpegEngine.errorMessage) { _, message in
+      if let message, useFFmpeg, !didFFmpegFallback {
+        didFFmpegFallback=true
+        switchPlaybackBackend(.apple)
+        ffmpegReason=message+" 已停止 FFmpeg，并按原位置和播放意图尝试 AVPlayer。"
+        showControls(animated:true)
+      }
+    }
     .onChange(of: systemPresentationController.isPictureInPictureActive) { _, active in
       model?.allowsAutomaticEngineSwitch = !active
     }
     .onChange(of: activeCurrentTime) { _, _ in
       updateRemotePlaybackInfo()
-      if !useVLC, !isScrubbing, activeIsPlaying, let model {
+      if !useVLC, !useFFmpeg, !isScrubbing, activeIsPlaying, let model {
         systemPresentationController.cacheDisplayedFrame(in: model.timelinePreview, at: activeCurrentTime)
       }
     }
@@ -410,6 +422,7 @@ struct PlayerScreen: View {
     dismissRestoreTask?.cancel()
     pauseActivePlayer()
     vlcController.stop()
+    ffmpegEngine.stop()
     RemotePlaybackCoordinator.shared.deactivate()
     PlayerOrientation.request(.portrait)
   }
@@ -417,7 +430,9 @@ struct PlayerScreen: View {
   @ViewBuilder
   private var playerLayer: some View {
     if let model {
-      if useVLC, model.selectedSource?.isOriginal == true, VLCAvailability.isAvailable {
+      if useFFmpeg {
+        FFmpegPlayerSurface(engine:ffmpegEngine,layout:videoLayout)
+      } else if useVLC, model.selectedSource?.isOriginal == true, VLCAvailability.isAvailable {
         VLCPlayerView(controller: vlcController)
       } else {
         SystemPlayerView(
@@ -1281,6 +1296,21 @@ struct PlayerScreen: View {
       ScrollView {
         LazyVStack(alignment: .leading, spacing: 12) {
           if let model {
+            VStack(alignment:.leading,spacing:8) {
+              settingsSectionTitle("播放内核")
+              HStack {
+                settingsChip("FFmpeg",selected:useFFmpeg) { switchPlaybackBackend(.ffmpeg) }
+                settingsChip("AVPlayer",selected:!useFFmpeg && !useVLC) { switchPlaybackBackend(.apple) }
+                if VLCAvailability.isAvailable {
+                  settingsChip("VLC",selected:useVLC) { switchPlaybackBackend(.vlc) }
+                }
+              }
+              if let reason=ffmpegReason { Text(reason).font(.caption).foregroundStyle(.orange) }
+              if useFFmpeg {
+                Text(ffmpegEngine.diagnostics).font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
+                Button("复制 FFmpeg 播放诊断") { UIPasteboard.general.string=ffmpegEngine.diagnostics }
+              }
+            }
             settingsSpeedSection(model: model)
 
             if model.sources.count > 1 {
@@ -1342,7 +1372,7 @@ struct PlayerScreen: View {
           ) {
             keepControlsDuringInteraction()
             Task { @MainActor in
-              await model.select(source)
+              await model.select(source,external:useFFmpeg)
               activatePlaybackEngine(for: model)
               applyPlaybackRate(playbackRate, persist: false)
               applyAutomaticOrientation(for: model.videoDisplaySize)
@@ -1505,10 +1535,11 @@ struct PlayerScreen: View {
         settingsActionButton(
           systemPresentationController.isPictureInPictureActive ? "退出小窗" : "小窗播放",
           systemName: systemPresentationController.isPictureInPictureActive ? "pip.exit" : "pip.enter",
-          enabled: !useVLC && systemPresentationController.isPictureInPictureSupported
+          enabled: useFFmpeg ? (ffmpegEngine.pip?.supported ?? false) : (!useVLC && systemPresentationController.isPictureInPictureSupported)
         ) {
           closeSettingsPanel(scheduleHide: false)
-          systemPresentationController.startPictureInPicture()
+          if useFFmpeg { ffmpegEngine.pip?.toggle() }
+          else { systemPresentationController.startPictureInPicture() }
         }
       }
 
@@ -2025,6 +2056,7 @@ struct PlayerScreen: View {
     }
 
     if model != nil {
+      ffmpegEngine.stop()
       pauseActivePlayer()
       vlcController.stop()
     }
@@ -2044,7 +2076,7 @@ struct PlayerScreen: View {
     // The first frame has strict priority. Do not even START NFO/poster,
     // subtitle, chapter, or full-playlist requests until the playback engine has
     // received its URL and begun opening the media connection.
-    await newModel.prepareAndPlay()
+    await newModel.prepareAndPlay(external:useFFmpeg)
     guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else {
       newModel.pause()
       return
@@ -2117,7 +2149,48 @@ struct PlayerScreen: View {
   }
 
   @MainActor
+  private func switchPlaybackBackend(_ backend: PlayerBackend) {
+    guard let model, let source=model.selectedSource else { return }
+    let position=activeCurrentTime, playing=useFFmpeg ? ffmpegEngine.wantsPlayback : activeIsPlaying
+    let volume=activeVolume
+    pauseActivePlayer()
+    ffmpegEngine.stop(); vlcController.stop(saveProgress:false)
+    useVLC=false; useFFmpeg=false
+    switch backend {
+    case .ffmpeg:
+      didFFmpegFallback=false
+      model.suspendForExternalEngine()
+      useFFmpeg=true; ffmpegReason=nil
+      ffmpegEngine.start(source:source,item:currentItem,api:appState.api,library:appState.libraryStore,
+        at:position,playing:playing)
+      ffmpegEngine.setPlaybackRate(playbackRate); ffmpegEngine.setVolume(volume)
+    case .vlc:
+      model.suspendForExternalEngine(); useVLC=true
+      vlcController.configure(source:source,item:currentItem,libraryStore:appState.libraryStore,
+        playbackRate:playbackRate,fastStartEnabled:appState.fastStartEnabled,resumeAt:position)
+      vlcController.setVolume(volume)
+      if !playing { vlcController.pause() }
+      ffmpegReason="兼容内核 VLC：实际格式及输出能力以当前播放结果为准"
+    case .apple:
+      ffmpegReason="兼容内核 AVPlayer：正在按原位置重新打开媒体"
+      Task { @MainActor in
+        await model.select(source)
+        model.pause(); model.seek(to:position); model.setPlaybackRate(playbackRate); model.setVolume(volume)
+        if playing { model.resume() }
+      }
+    }
+    configureRemotePlayback(); updateRemotePlaybackInfo()
+  }
+
+  @MainActor
   private func activatePlaybackEngine(for playerModel: PlayerModel) {
+    if useFFmpeg, let source=playerModel.selectedSource {
+      playerModel.suspendForExternalEngine()
+      ffmpegEngine.start(source:source,item:currentItem,api:appState.api,library:appState.libraryStore,
+        at:appState.libraryStore.resumePosition(for:currentItem))
+      ffmpegEngine.setPlaybackRate(playbackRate)
+      return
+    }
     guard let source = playerModel.selectedSource else {
       useVLC = false
       return
@@ -2234,6 +2307,7 @@ struct PlayerScreen: View {
 
   private var activeEngine: (any PlayerEngine)? {
     if isValidatingFFmpeg { return nil }
+    if useFFmpeg { return ffmpegEngine }
     if useVLC { return vlcController }
     return model
   }
@@ -2555,6 +2629,7 @@ struct PlayerScreen: View {
     showSpeedPanel = false
     showQueuePanel = false
     pauseActivePlayer()
+    ffmpegEngine.stop()
     vlcController.stop()
     model = nil
     useVLC = false
@@ -2581,7 +2656,9 @@ struct PlayerScreen: View {
   @MainActor
   private func seekBy(_ seconds: Double) {
     guard model != nil else { return }
-    if useVLC {
+    if useFFmpeg {
+      ffmpegEngine.seek(to:activeCurrentTime+seconds)
+    } else if useVLC {
       vlcController.seekBy(seconds)
     } else {
       model?.seekBy(seconds)

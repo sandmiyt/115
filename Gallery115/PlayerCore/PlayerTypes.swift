@@ -27,6 +27,7 @@ enum PlayerState: Equatable, Sendable {
 enum PlayerBackend: String, Sendable {
   case apple = "AVPlayer"
   case vlc = "VLC"
+  case ffmpeg = "FFmpeg"
 }
 
 struct PlayerTrack: Identifiable, Hashable, Sendable {

@@ -21,9 +21,19 @@ int CinevaFFmpegRuntimeCheck(void);
 // Hardware-preferred validation workers. Optional audio decode remains available
 // for standard A, but videoOnly excludes it. No libav types cross this ABI.
 typedef struct CinevaFFmpegSession CinevaFFmpegSession;
+typedef int (*CinevaFFmpegRead)(void * _Nonnull context, int64_t offset,
+    uint8_t * _Nonnull buffer, int capacity, int generation);
+typedef int64_t (*CinevaFFmpegSize)(void * _Nonnull context);
+typedef void (*CinevaFFmpegCancelIO)(void * _Nonnull context, int generation);
 typedef struct {
     int preferHardware;
     int videoOnly; // Validation defaults true; false retains audio decode capability.
+    int sequentialVideoOnly; // Applies only to video-only MOV, never audio playback.
+    int outputAudio;
+    void * _Nullable ioContext;
+    CinevaFFmpegRead _Nullable read;
+    CinevaFFmpegSize _Nullable size;
+    CinevaFFmpegCancelIO _Nullable cancelIO;
 } CinevaFFmpegSessionOptions;
 typedef struct {
     int status; // 0 opening, 1 decoding, 2 drained, -1 failed
@@ -55,7 +65,17 @@ typedef struct {
     int64_t forwardGapBytesTotal, largestForwardGap;
     int64_t packetReadCount;
     double averageReadFrameDuration, maximumReadFrameDuration;
+    int audioEnabled, audioDrained, videoDrained;
+    int audioPacketCount, pcmCount;
+    int64_t audioPacketBytes;
+    double audioQueuedSeconds, pcmSeconds;
+    double audioDecodedTime, audioStart, audioEnd, videoStart, videoEnd;
+    int selectedAudioIndex;
 } CinevaFFmpegSnapshot;
+typedef struct { int index, codec, channels, sampleRate; char language[32], title[128]; } CinevaFFmpegAudioTrack;
+int CinevaFFmpegSessionAudioTrackCount(CinevaFFmpegSession * _Nonnull session);
+int CinevaFFmpegSessionAudioTrack(CinevaFFmpegSession * _Nonnull session, int ordinal, CinevaFFmpegAudioTrack * _Nonnull track);
+int CinevaFFmpegSessionSelectAudio(CinevaFFmpegSession * _Nonnull session, int streamIndex);
 enum {
     CinevaStageOpen = 1, CinevaStageProbe, CinevaStageSelectVideo,
     CinevaStageVideoOpen, CinevaStageAudioOpen, CinevaStageSeek,
@@ -73,6 +93,10 @@ void CinevaFFmpegSessionSnapshot(CinevaFFmpegSession * _Nonnull session,
     CinevaFFmpegSnapshot * _Nonnull snapshot);
 CVPixelBufferRef _Nullable CinevaFFmpegSessionCopyFrame(CinevaFFmpegSession * _Nonnull session,
     double * _Nonnull pts, double * _Nonnull duration, int * _Nonnull serial) CF_RETURNS_RETAINED;
+// Stereo interleaved Float32, 48000 Hz. Return valid frame count (not float count).
+// Output memory is owned by the caller; each result includes media PTS/generation.
+int CinevaFFmpegSessionCopyAudio(CinevaFFmpegSession * _Nonnull session,
+    float * _Nonnull samples, int frameCapacity, double * _Nonnull pts, int * _Nonnull serial);
 const char * _Nonnull CinevaFFmpegCodecName(int codec);
 void CinevaFFmpegErrorText(int code, char * _Nonnull buffer, int capacity);
 
