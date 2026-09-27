@@ -118,8 +118,15 @@ jobs:
           python3 Tests/PlayerTransport/range_server.py --port-file "$RUNNER_TEMP/range-port" &
           RANGE_PID=$!
           trap 'kill "$RANGE_PID" 2>/dev/null || true' EXIT
-          for attempt in {1..50}; do test -s "$RUNNER_TEMP/range-port" && break; sleep 0.1; done
-          "$RUNNER_TEMP/range-checks" "http://127.0.0.1:$(cat "$RUNNER_TEMP/range-port")"
+          for attempt in {1..300}; do
+            test -s "$RUNNER_TEMP/range-port" && break
+            kill -0 "$RANGE_PID" || exit 1
+            sleep 0.1
+          done
+          test -s "$RUNNER_TEMP/range-port"
+          RANGE_PORT=$(cat "$RUNNER_TEMP/range-port")
+          curl --fail --silent --max-time 5 -H 'Range: bytes=0-0' "http://127.0.0.1:$RANGE_PORT/ok" >/dev/null
+          "$RUNNER_TEMP/range-checks" "http://127.0.0.1:$RANGE_PORT"
           xcodebuild \
             -workspace Gallery115.xcworkspace \
             -scheme Gallery115 \
