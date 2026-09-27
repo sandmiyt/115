@@ -356,7 +356,11 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     var redirected = request
     if previous?.host != next?.host || previous?.port != next?.port || previous?.scheme != next?.scheme {
       // Rebuild cross-origin headers: do not forward custom credentials either.
-      redirected.allHTTPHeaderFields = [:]
+      // A copied Foundation redirect request can retain protocol properties
+      // carrying the original headers. Construct a genuinely new request.
+      guard let next else { condition.unlock(); completionHandler(nil); return }
+      redirected = URLRequest(url:next,cachePolicy:.reloadIgnoringLocalCacheData,timeoutInterval:5)
+      for key in source.headers.keys { redirected.setValue(nil,forHTTPHeaderField:key) }
       redirected.setValue("bytes=\(flight.start)-\(flight.end)", forHTTPHeaderField: "Range")
       redirected.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
     }

@@ -71,10 +71,13 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   @ObservationIgnored private var scrubTask: Task<Void,Never>?
   @ObservationIgnored private var audioTail = false
   @ObservationIgnored private var restoredAudioPreference = false
+  @ObservationIgnored private var recordsHistory = true
 
   func start(source: VideoSource, item: CloudItem, api: APIClient, library: LibraryStore,
-             at position: Double, playing: Bool = true, useCache: Bool = true, preferHardware: Bool = true) {
+             at position: Double, playing: Bool = true, useCache: Bool = true, preferHardware: Bool = true,
+             recordsHistory: Bool = true) {
     stop()
+    self.recordsHistory=recordsHistory
     currentSource=source; sourceItem=item; self.api=api; self.library=library
     target=max(0,position.isFinite ? position : 0); currentTime=target
     trial=FFmpegDiagnosticTrial(mode:useCache ? .cachedAudio : .standard,position:target,hardware:preferHardware)
@@ -178,6 +181,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     scrubTask?.cancel(); scrubTask=nil
   }
   func selectAudio(_ id: String?) {
+    interruptTrial("切换音轨，观察窗口未完成")
     guard let id, let index=Int32(id), let handle else { return }
     audio.pause(); renderer.setPlaying(false)
     let next=CinevaFFmpegSessionSelectAudio(handle.pointer,index)
@@ -205,7 +209,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     if !trialFrozen { trial.interruption=reason; trialFrozen=true }
   }
   private func saveProgress(force: Bool = false) {
-    guard let sourceItem, let library, duration>0 else { return }
+    guard recordsHistory, let sourceItem, let library, duration>0 else { return }
     let second=Int(currentTime)
     if force || second/5 != savedSecond/5 {
       library.recordPlayback(sourceItem,position:currentTime,duration:duration); savedSecond=second
@@ -290,6 +294,12 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     }
     CinevaFFmpegSessionSnapshot(handle.pointer,&snapshot)
     guard snapshot.serial==serial else { return }
+    if !waiting, renderer.waitingForData {
+      // Display recovery invalidates its submitted runway: freeze audio until
+      // the common buffering gate can release both outputs together.
+      audio.pause(); waiting=true; waitStarted=now; resumeTarget=0.75
+      playbackState = .buffering
+    }
     var videoEnd=contiguousEnd(from:currentTime,submitted:renderer.lastEnd,
       heldStart:pending?.1,heldEnd:pending.map { $0.1+$0.2 },queueStart:snapshot.videoStart,queueEnd:snapshot.videoEnd)
     var audioEnd=hasAudio ? contiguousEnd(from:currentTime,submitted:audio.submittedEnd,

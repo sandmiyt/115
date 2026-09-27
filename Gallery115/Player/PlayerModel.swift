@@ -329,6 +329,7 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
     externallyControlled = external
     didFallbackFromOriginal = false
     await play(source, allowFallback: true)
+    if !externallyControlled { installTimeObserverIfNeeded() }
   }
 
   func pause() {
