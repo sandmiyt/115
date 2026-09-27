@@ -22,6 +22,9 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   @ObservationIgnored private var trialPlaybackAt: Double?
   @ObservationIgnored private var trialFrozen = false
   private(set) var errorMessage: String?
+  private(set) var lastFailure: FFmpegFailureSnapshot?
+  @ObservationIgnored private var sessionID=UUID()
+  private(set) var inputBackend: FFmpegInputBackend = .customAVIOCached
   private(set) var videoSize: CGSize?
   private(set) var rotation = 0.0
   private(set) var audioUnderruns = 0
@@ -93,12 +96,14 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
 
   func start(source: VideoSource, item: CloudItem, api: APIClient, library: LibraryStore,
              at position: Double, playing: Bool = true, useCache: Bool = true, preferHardware: Bool = true,
-             recordsHistory: Bool = true) {
+             recordsHistory: Bool = true, inputBackend: FFmpegInputBackend? = nil) {
     stop()
+    sessionID=UUID()
+    self.inputBackend=inputBackend ?? (useCache ? .customAVIOCached : .ffmpegHTTP)
     self.recordsHistory=recordsHistory
     currentSource=source; sourceItem=item; self.api=api; self.library=library
     target=max(0,position.isFinite ? position : 0); currentTime=target
-    trial=FFmpegDiagnosticTrial(mode:useCache ? .cachedAudio : .standard,position:target,hardware:preferHardware)
+    trial=FFmpegDiagnosticTrial(mode:self.inputBackend.trialMode,position:target,hardware:preferHardware)
     trialPlaybackAt=nil; trialFrozen=false
     wantsPlayback=playing; waiting=true; resumeTarget=0.75; serial=1
     backgroundAudioOnly=false
@@ -118,7 +123,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     }
     var options = CinevaFFmpegSessionOptions()
     options.preferHardware=preferHardware ? 1 : 0; options.videoOnly=0; options.outputAudio=1
-    if useCache {
+    if self.inputBackend != .ffmpegHTTP {
       let scope: String
       if MediaSourceSelectionStore.shared.resolvedSource == .cloud115 {
         // Account API has no stable user identifier in the current auth model.
@@ -130,7 +135,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
       let identity=RangeCacheIdentity(account:scope,fileID:item.id,size:item.size,
         validator:item.sha1.isEmpty ? "" : "sha1:"+item.sha1.lowercased())
       audioPreferenceKey="cineva.ffmpeg.audio."+identity.key
-      let coordinator=RangeCoordinator(source:source,identity:identity,refresh:{
+      let coordinator=RangeCoordinator(source:source,identity:identity,cacheEnabled:self.inputBackend == .customAVIOCached,refresh:{
         let response=try await api.initialVideoSources(for:item,preferOriginal:true)
         guard let fresh=response.sources.first(where: \.isOriginal) else { throw URLError(.resourceUnavailable) }
         return fresh
@@ -297,6 +302,21 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     }
   }
   private func fail(_ message: String) {
+    // Freeze value copies before close/cancel can replace the root cause.
+    if lastFailure?.session != sessionID {
+      var snapshot=CinevaFFmpegSnapshot()
+      if let handle { CinevaFFmpegSessionSnapshot(handle.pointer,&snapshot) }
+      let io=cache?.statistics
+      let function=withUnsafeBytes(of:snapshot.failureFunction) { String(decoding:$0.prefix { $0 != 0 },as:UTF8.self) }
+      let build="\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"))"
+      lastFailure=FFmpegFailureSnapshot(session:sessionID,generation:serial,backend:inputBackend,
+        build:build,stage:FFmpegFailureSnapshot.stageName(snapshot.failureStage)+" / "+(function.isEmpty ? "函数不可获得" : function),
+        nativeError:snapshot.errorCode,transport:io?.text ?? "原生 HTTP：传输细节不可获得；未启用未脱敏 verbose 日志",
+        operations:"read offset=\(snapshot.lastReadOffset) count=\(snapshot.lastReadCapacity) result=\(snapshot.lastReadResult)\n"
+          + "seek offset=\(snapshot.lastSeekOffset) whence=\(snapshot.lastSeekWhence) result=\(snapshot.lastSeekResult)\n"
+          + "hint=\(io?.hintedLength ?? -1) verified=\(io?.verifiedLength ?? -1) · subsequent clues=\(io?.clues.joined(separator: "; ") ?? "none")")
+      diagnostics=lastFailure!.text
+    }
     interruptTrial("播放失败，观察窗口未完成")
     errorMessage=message
     audio.stop(); renderer.setPlaying(false)
@@ -359,7 +379,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     var snapshot=CinevaFFmpegSnapshot(); CinevaFFmpegSessionSnapshot(handle.pointer,&snapshot)
     if snapshot.status<0 {
       var message=[CChar](repeating:0,count:192); CinevaFFmpegErrorText(snapshot.errorCode,&message,192)
-      fail(snapshot.errorCode == -70001 ? "检测到 Dolby Vision，当前 FFmpeg 路径未实现动态元数据输出，请使用兼容内核。" : "FFmpeg 阶段 \(snapshot.failureStage)：\(String(cString:message))（\(snapshot.errorCode)）"); return
+      fail(snapshot.errorCode == -70001 ? "检测到 Dolby Vision，当前 FFmpeg 路径未实现动态元数据输出，请使用兼容内核。" : "FFmpeg \(FFmpegFailureSnapshot.stageName(snapshot.failureStage))：\(String(cString:message))（\(snapshot.errorCode)）"); return
     }
     if snapshot.serial != serial {
       resetSubtitleImage()
@@ -527,7 +547,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
         cachedBytes:io.map { Int64($0.memoryBytes) },decoder:snapshot.decoderType==2 ? "VideoToolbox" : "FFmpeg 软件解码",
         renderer:"Apple Native + AVAudioEngine PCM",droppedFrames:renderer.droppedFrames,
         avSyncOffset:hasAudio ? renderer.time-audio.audibleTime : nil)
-      diagnostics="FFmpeg · \(cache == nil ? "旧 HTTP" : "Custom AVIO / 分段缓存") · \(playbackState.title)\n"
+      diagnostics="FFmpeg · \(inputBackend.rawValue) · \(playbackState.title)\n"
         + "色彩：\(statistics.hdrFormat ?? "未知") · 系统 HDR 资格 \(AVPlayer.eligibleForHDRPlayback ? "有" : "无") · 已请求 EDR；实际屏幕输出待设备确认\n"
         + "SDR 映射：\(toneMappedSDR ? "Core Image Reference White → sRGB" : "未启用；原生像素路径")\n"
         + "当前音轨：\(String(cString:CinevaFFmpegCodecName(snapshot.audioCodec))) · 切轨警告 \(snapshot.audioWarningCode) · 输出 PCM 非 Atmos\n"

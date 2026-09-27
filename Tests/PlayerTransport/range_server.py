@@ -31,15 +31,17 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/416" or start >= total:
             self.send_response(416); self.send_header("Content-Range", f"bytes */{total}")
             self.send_header("Content-Length", "0"); self.end_headers(); return
-        if path in ("/short64", "/short10"):
+        if path in ("/short64", "/short10", "/shortchange"):
             end = min(end, start + (65536 if path == "/short64" else 10000) - 1)
         status = 200 if path in ("/bad200", "/small200") else 206
         if status == 200: start, end = 0, total - 1
-        self.send_response(status); self.send_header("Content-Length", str(end - start + 1))
+        self.send_response(status); self.send_header("Content-Length", str(end - start + 1 + (1 if path == "/badlength" else 0)))
         if status == 206:
             declared = start + 1 if path == "/wrongrange" else start
             self.send_header("Content-Range", f"bytes {declared}-{end}/{total}")
-        self.send_header("ETag", '"v2"' if path == "/changed" and start >= 1048576 else '"v1"')
+        if not (path == "/missingetag" and start >= 1048576):
+            changed = (path == "/changed" and start >= 1048576) or (path == "/shortchange" and start >= 10000)
+            self.send_header("ETag", '"v2"' if changed else '"v1"')
         self.end_headers()
         for pos in range(start, end + 1, 16384):
             self.wfile.write(bytes(i % 251 for i in range(pos, min(pos + 16384, end + 1))))

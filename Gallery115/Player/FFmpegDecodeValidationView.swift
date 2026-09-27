@@ -158,7 +158,7 @@ struct FFmpegDecodeValidationView: View {
     copiedDiagnostics = false; slider = comparisonPosition; activeMode=readMode
     if readMode.outputsAudio {
       player.start(source:source,item:item,api:appState.api,library:appState.libraryStore,
-        at:comparisonPosition,useCache:readMode == .cachedAudio,preferHardware:preferHardware,recordsHistory:false)
+        at:comparisonPosition,useCache:readMode == .cachedAudio,preferHardware:preferHardware,recordsHistory:false, inputBackend:readMode == .standard ? .ffmpegHTTP : readMode == .directAudio ? .customAVIODirect : .customAVIOCached)
     } else {
       session.start(source:source,at:comparisonPosition,preferHardware:preferHardware,mode:readMode)
     }

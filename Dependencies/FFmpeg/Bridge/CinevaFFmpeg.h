@@ -51,6 +51,9 @@ typedef struct {
     double recoveryTarget;
     // Failure is captured at its origin; worker activity cannot overwrite it.
     int failureStage, readerStage, decoderStage;
+    char failureFunction[48];
+    int64_t lastReadOffset, lastSeekOffset, lastSeekResult;
+    int lastReadCapacity, lastReadResult, lastSeekWhence;
     int probeRetried, seekFallbacks, audioWarningCode;
     int64_t decodedVideoFrames, prerollFrames;
     int videoProfile, videoStreamIndex;

@@ -46,6 +46,7 @@ struct CinevaFFmpegSession {
     AVFormatContext *format;
     AVIOContext *customIO;
     int64_t customOffset;
+    const char *readerFunction; // Reader-owned; captured under snapshot lock on failure.
     CinevaFFmpegSessionOptions options;
     AVCodecContext *video, *audio;
     AVCodecParameters *videoParameters;
@@ -90,24 +91,30 @@ static int interrupted(void *opaque) {
 }
 static int customRead(void *opaque, uint8_t *buffer, int capacity) {
     CinevaFFmpegSession *s = opaque;
-    if (interrupted(s)) return AVERROR_EXIT;
-    int n = s->options.read(s->options.ioContext, s->customOffset, buffer, capacity, atomic_load(&s->ioGeneration));
-    if (n > 0) { s->customOffset += n; return n; }
-    if (n == 0) return AVERROR_EOF;
-    if (n == -3) return AVERROR_EXIT;
-    if (n == -2) return AVERROR(ETIMEDOUT);
-    return AVERROR(EIO);
+    int64_t offset = s->customOffset;
+    int n = interrupted(s) ? -3 : s->options.read(s->options.ioContext, offset, buffer, capacity, atomic_load(&s->ioGeneration));
+    int result = n > 0 ? n : n == 0 ? AVERROR_EOF : n == -3 ? AVERROR_EXIT : n == -2 ? AVERROR(ETIMEDOUT) : AVERROR(EIO);
+    pthread_mutex_lock(&s->mutex);
+    s->snapshot.lastReadOffset = offset; s->snapshot.lastReadCapacity = capacity; s->snapshot.lastReadResult = result;
+    pthread_mutex_unlock(&s->mutex);
+    if (n > 0) s->customOffset += n;
+    return result;
 }
 static int64_t customSeek(void *opaque, int64_t offset, int whence) {
     CinevaFFmpegSession *s = opaque;
-    int64_t size = s->options.size(s->options.ioContext);
-    if (whence == AVSEEK_SIZE) return size >= 0 ? size : AVERROR(ENOSYS);
+    int originalWhence = whence;
+    int64_t size = s->options.size(s->options.ioContext), result;
     whence &= ~AVSEEK_FORCE;
-    int64_t base = whence == SEEK_SET ? 0 : whence == SEEK_CUR ? s->customOffset : whence == SEEK_END ? size : -1;
-    if (base < 0 || (offset > 0 && base > INT64_MAX - offset) ||
-        (offset < 0 && offset < -base)) return AVERROR(EINVAL);
-    s->customOffset = base + offset;
-    return s->customOffset; // Byte-level track switching never cancels cache windows.
+    if (whence == AVSEEK_SIZE) result = size >= 0 ? size : AVERROR(ENOSYS);
+    else {
+        int64_t base = whence == SEEK_SET ? 0 : whence == SEEK_CUR ? s->customOffset : whence == SEEK_END ? size : -1;
+        if (base < 0 || (offset > 0 && base > INT64_MAX - offset) || (offset < 0 && offset < -base)) result = AVERROR(EINVAL);
+        else { s->customOffset = base + offset; result = s->customOffset; }
+    }
+    pthread_mutex_lock(&s->mutex);
+    s->snapshot.lastSeekOffset = offset; s->snapshot.lastSeekWhence = originalWhence; s->snapshot.lastSeekResult = result;
+    pthread_mutex_unlock(&s->mutex);
+    return result; // Byte-level track switching never cancels cache windows.
 }
 static void closeInput(CinevaFFmpegSession *s) {
     avformat_close_input(&s->format);
@@ -119,6 +126,8 @@ static void fail(CinevaFFmpegSession *s, int error, int stage) {
         s->snapshot.status = -1;
         s->snapshot.errorCode = error;
         s->snapshot.failureStage = stage;
+        if (stage == s->snapshot.readerStage && s->readerFunction)
+            snprintf(s->snapshot.failureFunction, sizeof(s->snapshot.failureFunction), "%s", s->readerFunction);
     }
     atomic_store(&s->cancelled, 1);
     pthread_cond_broadcast(&s->changed);
@@ -127,6 +136,7 @@ static void fail(CinevaFFmpegSession *s, int error, int stage) {
 static void readerStage(CinevaFFmpegSession *s, int stage) {
     pthread_mutex_lock(&s->mutex);
     s->snapshot.readerStage = stage;
+    s->readerFunction = NULL;
     s->ioStartedUs = stage == CinevaStageOpen || stage == CinevaStageProbe ||
         stage == CinevaStageSeek || stage == CinevaStageRead ? av_gettime_relative() : 0;
     pthread_mutex_unlock(&s->mutex);
@@ -657,6 +667,7 @@ static int openInput(CinevaFFmpegSession *s, int extended) {
     av_dict_set(&options, "probesize", extended ? "8388608" : "2097152", 0);
     av_dict_set(&options, "analyzeduration", extended ? "8000000" : "3000000", 0);
     atomic_store(&s->deadline, av_gettime_relative() + 30000000);
+    s->readerFunction = "avformat_open_input";
     int result = avformat_open_input(&s->format, s->url, NULL, &options);
     av_dict_free(&options);
     return result;
@@ -675,6 +686,7 @@ static void *readLoop(void *opaque) {
         // stream probing too, so audio-only verification cannot cause MP4 seeks.
         int mov = s->format->iformat == av_find_input_format("mov");
         if (mov) {
+            s->readerFunction = "av_opt_set_int";
             result = av_opt_set_int(s->format->priv_data, "interleaved_read", s->videoOnly && s->options.sequentialVideoOnly ? 0 : 1, 0);
             if (result < 0) goto done;
         }
@@ -695,6 +707,7 @@ static void *readLoop(void *opaque) {
                     av_bprintf(&names, "%s%s", names.len ? "," : "", codec->name);
             }
             int complete = av_bprint_is_complete(&names);
+            s->readerFunction = complete ? "av_opt_set(codec_whitelist)" : NULL;
             result = complete ? av_opt_set(s->format, "codec_whitelist", names.str, 0) : AVERROR(ENOMEM);
             av_bprint_finalize(&names, NULL);
             if (result < 0) goto done;
@@ -704,6 +717,7 @@ static void *readLoop(void *opaque) {
         snprintf(s->snapshot.container, sizeof(s->snapshot.container), "%s", s->format->iformat->name);
         pthread_mutex_unlock(&s->mutex);
         stage = CinevaStageProbe; readerStage(s, stage);
+        s->readerFunction = "avformat_find_stream_info";
         result = avformat_find_stream_info(s->format, NULL);
         readerFinished(s, 0);
         s->videoIndex = selectVideo(s->format);
@@ -842,12 +856,14 @@ static void *readLoop(void *opaque) {
                 int64_t stamp = (int64_t)((target + s->origin) * AV_TIME_BASE);
                 atomic_store(&s->deadline, av_gettime_relative() + 10000000);
                 int64_t videoStamp = av_rescale_q(stamp, AV_TIME_BASE_Q, s->videoTimeBase);
+                s->readerFunction = "avformat_seek_file";
                 result = avformat_seek_file(s->format, s->videoIndex, INT64_MIN, videoStamp, videoStamp, 0);
                 if (result < 0 && result != AVERROR_EXIT && wanted == atomic_load(&s->generation) && !atomic_load(&s->cancelled) &&
                     av_gettime_relative() < atomic_load(&s->deadline)) {
                     // Some indexes implement the older keyframe seek more
                     // reliably. Keep the same target and bounded I/O deadline.
                     if (s->format->pb) { s->format->pb->error = 0; s->format->pb->eof_reached = 0; }
+                    s->readerFunction = "av_seek_frame";
                     result = av_seek_frame(s->format, s->videoIndex, videoStamp, AVSEEK_FLAG_BACKWARD);
                     pthread_mutex_lock(&s->mutex); s->snapshot.seekFallbacks++; pthread_mutex_unlock(&s->mutex);
                 }
@@ -874,6 +890,7 @@ static void *readLoop(void *opaque) {
         atomic_store(&s->ioGeneration, serial); atomic_store(&s->interruptSeek, 1);
         stage = CinevaStageRead; readerStage(s, stage);
         atomic_store(&s->deadline, av_gettime_relative() + 10000000);
+        s->readerFunction = "av_read_frame";
         result = av_read_frame(s->format, packet);
         readerFinished(s, 1);
         atomic_store(&s->interruptSeek, 0);

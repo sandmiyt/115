@@ -30,6 +30,7 @@ struct PlayerScreen: View {
   @State private var useFFmpeg = false
   @State private var ffmpegReason: String?
   @State private var didFFmpegFallback = false
+  @State private var lastFFmpegFailure: FFmpegFailureSnapshot?
   @State private var backendSwitchTask: Task<Void,Never>?
   @State private var backendSwitchGeneration = UUID()
   @State private var pendingAudioPreference: PlayerTrack?
@@ -379,6 +380,7 @@ struct PlayerScreen: View {
     }
     .onChange(of: ffmpegEngine.errorMessage) { _, message in
       if let message, useFFmpeg, !didFFmpegFallback {
+        lastFFmpegFailure=ffmpegEngine.lastFailure
         didFFmpegFallback=true
         switchPlaybackBackend(.apple)
         ffmpegReason=message+" 已停止 FFmpeg，并按原位置和播放意图尝试 AVPlayer。"
@@ -1326,6 +1328,12 @@ struct PlayerScreen: View {
                 }
               }
               if let reason=ffmpegReason { Text(reason).font(.caption).foregroundStyle(.orange) }
+              if let failure=lastFFmpegFailure {
+                DisclosureGroup("上次 FFmpeg 失败快照") {
+                  Text(failure.text).font(.caption2).textSelection(.enabled)
+                  Button("复制 FFmpeg 失败快照") { UIPasteboard.general.string=failure.text }
+                }
+              }
               if useFFmpeg {
                 Text("AirPlay 可选择系统音频路由；远端视频播放请尝试 AVPlayer，实际可用性取决于文件与鉴权。")
                   .font(.caption).foregroundStyle(.secondary)

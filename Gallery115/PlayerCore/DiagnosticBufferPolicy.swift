@@ -53,15 +53,16 @@ struct DiagnosticBufferPolicy {
 }
 
 enum FFmpegReadMode: String, CaseIterable, Identifiable {
-  case videoOnlyStandard, videoOnlySequential, standard, cachedAudio, decodeAudio
+  case videoOnlyStandard, videoOnlySequential, standard, directAudio, cachedAudio, decodeAudio
   var id: Self { self }
   var videoOnly: Bool { self == .videoOnlySequential || self == .videoOnlyStandard }
-  var outputsAudio: Bool { self == .standard || self == .cachedAudio }
+  var outputsAudio: Bool { self == .standard || self == .directAudio || self == .cachedAudio }
   var title: String {
     switch self {
     case .videoOnlyStandard: return "Video-only + 标准读取"
     case .videoOnlySequential: return "Video-only + 顺序读取（稳定对照）"
-    case .standard: return "音视频输出 + 旧 HTTP"
+    case .standard: return "音视频输出 + FFmpeg 原生 HTTP"
+    case .directAudio: return "音视频输出 + Custom AVIO 直读（绕过缓存）"
     case .cachedAudio: return "音视频输出 + Custom AVIO 缓存"
     case .decodeAudio: return "音频仅解码 + 旧 HTTP（不输出声音）"
     }
@@ -101,5 +102,45 @@ struct FFmpegDiagnosticTrial: Identifiable {
       + String(format: "取包平均 %.4f s / 最大 %.4f s · 压缩视频队列 %.3f s", averageRead, maximumRead, compressed)
       + (interruption.map { "\n对照标记：" + $0 } ?? "")
       + (httpRequests.map { "\n真实 HTTP requests \($0) · 网络 bytes \(networkBytes ?? 0) · 缓存命中 bytes \(cacheHitBytes ?? 0)（以实际命中区分冷/暖）" } ?? "")
+  }
+}
+
+/// The input alone varies; audio, decoder and renderer stay identical.
+enum FFmpegInputBackend: String, Sendable {
+  case ffmpegHTTP, customAVIODirect, customAVIOCached
+  var trialMode: FFmpegReadMode {
+    switch self { case .ffmpegHTTP: return .standard; case .customAVIODirect: return .directAudio; case .customAVIOCached: return .cachedAudio }
+  }
+}
+
+struct FFmpegFailureSnapshot: Sendable {
+  let session: UUID
+  let generation: Int32
+  let backend: FFmpegInputBackend
+  let build: String
+  let stage: String
+  let nativeError: Int32
+  let transport: String
+  let operations: String
+  var text: String {
+    "Cineva \(build) · FFmpeg failure (frozen before teardown)\n"
+    + "session=\(session.uuidString) · generation=\(generation) · backend=\(backend.rawValue)\n"
+    + "stage=\(stage) · FFmpeg=\(nativeError)\n" + transport + "\n" + operations
+  }
+  static func stageName(_ value: Int32) -> String {
+    switch value {
+    case 1:return "打开媒体"
+    case 2:return "探测流信息"
+    case 3:return "选择视频轨"
+    case 4:return "打开视频解码器"
+    case 5:return "打开音频解码器"
+    case 6:return "定位媒体"
+    case 7:return "读取媒体包"
+    case 8:return "视频解码"
+    case 9:return "音频解码"
+    case 10:return "视频表面输出"
+    case 11:return "启动工作线程"
+    default:return "引擎控制 / 尚无原生失败阶段"
+    }
   }
 }

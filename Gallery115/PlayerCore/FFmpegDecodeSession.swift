@@ -31,6 +31,7 @@ private final class DecodeDisplayLinkTarget: NSObject {
 @MainActor @Observable
 final class FFmpegDecodeSession {
   private(set) var state: PlayerState = .idle
+  private(set) var failureEvidence: String?
   private(set) var currentTime = 0.0
   private(set) var duration = 0.0
   private(set) var videoFrames: Int64 = 0
@@ -91,7 +92,7 @@ final class FFmpegDecodeSession {
       + "\(modeDescription)\n\(ioDescription)\n\(ioTimingDescription)\n\(ioJumpDescription)\n\(readStatistics)\n\(bufferDescription)\n"
       + String(format: "压缩视频队列：%.2f s（尚未解码）\n", compressedVideoSeconds)
       + "解码器输出：\(decodedVideoFrames) 帧；目标前预滚：\(prerollFrames) 帧\n"
-      + "\(failure)\n" + (audioWarning ?? "") + "\n" + (fallbackDescription ?? "")
+      + "\(failure)\n" + (failureEvidence ?? "") + "\n" + (audioWarning ?? "") + "\n" + (fallbackDescription ?? "")
   }
 
   @ObservationIgnored private var handle: FFmpegSessionHandle?
@@ -106,6 +107,7 @@ final class FFmpegDecodeSession {
   func start(source: VideoSource, at seconds: Double, preferHardware: Bool = true,
              mode: FFmpegReadMode = .videoOnlySequential) {
     guard handle == nil else { return }
+    failureEvidence=nil
     let start = seconds.isFinite ? max(0, seconds) : 0
     readMode = mode
     modeDescription = mode.videoOnly ? "Video-only diagnostic · 等待容器识别" : "标准 FFmpeg · 音频仅解码计数"
@@ -353,6 +355,8 @@ final class FFmpegDecodeSession {
       publish(snapshot, now: CACurrentMediaTime())
       updateTrial(snapshot, now: CACurrentMediaTime())
       interruptTrial("会话失败，未完成的对照窗口停止统计")
+      let function=withUnsafeBytes(of:snapshot.failureFunction) { String(decoding:$0.prefix { $0 != 0 },as:UTF8.self) }
+      failureEvidence="generation=\(snapshot.serial) · backend=ffmpegHTTP · function=\(function.isEmpty ? "不可获得" : function) · FFmpeg=\(snapshot.errorCode)\n原生 HTTP 传输细节不可获得；未开启未脱敏日志"
       let failureStage = stageName(snapshot.failureStage)
       let detail = errorText(snapshot.errorCode)
       let code = snapshot.errorCode

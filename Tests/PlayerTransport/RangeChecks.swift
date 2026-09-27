@@ -10,8 +10,8 @@ import Foundation
       VideoSource(id:"fixture",title:"fixture",definition:0,url:URL(string:base+path)!,kind:.original,headers:headers)
     }
     func client(_ path: String, size: Int64 = 3*1048576+97, id: String = UUID().uuidString,
-                version: String = "fixture-v1", headers: [String:String] = [:], refresh: RangeCoordinator.Refresh? = nil) -> RangeCoordinator {
-      RangeCoordinator(source:source(path,headers:headers),identity:RangeCacheIdentity(account:"test-account",fileID:id,size:size,validator:version),disk:disk,refresh:refresh)
+                version: String = "fixture-v1", cacheEnabled: Bool = true, headers: [String:String] = [:], refresh: RangeCoordinator.Refresh? = nil) -> RangeCoordinator {
+      RangeCoordinator(source:source(path,headers:headers),identity:RangeCacheIdentity(account:"test-account",fileID:id,size:size,validator:version),disk:disk,cacheEnabled:cacheEnabled,refresh:refresh)
     }
     var checks=0
     func expect(_ ok: Bool,_ message: String) { precondition(ok,message); checks+=1 }
@@ -31,7 +31,9 @@ import Foundation
     expect(read(cold,size)==0,"Verified EOF")
     cold.close()
     let warm=client("/ok",id:"warm")
-    expect(read(warm,0)>0 && warm.statistics.diskHitBytes>0 && warm.statistics.requests==0,"Warm disk cache")
+    expect(warm.fileSize == -1,"Listing size is not confirmed AVSEEK_SIZE")
+    expect(read(warm,size-1)>0,"Warm session validates HTTP identity first")
+    expect(read(warm,0)>0 && warm.statistics.diskHitBytes>0 && warm.statistics.requests==1,"Warm disk cache after validation")
     warm.close()
     let changedIdentity=client("/ok",id:"warm",version:"fixture-v2")
     expect(read(changedIdentity,0)>0 && changedIdentity.statistics.requests>0,"Version isolates disk cache")
@@ -66,6 +68,36 @@ import Foundation
       expect(c.statistics.requests<400,"Short 206 finite request count")
       c.close()
     }
+    for hint in [size-1,size+1] {
+      let c=client("/ok",size:hint,id:"warm")
+      expect(c.fileSize == -1,"Provisional size unavailable to AVSEEK_SIZE")
+      expect(read(c,hint)<0 && c.statistics.requests==1,"Hint cannot manufacture EOF")
+      expect(c.statistics.terminalFailure?.kind == .metadataConflict,"Hint mismatch classified without mixing cache")
+      expect(c.statistics.diskHitBytes==0 && c.statistics.memoryBytes==0,"Hint conflict isolates existing pages")
+      let frozen=c.statistics.terminalFailure!.text
+      c.close()
+      expect(c.statistics.terminalFailure?.text==frozen,"Teardown preserves first terminal evidence")
+    }
+    let direct=client("/ok",cacheEnabled:false)
+    expect(read(direct,0)>0,"Direct AVIO reads real bytes")
+    expect(read(direct,2*1048576)>0 && read(direct,0)>0,"Direct AVIO forward/backward input")
+    expect(direct.statistics.memoryHitBytes==0 && direct.statistics.diskHitBytes==0 && direct.statistics.memoryBytes==0,"Direct AVIO bypasses all pages")
+    expect(direct.statistics.requests>=3,"Direct backread actually uses transport")
+    direct.close()
+    for path in ["/badlength","/shortchange","/missingetag"] {
+      let c=client(path)
+      if path != "/badlength" { expect(read(c,0)>0,"Initial matching representation") }
+      let offset:Int64=path == "/shortchange" ? 10000 : 2*1048576
+      expect(read(c,offset)<0,"Reject invalid body declaration or version loss")
+      expect(c.statistics.terminalFailure != nil,"Typed terminal snapshot retained")
+      c.close()
+    }
+    let auth=client("/expired",headers:["Authorization":"do-not-log", "User-Agent":"Cineva-iOS/2.0"])
+    expect(read(auth,0)<0 && auth.statistics.terminalFailure?.kind == .authentication,"Authentication is typed")
+    let evidence=auth.statistics.terminalFailure!.text
+    auth.close()
+    expect(!evidence.contains("do-not-log") && !evidence.contains("http") && !evidence.contains("Authorization"),"Evidence has no credentials or URL")
+    expect(auth.statistics.terminalFailure?.text==evidence,"Close cannot replace failure with cancellation")
     let slow=client("/slow"), before=Date()
     expect(read(slow,0)>0 && Date().timeIntervalSince(before)<1,"Incremental bytes before full block")
     slow.changeGeneration(2)
