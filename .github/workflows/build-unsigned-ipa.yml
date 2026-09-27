@@ -134,6 +134,15 @@ jobs:
           RANGE_PORT=$(cat "$RUNNER_TEMP/range-port")
           curl --fail --silent --max-time 5 -H 'Range: bytes=0-0' "http://127.0.0.1:$RANGE_PORT/ok" >/dev/null
           "$RUNNER_TEMP/range-checks" "http://127.0.0.1:$RANGE_PORT"
+          # Compare the exact pre-change transport with identical loopback calls.
+          git fetch --depth=1 origin 16b7e74efa3860c80a8e5f565ebb3898d68510f1
+          git show 16b7e74efa3860c80a8e5f565ebb3898d68510f1:Gallery115/PlayerCore/RangeCoordinator.swift > "$RUNNER_TEMP/RangeBefore.swift"
+          swiftc Gallery115/Models/VideoSource.swift "$RUNNER_TEMP/RangeBefore.swift" \
+            Tests/PlayerTransport/RangeTimingChecks.swift -o "$RUNNER_TEMP/range-before"
+          swiftc Gallery115/Models/VideoSource.swift Gallery115/PlayerCore/RangeCoordinator.swift \
+            Tests/PlayerTransport/RangeTimingChecks.swift -o "$RUNNER_TEMP/range-after"
+          "$RUNNER_TEMP/range-before" "http://127.0.0.1:$RANGE_PORT" before
+          "$RUNNER_TEMP/range-after" "http://127.0.0.1:$RANGE_PORT" after
           xcodebuild \
             -workspace Gallery115.xcworkspace \
             -scheme Gallery115 \

@@ -417,6 +417,7 @@ final class ArtworkCacheTests: XCTestCase {
     let calls = await probe.calls
     XCTAssertEqual(calls, 12)
     XCTAssertLessThanOrEqual(peak, 3)
+    await cache.flushPersistence() // Do not remove the fixture directory while atomic writes are still active.
   }
 
   func testCancellingOneConsumerDoesNotCancelSharedRequest() async throws {

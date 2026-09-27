@@ -17,6 +17,17 @@ private final class PendingRangeRead: @unchecked Sendable {
   }
 }
 
+private final class SlowDiskGate: @unchecked Sendable {
+  let entered=DispatchSemaphore(value:0), release=DispatchSemaphore(value:0)
+  private let lock=NSLock()
+  private var first=true
+  func available()->Int64 {
+    lock.lock(); let block=first; first=false; lock.unlock()
+    if block { entered.signal(); _=release.wait(timeout:.now()+15) }
+    return 8*1073741824
+  }
+}
+
 @main struct RangeChecks {
   static func main() throws {
     let base=CommandLine.arguments[1]
@@ -164,7 +175,7 @@ private final class PendingRangeRead: @unchecked Sendable {
     expect(read(cold,200000)>0,"Backward cached range")
     expect(cold.statistics.memoryHitBytes>0,"Actual memory hit")
     expect(read(cold,size)==0,"Verified EOF")
-    cold.close()
+    cold.close(); disk.flush()
     let warm=client("/ok",id:"warm")
     expect(warm.fileSize == -1,"Listing size is not confirmed AVSEEK_SIZE")
     expect(read(warm,size-1)>0,"Warm session validates HTTP identity first")
@@ -203,7 +214,7 @@ private final class PendingRangeRead: @unchecked Sendable {
       expect(read(c,7777)>0 && read(c,2*1048576+37)>0,"Short 206 backward/random reads")
       expect(c.statistics.requests<400,"Short 206 finite request count")
       for _ in 0..<100 where c.statistics.memoryBytes<Int(size) { Thread.sleep(forTimeInterval:0.01) }
-      c.close()
+      c.close(); disk.flush()
       let warmShort=client(path,id:cacheID)
       expect(read(warmShort,size-1)>0 && read(warmShort,0)>0,"Short 206 warm validation/read")
       expect(warmShort.statistics.diskHitBytes>0,"Only assembled complete short-response pages persist")
@@ -276,6 +287,22 @@ private final class PendingRangeRead: @unchecked Sendable {
     expect(RangeCoordinator.contentRange("bytes 0-9/9")==nil,"End outside total")
     expect(RangeCoordinator.contentRange("bytes -1-5/9")==nil,"Negative syntax is not silently stripped")
     expect(RangeCoordinator.contentRange("bytes +0-5/9")==nil,"Range requires decimal digits")
+    let diskGate=SlowDiskGate()
+    let blockedDisk=SegmentDiskCache(root:root.appendingPathComponent("blocked-writer"),
+      freeSpace:{ diskGate.available() })
+    let whileWriting=RangeCoordinator(source:source("/large"),identity:RangeCacheIdentity(
+      account:"test",fileID:"blocked-writer",size:576*1048576+97,validator:"test-v1"),disk:blockedDisk)
+    expect(read(whileWriting,0)>0,"First bytes precede disk persistence")
+    expect(diskGate.entered.wait(timeout:.now()+2) == .success,"Fixture holds actual utility writer")
+    let duringWrite=ProcessInfo.processInfo.systemUptime
+    expect(read(whileWriting,2*1048576)>0,"Foreground miss progresses with disk writer blocked")
+    expect(ProcessInfo.processInfo.systemUptime-duringWrite<1,"Disk callback cannot delay foreground network read")
+    for index in 3..<12 {
+      expect(read(whileWriting,Int64(index)*1048576)>0,"Network stays usable under disk backpressure")
+      for _ in 0..<100 where whileWriting.statistics.memoryBytes<(index-1)*1048576 { Thread.sleep(forTimeInterval:0.005) }
+      expect(blockedDisk.queuedWriteBytes<=4*1048576,"Pending persistence never exceeds 4 MiB")
+    }
+    diskGate.release.signal(); whileWriting.close(); blockedDisk.flush()
     let priority=client("/slow?priority")
     expect(read(priority,0)>0,"Prime foreground before prefetch priority check")
     for _ in 0..<400 where priority.statistics.memoryBytes<1048576 { Thread.sleep(forTimeInterval:0.01) }

@@ -101,6 +101,7 @@ final class SegmentDiskCache: @unchecked Sendable {
   private let queue = DispatchQueue(label:"cineva.segment.disk",qos:.utility)
   private let admission = NSLock()
   private var pendingBytes = 0
+  private var pendingFaults:Set<URL>=[]
   private let pendingLimit = 4*1048576
   private let root: URL
   private let capacity: @Sendable () -> Int64
@@ -120,6 +121,7 @@ final class SegmentDiskCache: @unchecked Sendable {
     var stamps:[Int64:TimeInterval] = [:]
   }
   var epoch: UInt64 { queue.sync { revision } }
+  var queuedWriteBytes:Int { admission.lock(); defer { admission.unlock() }; return pendingBytes }
   init(root:URL? = nil, capacity:@escaping @Sendable () -> Int64 = {
     Int64(UserDefaults.standard.integer(forKey:SegmentDiskCache.capacityPreference))*1073741824
   }, freeSpace:(@Sendable () -> Int64)? = nil) {
@@ -192,6 +194,7 @@ final class SegmentDiskCache: @unchecked Sendable {
   private func room(for bytes:Int64, key:String)->Bool {
     index()
     let limit=capacity(), reserve:Int64=1073741824
+    guard bytes>=0,bytes<=Int64.max-reserve else { return false }
     let protected=entries.filter { entry in
       let owner=String(entry.key.lastPathComponent.prefix(64))
       return owner==key || (leases[owner] ?? 0)>0
@@ -226,7 +229,7 @@ final class SegmentDiskCache: @unchecked Sendable {
       records[key]=record
       let bytes=record.pages.reduce(Int64(0)) { $0+min(65536,total-$1) }
       let missing=max(0,total-bytes), overhead=(missing/65536+1)*8192+1048576
-      let limited=reserveWhole && !room(for:missing+overhead,key:key)
+      let limited=reserveWhole && (missing>Int64.max-overhead || !room(for:missing+overhead,key:key))
       let message=limited ? "空间或视频缓存额度不足，已暂停整片下载；正常播放不受影响" : writeFailures[key]
       // Record is intentionally created before the first async page batch.
       if !FileManager.default.fileExists(atPath:manifest(key).path) { try? save(record,key:key) }
@@ -242,17 +245,30 @@ final class SegmentDiskCache: @unchecked Sendable {
       return (key,record.total,record.validator,progress(record,persistent:true).complete)
     }
   }
-  func read(key:String,offset:Int64,length:Int)->Data? {
-    queue.sync {
-      let file=path(key,offset)
-      guard let stored=try? Data(contentsOf:file),stored.count==length+32,
-        Data(SHA256.hash(data:stored.dropFirst(32)))==stored.prefix(32) else {
-        if var record=load(key),record.pages.remove(offset) != nil { try? save(record,key:key) }
-        try? FileManager.default.removeItem(at:file); entries.removeValue(forKey:file)
-        return nil
+  private func discardPage(key:String,offset:Int64,length:Int,file:URL) {
+    admission.lock()
+    guard pendingFaults.count<64,pendingFaults.insert(file).inserted else { admission.unlock(); return }
+    admission.unlock()
+    queue.async {
+      defer { self.admission.lock(); self.pendingFaults.remove(file); self.admission.unlock() }
+      // A queued atomic writer may already have repaired a miss/corrupt page.
+      if let current=try? Data(contentsOf:file),current.count==length+32,
+        Data(SHA256.hash(data:current.dropFirst(32)))==current.prefix(32) { return }
+      if var record=self.records[key],record.pages.remove(offset) != nil {
+        try? self.save(record,key:key)
       }
-      return Data(stored.dropFirst(32))
+      try? FileManager.default.removeItem(at:file); self.entries.removeValue(forKey:file)
     }
+  }
+  func read(key:String,offset:Int64,length:Int)->Data? {
+    // Atomic immutable blocks can be read without joining the writer/eviction
+    // queue. A foreground seek must not wait behind speculative persistence.
+    let file=path(key,offset)
+    guard let stored=try? Data(contentsOf:file),stored.count==length+32,
+      Data(SHA256.hash(data:stored.dropFirst(32)))==stored.prefix(32) else {
+      discardPage(key:key,offset:offset,length:length,file:file); return nil
+    }
+    return Data(stored.dropFirst(32))
   }
   @discardableResult func enqueue(_ pages:[(Int64,Data)],key:String,epoch:UInt64,
                                   identity:String? = nil,total:Int64 = 0,validator:String = "",
@@ -421,11 +437,15 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     guard let token=prefetchToken else { return }
     previewTokens.remove(token); readerErrors.removeValue(forKey:token)
     cancelFlights(for:token); prefetchToken=nil
+    if refreshOwner==token {
+      refreshTask?.cancel(); refreshTask=nil; refreshing=false; refreshed=false; refreshOwner=nil
+    }
   }
   private func maintain() {
     condition.lock()
     guard !closed, fatalError==nil else { condition.unlock(); return }
     guard let key=diskKey,let validator=responseValidator else {
+      if length<0 { diskProgress=MediaCacheProgress(); condition.unlock(); return }
       diskProgress=MediaCacheProgress(total:max(0,length),limitation:cacheEnabled
         ? "尚无可靠的媒体响应标识，仅在线播放，未写入磁盘" : "此媒体使用在线播放")
       condition.unlock(); return
@@ -438,7 +458,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     let (progress,pages)=disk.inspect(key:key,identity:identity.isPersistent ? identity.key : key,
       total:total,validator:validator,persistent:identity.isPersistent,reserveWhole:enabled)
     condition.lock()
-    guard !closed,diskKey==key else { condition.unlock(); return }
+    guard !closed,fatalError==nil,diskKey==key else { condition.unlock(); return }
     diskProgress=progress; durablePages=pages
     if ProcessInfo.processInfo.systemUptime<prefetchRetryAt {
       diskProgress.limitation="整片下载暂时中断，稍后重试；正常播放仍可继续"
@@ -478,7 +498,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     previewTokens.insert(token); prefetchToken=token
     condition.unlock()
     var bytes=[UInt8](repeating:0,count:65536)
-    let end=min(total,offset+window)
+    let end=offset+min(window,total-offset)
     while offset<end {
       let n=read(offset:offset,buffer:&bytes,count:Int(min(65536,end-offset)),generation:token)
       if n<=0 {
@@ -542,6 +562,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
   }
   func changeGeneration(_ value:Int32) {
     condition.lock()
+    guard !closed else { condition.unlock(); return }
     yieldPrefetch(); prefetchAllowed=false
     let previous=generation; generation=value; readerErrors.removeValue(forKey:previous)
     cancelFlights(for:previous)
@@ -662,6 +683,16 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
           result=Int32(n); return result
         }
       }
+      // The OS may purge a formerly complete cache. Resolve the real source
+      // only after an actual local hole, never as a prerequisite for local open.
+      if source.url.scheme=="cineva-cache",!refreshing {
+        guard !refreshed,let refresh else { result = -1; return result }
+        refreshed=true; refreshing=true; refreshOwner=wanted; stats.refreshes+=1
+        refreshTask=Task.detached { [weak self] in
+          do { self?.didRefresh(try await refresh(),generation:wanted) }
+          catch { self?.didRefresh(nil,generation:wanted) }
+        }
+      }
       if primary {
         lastForegroundMiss=ProcessInfo.processInfo.systemUptime
         // Coalesce an exact active range; unrelated speculative work yields now.
@@ -779,11 +810,14 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     var end=min(start+min(span-1,Int64.max-start),length>0 ? length-1 : Int64.max)
     // Stop at the next actual cached span instead of re-downloading its bytes.
     if cacheEnabled {
-      for base in stride(from:start/page*page,through:end,by:page) {
+      var base=start/page*page
+      while base<=end {
         if durablePages.contains(base),base>start { end=min(end,base-1); break }
         if let block=memory[base],let next=block.coverage.first(where: { base+Int64($0.lowerBound)>start }) {
           end=min(end,base+Int64(next.lowerBound)-1); break
         }
+        if base>Int64.max-page { break }
+        base+=page
       }
     }
     let f=Flight(start:start,end:end,generation:generation,recovery:recovery)

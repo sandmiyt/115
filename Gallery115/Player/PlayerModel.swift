@@ -286,6 +286,7 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
       if external, let local=await FFmpegPlayerEngine.cachedSource(for:item) {
         try Task.checkCancellation()
         sources=[local]; await play(local,allowFallback:false)
+        loadRemainingSources()
         return
       }
       let initial = try await api.initialVideoSources(for: item, preferOriginal: defaultQuality == .original)
