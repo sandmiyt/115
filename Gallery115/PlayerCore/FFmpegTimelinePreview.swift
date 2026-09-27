@@ -85,7 +85,15 @@ actor FFmpegPreviewWorker {
             guard let mapped=filter.outputImage else { return result(nil,"HDR 预览转换不可用") }; image=mapped
           } else { return result(nil,"此 HDR 预览需可靠的 SDR 映射；保留主画面") }
         }
-        image=image.transformed(by:CGAffineTransform(rotationAngle:CGFloat(snapshot.rotation * .pi/180)))
+        // Core Image uses a bottom-left coordinate system, whereas the
+        // primary CALayer uses UIKit coordinates. Invert the layer angle.
+        let angle=snapshot.rotation.isFinite ? snapshot.rotation.truncatingRemainder(dividingBy:360) : 0
+        let quarter=(angle/90).rounded()
+        if abs(angle/90-quarter)<0.0001 {
+          // Exact EXIF transforms avoid an extra border pixel from cos(pi/2).
+          let orientations:[Int32]=[1,6,3,8]
+          image=image.oriented(forExifOrientation:orientations[(Int(quarter)%4+4)%4])
+        } else { image=image.transformed(by:CGAffineTransform(rotationAngle:-CGFloat(angle * .pi/180))) }
         let scale=min(1,480/max(image.extent.width,image.extent.height))
         image=image.transformed(by:CGAffineTransform(scaleX:scale,y:scale))
         guard let cg=context.createCGImage(image,from:image.extent,format:.RGBA8,

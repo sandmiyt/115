@@ -1,6 +1,7 @@
 import AVFoundation
 import CinevaFFmpeg
 import Foundation
+import CoreImage
 
 @main struct PreviewChecks {
   static func main() async {
@@ -22,7 +23,26 @@ import Foundation
           expect(cached.pts==frame.pts && cached.note=="帧缓存","Cache keys actual interval, not half-second bucket")
         }
         let image=frame.image!.cgImage!
-        if file=="rotated.mp4" { expect(image.height>image.width,"Display rotation applies to preview pixels") }
+        if file=="rotated.mp4" {
+          expect(image.height>image.width,"Display rotation applies to preview pixels")
+          // Apple is an orientation oracle for this MP4 test ONLY; production
+          // preview and every other fixture still use the real FFmpeg worker.
+          let oracle=AVAssetImageGenerator(asset:AVURLAsset(url:source.url))
+          oracle.appliesPreferredTrackTransform=true
+          oracle.requestedTimeToleranceBefore = .zero; oracle.requestedTimeToleranceAfter = .zero
+          let reference=try! await oracle.image(at:CMTime(seconds:frame.pts,preferredTimescale:60000))
+          expect(abs(reference.actualTime.seconds-frame.pts)<0.002,"Orientation oracle uses the same actual frame")
+          let normalized=CIContext().createCGImage(CIImage(cgImage:reference.image),from:CGRect(x:0,y:0,width:CGFloat(reference.image.width),height:CGFloat(reference.image.height)),format:.RGBA8,colorSpace:CGColorSpace(name:CGColorSpace.sRGB)!)!
+          expect(image.width==normalized.width && image.height==normalized.height,"Rotated bounds match track transform")
+          let rawA=image.dataProvider!.data!, rawB=normalized.dataProvider!.data!
+          let a=CFDataGetBytePtr(rawA)!, b=CFDataGetBytePtr(rawB)!
+          var same=0,total=0
+          for y in stride(from:2,to:image.height,by:3) { for x in stride(from:2,to:image.width,by:3) {
+            if (a[y*image.bytesPerRow+x*4]>128)==(b[y*normalized.bytesPerRow+x*4]>128) { same+=1 }; total+=1
+          } }
+          withExtendedLifetime((rawA,rawB)) {}
+          expect(Double(same)/Double(total)>0.98,"Preview orientation matches preferred track transform: \(same)/\(total) samples")
+        }
         expect(max(image.width,image.height)<=481,"Preview output size bounded independently of source")
         if file != "rotated.mp4" && file != "4k.mp4", let raw=image.dataProvider?.data {
           let bytes=CFDataGetBytePtr(raw)!
@@ -46,7 +66,8 @@ import Foundation
         var pts=0.0,duration=0.0,serial:Int32=0
         if CinevaFFmpegSessionCopyFrame(primary.pointer,&pts,&duration,&serial) != nil { video=true }
         var pcm=[Float](repeating:0,count:131072)
-        if CinevaFFmpegSessionCopyAudio(primary.pointer,&pcm,65536,&pts,&serial)>0 { audio=true }
+        let count=CinevaFFmpegSessionCopyAudio(primary.pointer,&pcm,65536,&pts,&serial)
+        if count>0 { audio = audio || pcm.prefix(Int(count)*2).contains { abs($0)>0.00001 } }
         CinevaFFmpegSessionSnapshot(primary.pointer,&snapshot)
         expect(snapshot.status>=0,"Primary decoder survives preview lifetime")
         try? await Task.sleep(for:.milliseconds(10))
