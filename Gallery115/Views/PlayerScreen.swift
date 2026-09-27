@@ -31,9 +31,7 @@ struct PlayerScreen: View {
   @State private var useVLC = false
   @State private var ffmpegEngine = FFmpegPlayerEngine()
   @State private var useFFmpeg = true
-  @State private var ffmpegReason: String?
   @State private var didFFmpegFallback = false
-  @State private var lastFFmpegFailure: FFmpegFailureSnapshot?
   @State private var backendSwitchTask: Task<Void,Never>?
   @State private var backendSwitchGeneration = UUID()
   @State private var pendingAudioPreference: PlayerTrack?
@@ -384,11 +382,9 @@ struct PlayerScreen: View {
       if let message, useVLC { model?.errorMessage = message }
     }
     .onChange(of: ffmpegEngine.errorMessage) { _, message in
-      if let message, useFFmpeg, !didFFmpegFallback {
-        lastFFmpegFailure=ffmpegEngine.lastFailure
+      if message != nil, useFFmpeg, !didFFmpegFallback {
         didFFmpegFallback=true
         switchPlaybackBackend(.apple)
-        ffmpegReason=message+" 已停止 FFmpeg，并按原位置和播放意图尝试 AVPlayer。"
         showControls(animated:true)
       }
     }
@@ -1324,29 +1320,12 @@ struct PlayerScreen: View {
       ScrollView {
         LazyVStack(alignment: .leading, spacing: 12) {
           if let model {
-            VStack(alignment:.leading,spacing:8) {
-              Text("播放内核：\(activeStatistics.backend?.rawValue ?? "准备中")").font(.caption)
-              if let reason=ffmpegReason { Text(reason).font(.caption).foregroundStyle(.orange) }
-              if let failure=lastFFmpegFailure {
-                DisclosureGroup("上次 FFmpeg 失败快照") {
-                  Text(failure.text).font(.caption2).textSelection(.enabled)
-                  Button("复制 FFmpeg 失败快照") { UIPasteboard.general.string=failure.text }
-                }
+            if useFFmpeg {
+              if let failure = ffmpegEngine.pip?.failure {
+                Text(failure).font(.caption).foregroundStyle(.orange)
               }
-              if useFFmpeg {
-                Text("AirPlay 可选择系统音频路由；远端视频输出取决于当前内核、文件与鉴权。")
-                  .font(.caption).foregroundStyle(.secondary)
-                DisclosureGroup("播放详情") {
-                  Text(ffmpegEngine.diagnostics).font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
-                  Button("复制播放诊断") { UIPasteboard.general.string=ffmpegEngine.diagnostics }
-                }
-                Button("清空 FFmpeg 分段缓存并重新读取") { Task { await ffmpegEngine.clearSegmentCache() } }
-                if let failure=ffmpegEngine.pip?.failure { Text(failure).font(.caption).foregroundStyle(.orange) }
-                if let warning=ffmpegEngine.subtitleWarning { Text(warning).font(.caption).foregroundStyle(.orange) }
-                if ffmpegEngine.hasAtmosMetadata {
-                  Text("当前为立体声；系统能否输出空间音频取决于文件和音频设备。")
-                    .font(.caption).foregroundStyle(.secondary)
-                }
+              if let warning = ffmpegEngine.subtitleWarning {
+                Text(warning).font(.caption).foregroundStyle(.orange)
               }
             }
             settingsSpeedSection(model: model)
@@ -2130,7 +2109,7 @@ struct PlayerScreen: View {
       vlcController.stop()
     }
 
-    useFFmpeg=true; useVLC=false; didFFmpegFallback=false; ffmpegReason=nil
+    useFFmpeg=true; useVLC=false; didFFmpegFallback=false
     let newModel = PlayerModel(
       item: expectedItem,
       api: appState.api,
@@ -2234,7 +2213,7 @@ struct PlayerScreen: View {
     case .ffmpeg:
       didFFmpegFallback=false
       model.suspendForExternalEngine()
-      useFFmpeg=true; ffmpegReason=nil
+      useFFmpeg=true
       ffmpegEngine.start(source:source,item:currentItem,api:appState.api,library:appState.libraryStore,
         at:position,playing:playing)
       ffmpegEngine.setPlaybackRate(playbackRate); ffmpegEngine.setVolume(volume)
@@ -2245,9 +2224,7 @@ struct PlayerScreen: View {
         playbackRate:playbackRate,fastStartEnabled:appState.fastStartEnabled,resumeAt:position)
       vlcController.setVolume(volume)
       if !playing { vlcController.pause() }
-      ffmpegReason="兼容内核 VLC：实际格式及输出能力以当前播放结果为准"
     case .apple:
-      ffmpegReason="兼容内核 AVPlayer：正在按原位置重新打开媒体"
       backendSwitchTask=Task { @MainActor in
         guard !Task.isCancelled, backendSwitchGeneration==generation else { return }
         await model.select(source,autoplay:false,resumeAt:position)

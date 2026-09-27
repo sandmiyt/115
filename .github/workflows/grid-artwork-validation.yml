@@ -1,0 +1,28 @@
+name: Grid and artwork regression
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/grid-artwork]
+jobs:
+  regression:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test actual cache and continuous geometry on iOS Simulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          VALIDATION="$RUNNER_TEMP/grid-validation"
+          mkdir -p "$VALIDATION"
+          cp Package.swift "$VALIDATION/"
+          cp -R Gallery115 Tests "$VALIDATION/"
+          DEVICE=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for k,v in d["devices"].items() if "iOS" in k for x in v if "iPhone" in x["name"]))')
+          cd "$VALIDATION"
+          xcodebuild -scheme CinevaCacheValidation -destination "platform=iOS Simulator,id=$DEVICE" -resultBundlePath "$RUNNER_TEMP/GridRegression.xcresult" CODE_SIGNING_ALLOWED=NO test
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: grid-artwork-xcresult
+          path: ${{ runner.temp }}/GridRegression.xcresult

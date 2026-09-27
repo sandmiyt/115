@@ -321,3 +321,108 @@ enum PhotoGridTransitionPolicy {
     return min(max((magnification - 1) / (targetRatio - 1), 0), 1)
   }
 }
+
+/// One scalar spans every resting density. No UIKit transition completion owns state.
+struct PhotoGridZoomState {
+  enum Phase: String { case idle, tracking, settling, cancelled }
+  var phase: Phase = .idle
+  var position: Double = 2
+  var velocity: Double = 0
+  var target: Double = 2
+  var generation = 0
+  private var startWidth: Double = 1
+
+  mutating func begin(widths: [Double]) {
+    generation &+= 1
+    phase = .tracking
+    startWidth = Self.width(at: position, widths: widths)
+    velocity = 0
+  }
+  mutating func track(scale: Double, speed: Double, widths: [Double]) {
+    guard phase == .tracking, scale.isFinite, scale > 0 else { return }
+    position = Self.position(for: startWidth * scale, widths: widths)
+    let index = min(Int(position), widths.count - 2)
+    velocity = speed.isFinite ? min(max(startWidth * speed / (widths[index + 1] - widths[index]), -12), 12) : 0
+  }
+  mutating func end(cancelled: Bool = false) {
+    phase = cancelled ? .cancelled : .settling
+    if cancelled { velocity = 0 }
+    target = min(max((position + velocity * 0.12).rounded(), 0), 4)
+  }
+  mutating func step(seconds: Double, reduceMotion: Bool) -> Bool {
+    guard phase == .settling || phase == .cancelled else { return false }
+    let omega = reduceMotion ? 32.0 : 22.0
+    // Exact critically damped solution: stable at both 60 Hz and 120 Hz.
+    let dt = min(max(seconds, 0), 0.05)
+    let delta = position - target
+    let c = velocity + omega * delta
+    let decay = exp(-omega * dt)
+    position = min(max(target + (delta + c * dt) * decay, 0), 4)
+    velocity = (velocity - omega * c * dt) * decay
+    if abs(position - target) < 0.001 && abs(velocity) < 0.01 {
+      position = target; velocity = 0; phase = .idle
+      return true
+    }
+    return false
+  }
+  static func width(at position: Double, widths: [Double]) -> Double {
+    let p = min(max(position, 0), Double(widths.count - 1))
+    let i = min(Int(p), widths.count - 2)
+    return widths[i] + (widths[i + 1] - widths[i]) * (p - Double(i))
+  }
+  static func position(for width: Double, widths: [Double]) -> Double {
+    for i in 0..<(widths.count - 1) where width >= widths[i + 1] {
+      return Double(i) + min(max((widths[i] - width) / (widths[i] - widths[i + 1]), 0), 1)
+    }
+    return Double(widths.count - 1)
+  }
+}
+
+/// Pure geometry used by the shipping layout and exhaustive coverage tests.
+/// Interpolated row Y is monotonic in media index even when columns wrap.
+struct PhotoGridGeometry {
+  var width: Double
+  var position: Double
+  var compact: Bool
+  var top: Double
+  var captionHeight: Double
+  var count: Int
+  var gap: Double { compact ? 2 : 9 }
+  var rowGap: Double { compact ? 2 : 11 }
+  var inset: Double { compact ? 2 : 10 }
+  var widths: [Double] {
+    MediaGridZoomPolicy.levels.map { max(1, (width - inset * 2 - Double($0 - 1) * gap) / Double($0)) }
+  }
+  var pair: (Int, Int, Double) {
+    let p = min(max(position, 0), 4)
+    let lower = min(Int(p), 3)
+    return (MediaGridZoomPolicy.levels[lower], MediaGridZoomPolicy.levels[lower + 1], p - Double(lower))
+  }
+  private func frame(_ index: Int, columns: Int) -> CGRect {
+    let w = max(1, (width - inset * 2 - Double(columns - 1) * gap) / Double(columns))
+    let h = compact ? w : w * 9 / 16 + captionHeight
+    return CGRect(x: inset + Double(index % columns) * (w + gap),
+                  y: top + Double(index / columns) * (h + rowGap), width: w, height: h)
+  }
+  func frame(_ index: Int) -> CGRect {
+    let (a, b, t) = pair
+    let x = frame(index, columns: a), y = frame(index, columns: b)
+    return CGRect(x: x.minX + (y.minX - x.minX) * t, y: x.minY + (y.minY - x.minY) * t,
+                  width: x.width + (y.width - x.width) * t, height: x.height + (y.height - x.height) * t)
+  }
+  var bottom: Double { count == 0 ? top : Double(frame(count - 1).maxY) + rowGap }
+  func candidates(in rect: CGRect) -> Range<Int> {
+    // Search the CURRENT interpolated geometry, not endpoint viewport unions.
+    func lowerBound(_ predicate: (Int) -> Bool) -> Int {
+      var low = 0, high = count
+      while low < high {
+        let mid = (low + high) / 2
+        if predicate(mid) { high = mid } else { low = mid + 1 }
+      }
+      return low
+    }
+    let first = lowerBound { frame($0).maxY >= rect.minY }
+    let last = lowerBound { frame($0).minY > rect.maxY }
+    return first..<max(first, last)
+  }
+}

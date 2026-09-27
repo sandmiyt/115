@@ -17,6 +17,7 @@ actor ThumbnailService {
     let task: Task<UIImage?, Never>
     var clients: Set<UUID>
     var isPrefetch: Bool
+    let pixels: Int
   }
   private struct SlotWaiter {
     let id: UUID
@@ -25,6 +26,22 @@ actor ThumbnailService {
     let isFrame: Bool
   }
 
+  private let imageWorker: ArtworkImageWorker
+  private struct PendingWrite {
+    let identity: ArtworkIdentity
+    let image: UIImage
+    let data: Data?
+    let generation: UUID
+    var cost: Int { data?.count ?? Int(image.size.width * image.size.height * image.scale * image.scale * 4) }
+  }
+  private var pendingWrites: [String: PendingWrite] = [:]
+  private var writeOrder: [String] = []
+  private var persistenceTask: Task<Void, Never>?
+  private var persistenceID: UUID?
+  private var gridOwners = Set<Int>()
+  private var activePrefetchSlots = Set<UUID>()
+  private var activePrefetchFrameSlots = Set<UUID>()
+  private var badURLs: [URL: Date] = [:]
   private let disk: ArtworkDiskStore
   private let namespace: @Sendable () -> String
   private let loader: Loader?
@@ -33,13 +50,14 @@ actor ThumbnailService {
   private let logger = Logger(subsystem: "com.xiaocai.gallery115", category: "Artwork")
   private var inFlight: [String: Work] = [:]
   private var frameAttempts: [String: Int] = [:]
+  private var frameFailedUntil: [String: Date] = [:]
   private var failedUntil: [String: Date] = [:]
   private var activeSlots: Set<UUID> = []
   private var activeFrameSlots: Set<UUID> = []
   private var slotWaiters: [SlotWaiter] = []
   private var playbackOwners: Set<UUID> = []
   private var endedPlaybackOwners: Set<UUID> = []
-  private var cacheGeneration = UUID()
+  private var cacheGeneration: UUID
   private var directoryWork: (id: UUID, task: Task<ThumbnailLibraryPage?, Never>)?
   private var backgroundFailedUntil: [String: Date] = [:]
   private(set) var libraryReloadRevision = 0
@@ -62,6 +80,9 @@ actor ThumbnailService {
     loader: Loader? = nil,
     frameLoader: Loader? = nil
   ) {
+    let generation = UUID()
+    self.cacheGeneration = generation
+    self.imageWorker = ArtworkImageWorker(disk: disk, generation: generation)
     self.disk = disk
     self.namespace = namespace
     self.loader = loader
@@ -100,26 +121,32 @@ actor ThumbnailService {
   func warmLocalThumbnails(_ items: [CloudItem], limit: Int = 24) async {
     for item in items.lazy.filter({ $0.isVideo || $0.isPhoto }).prefix(max(0, limit)) {
       guard !Task.isCancelled, playbackOwners.isEmpty else { return }
-      _ = localImage(identity(for: item), maximumPixelSize: item.isPhoto ? 960 : 640)
+      _ = await localImage(identity(for: item), maximumPixelSize: 320, generation: cacheGeneration)
       await Task.yield()
     }
   }
 
-  func thumbnail(for item: CloudItem, api: APIClient, isPrefetch: Bool = false) async -> UIImage? {
+  func thumbnail(for item: CloudItem, api: APIClient, isPrefetch: Bool = false, targetPixels: Int = 640) async -> UIImage? {
     guard item.isVideo || item.isPhoto else { return nil }
+    let pixels = ArtworkSizeTier.pixels(for: targetPixels)
     let identity = identity(for: item)
     let generation = cacheGeneration
     while !Task.isCancelled, generation == cacheGeneration, identity.namespace == namespace() {
-      if let image = localImage(identity, maximumPixelSize: item.isPhoto ? 960 : 640) { return image }
+      if let image = memoryCache.suitable(forKey: identity.key as NSString, pixels: pixels) {
+        GridArtworkTrace.event("memory-hit", id: identity.key)
+        return image
+      }
       if let retry = failedUntil[identity.key], retry > Date() { return nil }
 
       let clientID = UUID()
       let work: Work
       if var existing = inFlight[identity.key] {
+        GridArtworkTrace.event("deduplicated", id: identity.key)
         existing.clients.insert(clientID)
         if !isPrefetch { existing.isPrefetch = false }
         if !isPrefetch, let index = slotWaiters.firstIndex(where: { $0.id == existing.id }) {
           slotWaiters[index].isPrefetch = false
+          drainWaiters()
         }
         inFlight[identity.key] = existing
         work = existing
@@ -127,9 +154,9 @@ actor ThumbnailService {
         let workID = UUID()
         let task = Task<UIImage?, Never> { [weak self] in
           guard let self else { return nil }
-          return await self.load(item, identity: identity, api: api, generation: generation, workID: workID, isPrefetch: isPrefetch)
+          return await self.load(item, identity: identity, api: api, generation: generation, workID: workID, isPrefetch: isPrefetch, pixels: pixels)
         }
-        work = Work(id: workID, task: task, clients: [clientID], isPrefetch: isPrefetch)
+        work = Work(id: workID, task: task, clients: [clientID], isPrefetch: isPrefetch, pixels: pixels)
         inFlight[identity.key] = work
       }
 
@@ -157,6 +184,8 @@ actor ThumbnailService {
       // Playback cancellation isn't a failure. Interested cards retry behind
       // the closed gate and resume when the player closes.
       if work.task.isCancelled { continue }
+      if result != nil, work.pixels < pixels { continue }
+      GridArtworkTrace.event("delivery", id: identity.key, detail: "pixels=\(pixels) prefetch=\(isPrefetch)")
       return result
     }
     return nil
@@ -255,9 +284,7 @@ actor ThumbnailService {
     let identity = identity(for: item)
     if cachedThumbnail(for: item) != nil { return }
     // Inspect disk metadata without decoding every cached cover into memory.
-    if let data = try? disk.read(identity),
-      let source = CGImageSourceCreateWithData(data as CFData, nil),
-      CGImageSourceGetCount(source) > 0 { return }
+    if await imageWorker.contains(identity, generation: generation) { return }
     if let until = backgroundFailedUntil[identity.key], until > Date() { return }
     let revision = libraryReloadRevision
     if await thumbnail(for: item, api: api, isPrefetch: true) == nil,
@@ -275,6 +302,7 @@ actor ThumbnailService {
     failedUntil.removeAll()
     backgroundFailedUntil.removeAll()
     frameAttempts.removeAll()
+    frameFailedUntil.removeAll()
   }
 
   func waitForLibraryRescan(after revision: Int) async {
@@ -325,8 +353,23 @@ actor ThumbnailService {
   }
 
   @discardableResult
-  func storeGeneratedThumbnail(_ image: UIImage, for item: CloudItem) -> Bool {
-    persist(image, identity: identity(for: item))
+  func storeGeneratedThumbnail(_ image: UIImage, for item: CloudItem) async -> Bool {
+    let identity = identity(for: item), generation = cacheGeneration
+    cacheInMemory(image, key: identity.key, pixels: 640)
+    return await imageWorker.persist(image: image, data: nil, identity: identity, generation: generation)
+  }
+
+  func setGridInteraction(_ interacting: Bool, owner: Int) {
+    if interacting {
+      gridOwners.insert(owner)
+      for work in inFlight.values where work.isPrefetch && activeFrameSlots.contains(work.id) { work.task.cancel() }
+    } else { gridOwners.remove(owner) }
+    drainWaiters()
+  }
+
+  /// A test/termination barrier; visible consumers never wait for persistence.
+  func flushPersistence() async {
+    while let task = persistenceTask { await task.value }
   }
 
   func cacheUsageBytes() async -> Int64 {
@@ -335,7 +378,7 @@ actor ThumbnailService {
   }
 
   @discardableResult
-  func clearCache() -> Bool {
+  func clearCache() async -> Bool {
     cacheGeneration = UUID()
     libraryScanID = UUID()
     libraryIdleWait?.task.cancel()
@@ -345,19 +388,16 @@ actor ThumbnailService {
     inFlight.removeAll()
     failedUntil.removeAll()
     frameAttempts.removeAll()
+    frameFailedUntil.removeAll()
     memoryCache.removeAllObjects()
-    do {
-      try disk.clear()
-      return true
-    } catch {
-      logger.error("Unable to clear durable artwork: \(error.localizedDescription, privacy: .private)")
-      return false
-    }
+    pendingWrites.removeAll(); writeOrder.removeAll()
+    badURLs.removeAll()
+    return await imageWorker.reset(generation: cacheGeneration, clear: true)
   }
 
   /// Cancel work tied to the previous provider while retaining durable artwork.
   /// A provider-specific namespace prevents the next source from reading it.
-  func resetForSourceChange() {
+  func resetForSourceChange() async {
     cacheGeneration = UUID()
     libraryScanID = UUID()
     libraryIdleWait?.task.cancel()
@@ -367,58 +407,81 @@ actor ThumbnailService {
     inFlight.removeAll()
     failedUntil.removeAll()
     frameAttempts.removeAll()
+    frameFailedUntil.removeAll()
     memoryCache.removeAllObjects()
     memoryCache.namespaceSnapshot = nil
     for waiter in slotWaiters { waiter.continuation.resume(returning: false) }
     slotWaiters.removeAll()
     activeSlots.removeAll()
     activeFrameSlots.removeAll()
+    activePrefetchSlots.removeAll(); activePrefetchFrameSlots.removeAll()
+    pendingWrites.removeAll(); writeOrder.removeAll(); badURLs.removeAll()
+    _ = await imageWorker.reset(generation: cacheGeneration, clear: false)
   }
 
-  private func localImage(_ identity: ArtworkIdentity, maximumPixelSize: Int) -> UIImage? {
-    if let image = memoryCache.object(forKey: identity.key as NSString) { return image }
-    do {
-      guard let data = try disk.read(identity) else { return nil }
-      guard let image = downsampledImage(from: data, maximumPixelSize: maximumPixelSize) else {
-        disk.remove(identity)
-        return nil
+  private func localImage(_ identity: ArtworkIdentity, maximumPixelSize: Int, generation: UUID) async -> UIImage? {
+    if let image = memoryCache.suitable(forKey: identity.key as NSString, pixels: maximumPixelSize) { return image }
+    guard let image = await imageWorker.local(identity, pixels: maximumPixelSize, generation: generation),
+      !Task.isCancelled, generation == cacheGeneration, identity.namespace == namespace() else { return nil }
+    cacheInMemory(image, key: identity.key, pixels: maximumPixelSize)
+    return image
+  }
+
+  private func enqueuePersistence(_ image: UIImage, data: Data?, identity: ArtworkIdentity, generation: UUID) {
+    let write = PendingWrite(identity: identity, image: image, data: data, generation: generation)
+    // Queue memory and concurrency are bounded; do not let a library scan retain
+    // hundreds of images. A dropped write can be filled by a later cache miss.
+    if pendingWrites[identity.key] == nil {
+      guard writeOrder.count < 32,
+        pendingWrites.values.reduce(0, { $0 + $1.cost }) + write.cost <= 32 * 1_024 * 1_024 else {
+        GridArtworkTrace.event("persist-deferred", id: identity.key); return
       }
-      cacheInMemory(image, key: identity.key)
-      return image
-    } catch {
-      logger.error("Unable to read durable artwork: \(error.localizedDescription, privacy: .private)")
-      return nil
+      writeOrder.append(identity.key)
+    }
+    pendingWrites[identity.key] = write
+    guard persistenceTask == nil else { return }
+    let id = UUID()
+    persistenceID = id
+    persistenceTask = Task(priority: .utility) { [self] in
+      // Yield delivery first; heavy work is isolated on the image worker actor.
+      await Task.yield()
+      await drainPersistence(id: id)
     }
   }
 
-  private func persist(_ image: UIImage, identity: ArtworkIdentity) -> Bool {
-    cacheInMemory(image, key: identity.key)
-    guard let data = image.jpegData(compressionQuality: 0.80) else { return false }
-    do {
-      try disk.write(data, for: identity)
-      return true
-    } catch {
-      logger.error("Unable to persist artwork: \(error.localizedDescription, privacy: .private)")
-      return false
+  private func drainPersistence(id: UUID) async {
+    while !writeOrder.isEmpty {
+      let key = writeOrder.removeFirst()
+      guard let write = pendingWrites.removeValue(forKey: key), write.generation == cacheGeneration else { continue }
+      _ = await imageWorker.persist(image: write.image, data: write.data,
+        identity: write.identity, generation: write.generation)
     }
+    if persistenceID == id { persistenceTask = nil; persistenceID = nil }
   }
 
   private func load(
-    _ item: CloudItem, identity: ArtworkIdentity, api: APIClient, generation: UUID, workID: UUID, isPrefetch: Bool
+    _ item: CloudItem, identity: ArtworkIdentity, api: APIClient, generation: UUID, workID: UUID, isPrefetch: Bool, pixels: Int
   ) async -> UIImage? {
-    guard await acquireSlot(workID, isPrefetch: isPrefetch) else { return nil }
+    if let image = await localImage(identity, maximumPixelSize: pixels, generation: generation) { return image }
+    let queued = ProcessInfo.processInfo.systemUptime
+    guard await acquireSlot(workID, isPrefetch: inFlight[identity.key]?.isPrefetch ?? isPrefetch) else { return nil }
+    GridArtworkTrace.event("queue", id: identity.key, detail: "prefetch=\(isPrefetch)", since: queued)
     var holdsNetworkSlot = true
     defer { if holdsNetworkSlot { releaseSlot(workID) } }
     guard !Task.isCancelled, generation == cacheGeneration, identity.namespace == namespace() else { return nil }
-    if let image = localImage(identity, maximumPixelSize: item.isPhoto ? 960 : 640) { return image }
-    var image = await Self.boundedArtwork(seconds: 18) { [self] in
-      if let loader { return await loader(item, api) }
-      return await loadNetworkArtwork(for: item, api: api)
+    let artifact = await Self.boundedResult(seconds: 18) { [self] in
+      if let loader {
+        guard let image = await loader(item, api) else { return nil }
+        return LoadedArtwork(image: image, data: nil)
+      }
+      return await loadNetworkArtwork(for: item, identity: identity, api: api, pixels: pixels, generation: generation)
     }
+    var image = artifact?.image
     // Independent frame lanes cannot hold up ready image downloads.
     releaseSlot(workID)
     holdsNetworkSlot = false
-    if image == nil, item.isVideo, !item.isDiscImage, (loader == nil || frameLoader != nil) {
+    if image == nil, item.isVideo, !item.isDiscImage, (loader == nil || frameLoader != nil),
+      (frameFailedUntil[identity.key] ?? .distantPast) <= Date() {
       guard !Task.isCancelled, generation == cacheGeneration,
         await acquireSlot(workID, isPrefetch: inFlight[identity.key]?.isPrefetch ?? isPrefetch, isFrame: true) else { return nil }
       defer { releaseSlot(workID, isFrame: true) }
@@ -430,41 +493,61 @@ actor ThumbnailService {
       let frameBudget = Double([15, 30, 60][min(attempt, 2)])
       image = await Self.boundedArtwork(seconds: frameBudget) {
         if let frameLoader { return await frameLoader(item, api) }
+        let started = ProcessInfo.processInfo.systemUptime
         guard let source = try? await api.thumbnailSource(for: item), !Task.isCancelled else { return nil }
+        GridArtworkTrace.event("frame-source", id: identity.key, since: started)
         return await Self.frameThumbnail(source: source)
+      }
+      if image == nil, !Task.isCancelled, generation == cacheGeneration {
+        if frameFailedUntil.count > 1_024 { frameFailedUntil.removeAll() }
+        frameFailedUntil[identity.key] = Date().addingTimeInterval(300)
       }
     }
     guard !Task.isCancelled, generation == cacheGeneration, identity.namespace == namespace(),
       let image else { return nil }
     failedUntil[identity.key] = nil
     frameAttempts[identity.key] = nil
-    _ = persist(image, identity: identity)
+    cacheInMemory(image, key: identity.key, pixels: artifact?.data == nil ? 960 : pixels)
+    enqueuePersistence(image, data: artifact?.data, identity: identity, generation: generation)
     return image
   }
 
-  private func loadNetworkArtwork(for item: CloudItem, api: APIClient) async -> UIImage? {
-    // The slot covers sidecar discovery too. Previously every visible card could
-    // issue PROPFIND requests before it reached the frame-generation semaphore.
-    if let url = item.thumbnailURL, let image = await remoteThumbnail(at: url, maximumPixelSize: item.isPhoto ? 960 : 640) { return image }
+  private func loadNetworkArtwork(for item: CloudItem, identity: ArtworkIdentity, api: APIClient, pixels: Int, generation: UUID) async -> LoadedArtwork? {
+    if let url = item.thumbnailURL,
+      let result = await remoteThumbnail(at: url, identity: identity, pixels: pixels, generation: generation) { return result }
     guard !Task.isCancelled else { return nil }
+    let started = ProcessInfo.processInfo.systemUptime
+    GridArtworkTrace.event("source-fallback", id: identity.key)
     if item.isPhoto {
       guard let source = try? await api.photoSource(for: item), !Task.isCancelled else { return nil }
-      return await remoteThumbnail(at: source.url, headers: source.headers, maximumPixelSize: 960)
+      GridArtworkTrace.event("source-resolution", id: identity.key, since: started)
+      return await remoteThumbnail(at: source.url, headers: source.headers, identity: identity, pixels: pixels, generation: generation)
     }
-    return await Self.firstAvailableArtwork([
-      { [self] in
-        guard let url = await api.serverThumbnailURL(for: item), url != item.thumbnailURL,
-          !Task.isCancelled else { return nil }
-        return await remoteThumbnail(at: url)
-      },
-      { [self] in
-        guard let data = await api.posterData(for: item), !Task.isCancelled else { return nil }
-        return await decodeArtwork(data)
-      }
-    ])
+    let url = await api.serverThumbnailURL(for: item)
+    GridArtworkTrace.event("source-resolution", id: identity.key, since: started)
+    if let url, url != item.thumbnailURL,
+      let result = await remoteThumbnail(at: url, identity: identity, pixels: pixels, generation: generation) { return result }
+    guard !Task.isCancelled, let data = await api.posterData(for: item), data.count <= 16_000_000,
+      let image = await imageWorker.decode(data, identity: identity, pixels: pixels, generation: generation) else { return nil }
+    return LoadedArtwork(image: image, data: data)
   }
 
-  private func decodeArtwork(_ data: Data) -> UIImage? { downsampledImage(from: data) }
+  private struct LoadedArtwork { let image: UIImage; let data: Data? }
+  private nonisolated static func boundedResult(seconds: Double,
+    operation: @escaping @Sendable () async -> LoadedArtwork?) async -> LoadedArtwork? {
+    let completion = ArtworkCompletion<LoadedArtwork>()
+    return await withTaskCancellationHandler {
+      await withCheckedContinuation { continuation in
+        completion.install(continuation)
+        let worker = Task { completion.finish(await operation()) }
+        let timeout = Task {
+          do { try await Task.sleep(for: .seconds(seconds)) } catch { return }
+          completion.finish(nil)
+        }
+        completion.attach([worker, timeout])
+      }
+    } onCancel: { completion.finish(nil) }
+  }
 
   typealias ArtworkOperation = @Sendable () async -> UIImage?
 
@@ -533,34 +616,33 @@ actor ThumbnailService {
     }
   }
 
-  private func remoteThumbnail(at url: URL, headers: [String: String] = [:], maximumPixelSize: Int = 640) async -> UIImage? {
+  private func remoteThumbnail(at url: URL, headers: [String: String] = [:], identity: ArtworkIdentity,
+    pixels: Int, generation: UUID) async -> LoadedArtwork? {
+    if let until = badURLs[url], until > Date() { return nil }
     var request = URLRequest(url: url)
     request.cachePolicy = .useProtocolCachePolicy
-    request.timeoutInterval = 8
+    request.timeoutInterval = 5
     for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
-    guard let (data, response) = try? await imageSession.data(for: request),
-      !Task.isCancelled, data.count <= 16_000_000,
-      let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode)
-    else { return nil }
-    return downsampledImage(from: data, maximumPixelSize: maximumPixelSize)
+    let started = ProcessInfo.processInfo.systemUptime
+    GridArtworkTrace.event("network-request", id: identity.key)
+    do {
+      let data = try await ArtworkByteReceiver.receive(request, session: imageSession, limit: 16_000_000)
+      GridArtworkTrace.event("network-receive", id: identity.key, detail: "bytes=\(data.count)", since: started)
+      guard !Task.isCancelled, let image = await imageWorker.decode(data, identity: identity, pixels: pixels, generation: generation) else { return nil }
+      return LoadedArtwork(image: image, data: data)
+    } catch {
+      if !Task.isCancelled {
+        if badURLs.count > 256 { badURLs.removeAll() }
+        badURLs[url] = Date().addingTimeInterval(30)
+      }
+      return nil
+    }
   }
 
-  private func cacheInMemory(_ image: UIImage, key: String) {
+  private func cacheInMemory(_ image: UIImage, key: String, pixels: Int) {
     let width = max(Int(image.size.width * image.scale), 1)
     let height = max(Int(image.size.height * image.scale), 1)
-    memoryCache.setObject(image, forKey: key as NSString, cost: min(width * height * 4, 16 * 1_024 * 1_024))
-  }
-
-  private func downsampledImage(from data: Data, maximumPixelSize: Int = 640) -> UIImage? {
-    guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
-    let options: [CFString: Any] = [
-      kCGImageSourceCreateThumbnailFromImageAlways: true,
-      kCGImageSourceCreateThumbnailWithTransform: true,
-      kCGImageSourceThumbnailMaxPixelSize: maximumPixelSize,
-      kCGImageSourceShouldCacheImmediately: true,
-    ]
-    guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
-    return UIImage(cgImage: image)
+    memoryCache.setObject(image, forKey: key as NSString, cost: min(width * height * 4, 16 * 1_024 * 1_024), pixels: pixels)
   }
 
   private func cancelClient(_ client: UUID, key: String, workID: UUID) {
@@ -576,7 +658,8 @@ actor ThumbnailService {
 
   private func acquireSlot(_ id: UUID, isPrefetch: Bool, isFrame: Bool = false) async -> Bool {
     guard !Task.isCancelled else { return false }
-    if canAcquireSlot(isFrame: isFrame) {
+    if canAcquireSlot(isFrame: isFrame, isPrefetch: isPrefetch) {
+      if isPrefetch { if isFrame { activePrefetchFrameSlots.insert(id) } else { activePrefetchSlots.insert(id) } }
       if isFrame { activeFrameSlots.insert(id) }
       else { activeSlots.insert(id) }
       return true
@@ -596,11 +679,17 @@ actor ThumbnailService {
     slotWaiters.remove(at: index).continuation.resume(returning: false)
   }
 
-  private func canAcquireSlot(isFrame: Bool) -> Bool {
-    playbackOwners.isEmpty && (isFrame ? activeFrameSlots.count < maximumFrameJobs : activeSlots.count < maximumNetworkJobs)
+  private func canAcquireSlot(isFrame: Bool, isPrefetch: Bool) -> Bool {
+    guard playbackOwners.isEmpty else { return false }
+    if isPrefetch {
+      if isFrame { return gridOwners.isEmpty && activePrefetchFrameSlots.count < 1 && activeFrameSlots.count < maximumFrameJobs }
+      return activePrefetchSlots.count < maximumNetworkJobs - 1 && activeSlots.count < maximumNetworkJobs
+    }
+    return isFrame ? activeFrameSlots.count < maximumFrameJobs : activeSlots.count < maximumNetworkJobs
   }
 
   private func releaseSlot(_ id: UUID, isFrame: Bool = false) {
+    if isFrame { activePrefetchFrameSlots.remove(id) } else { activePrefetchSlots.remove(id) }
     if isFrame { activeFrameSlots.remove(id) }
     else { activeSlots.remove(id) }
     drainWaiters()
@@ -608,9 +697,12 @@ actor ThumbnailService {
 
   private func drainWaiters() {
     while playbackOwners.isEmpty {
-      let eligible = slotWaiters.indices.filter { canAcquireSlot(isFrame: slotWaiters[$0].isFrame) }
+      let eligible = slotWaiters.indices.filter { canAcquireSlot(isFrame: slotWaiters[$0].isFrame, isPrefetch: slotWaiters[$0].isPrefetch) }
       guard let index = eligible.first(where: { !slotWaiters[$0].isPrefetch }) ?? eligible.first else { return }
       let waiter = slotWaiters.remove(at: index)
+      if waiter.isPrefetch {
+        if waiter.isFrame { activePrefetchFrameSlots.insert(waiter.id) } else { activePrefetchSlots.insert(waiter.id) }
+      }
       if waiter.isFrame { activeFrameSlots.insert(waiter.id) }
       else { activeSlots.insert(waiter.id) }
       waiter.continuation.resume(returning: true)
@@ -709,24 +801,167 @@ private final class ArtworkCompletion<Value>: @unchecked Sendable {
 
 /// NSCache provides its own synchronization. Keep raw cache mutation out of views.
 private final class ArtworkMemoryCache: @unchecked Sendable {
-  private let cache = NSCache<NSString, UIImage>()
-  private let namespaceLock = NSLock()
+  private final class Entry {
+    let image: UIImage; let pixels: Int
+    init(_ image: UIImage, _ pixels: Int) { self.image = image; self.pixels = pixels }
+  }
+  private let cache = NSCache<NSString, Entry>()
+  private let lock = NSLock()
   private var storedNamespace: String?
   var namespaceSnapshot: String? {
-    get { namespaceLock.lock(); defer { namespaceLock.unlock() }; return storedNamespace }
-    set { namespaceLock.lock(); storedNamespace = newValue; namespaceLock.unlock() }
+    get { lock.lock(); defer { lock.unlock() }; return storedNamespace }
+    set { lock.lock(); storedNamespace = newValue; lock.unlock() }
   }
-  var countLimit: Int {
-    get { cache.countLimit }
-    set { cache.countLimit = newValue }
+  var countLimit: Int { get { cache.countLimit } set { cache.countLimit = newValue } }
+  var totalCostLimit: Int { get { cache.totalCostLimit } set { cache.totalCostLimit = newValue } }
+  func object(forKey key: NSString) -> UIImage? { cache.object(forKey: key)?.image }
+  func suitable(forKey key: NSString, pixels: Int) -> UIImage? {
+    guard let entry = cache.object(forKey: key), entry.pixels >= pixels else { return nil }
+    return entry.image
   }
-  var totalCostLimit: Int {
-    get { cache.totalCostLimit }
-    set { cache.totalCostLimit = newValue }
+  func setObject(_ image: UIImage, forKey key: NSString, cost: Int, pixels: Int) {
+    lock.lock(); defer { lock.unlock() }
+    if let existing = cache.object(forKey: key), existing.pixels >= pixels { return }
+    cache.setObject(Entry(image, pixels), forKey: key, cost: cost)
   }
-  func object(forKey key: NSString) -> UIImage? { cache.object(forKey: key) }
-  func setObject(_ image: UIImage, forKey key: NSString, cost: Int) {
-    cache.setObject(image, forKey: key, cost: cost)
+  func removeAllObjects() { lock.lock(); defer { lock.unlock() }; cache.removeAllObjects() }
+}
+
+
+enum ArtworkSizeTier {
+  static func pixels(for requested: Int) -> Int {
+    if requested <= 320 { return 320 }
+    if requested <= 640 { return 640 }
+    return 960
   }
-  func removeAllObjects() { cache.removeAllObjects() }
+}
+
+/// A separate serial executor bounds decode/encode/disk concurrency to one.
+/// There is no synchronous I/O or JPEG compression on ThumbnailService's actor.
+private actor ArtworkImageWorker {
+  let disk: ArtworkDiskStore
+  private var generation: UUID
+  private let recentSources = NSCache<NSString, NSData>()
+  init(disk: ArtworkDiskStore, generation: UUID) {
+    self.disk = disk; self.generation = generation
+    recentSources.countLimit = 24
+    recentSources.totalCostLimit = 24 * 1_024 * 1_024
+  }
+  func reset(generation: UUID, clear: Bool) -> Bool {
+    self.generation = generation
+    recentSources.removeAllObjects()
+    do { if clear { try disk.clear() }; return true } catch { return false }
+  }
+  func contains(_ identity: ArtworkIdentity, generation: UUID) -> Bool {
+    guard self.generation == generation else { return false }
+    if recentSources.object(forKey: identity.key as NSString) != nil { return true }
+    guard let data = try? disk.read(identity), let source = CGImageSourceCreateWithData(data as CFData, nil) else { return false }
+    return CGImageSourceGetCount(source) > 0
+  }
+  func local(_ identity: ArtworkIdentity, pixels: Int, generation: UUID) -> UIImage? {
+    guard self.generation == generation, !Task.isCancelled else { return nil }
+    let started = ProcessInfo.processInfo.systemUptime
+    if let data = recentSources.object(forKey: identity.key as NSString) {
+      return decode(data as Data, identity: identity, pixels: pixels, generation: generation)
+    }
+    guard let data = try? disk.read(identity) else { return nil }
+    GridArtworkTrace.event("disk-read", id: identity.key, detail: "bytes=\(data.count)", since: started)
+    guard let image = decode(data, identity: identity, pixels: pixels, generation: generation) else {
+      if !Task.isCancelled { disk.remove(identity) }
+      return nil
+    }
+    GridArtworkTrace.event("disk-hit", id: identity.key)
+    return image
+  }
+  func decode(_ data: Data, identity: ArtworkIdentity, pixels: Int, generation: UUID) -> UIImage? {
+    guard self.generation == generation, !Task.isCancelled else { return nil }
+    let started = ProcessInfo.processInfo.systemUptime
+    guard let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary) else { return nil }
+    let options: [CFString: Any] = [
+      kCGImageSourceCreateThumbnailFromImageAlways: true,
+      kCGImageSourceCreateThumbnailWithTransform: true,
+      kCGImageSourceThumbnailMaxPixelSize: pixels,
+      kCGImageSourceShouldCacheImmediately: true,
+    ]
+    guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+    recentSources.setObject(data as NSData, forKey: identity.key as NSString, cost: data.count)
+    GridArtworkTrace.event("decode", id: identity.key, detail: "pixels=\(pixels)", since: started)
+    return UIImage(cgImage: cg)
+  }
+  func persist(image: UIImage, data: Data?, identity: ArtworkIdentity, generation: UUID) -> Bool {
+    guard self.generation == generation else { return false }
+    let started = ProcessInfo.processInfo.systemUptime
+    // Keep compressed server material for future larger decodes. Generated
+    // frames retain the original JPEG policy. A dense decode never replaces it.
+    guard let encoded = data ?? image.jpegData(compressionQuality: 0.80) else { return false }
+    do {
+      if let existing = try disk.read(identity), Self.extent(existing) > Self.extent(encoded) { return true }
+      try disk.write(encoded, for: identity)
+      GridArtworkTrace.event("persist", id: identity.key, detail: "bytes=\(encoded.count)", since: started)
+      return true
+    } catch {
+      GridArtworkTrace.event("persist-failed", id: identity.key, since: started)
+      return false
+    }
+  }
+  private static func extent(_ data: Data) -> Int {
+    guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+      let info = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] else { return 0 }
+    return max((info[kCGImagePropertyPixelWidth] as? Int) ?? 0, (info[kCGImagePropertyPixelHeight] as? Int) ?? 0)
+  }
+}
+
+/// AsyncBytes returns after headers, so oversized/malformed bodies are stopped
+/// before allocation. The running task is cancelled on every early return.
+enum ArtworkByteReceiver {
+  static func receive(_ request: URLRequest, session: URLSession, limit: Int) async throws -> Data {
+    let (bytes, response) = try await session.bytes(for: request)
+    defer { bytes.task.cancel() }
+    guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
+      response.expectedContentLength <= Int64(limit),
+      let mime = response.mimeType?.lowercased(),
+      mime.hasPrefix("image/") || mime == "application/octet-stream" else { throw URLError(.badServerResponse) }
+    return try await withTaskCancellationHandler {
+      var data = Data()
+      data.reserveCapacity(min(limit, max(0, Int(response.expectedContentLength))))
+      for try await byte in bytes {
+        if data.count % 16384 == 0 { try Task.checkCancellation() }
+        guard data.count < limit else { throw URLError(.dataLengthExceedsMaximum) }
+        data.append(byte)
+      }
+      try Task.checkCancellation()
+      return data
+    } onCancel: { bytes.task.cancel() }
+  }
+}
+
+/// Opt in with CINEVA_GRID_TRACE=1 in the Debug scheme. No URLs or raw media IDs.
+/// Correlate timestamped stages with Points of Interest / Time Profiler and
+/// Allocations. Release builds neither format event details nor emit logs.
+enum GridArtworkTrace {
+  private static let enabled: Bool = {
+    #if DEBUG
+    return ProcessInfo.processInfo.environment["CINEVA_GRID_TRACE"] == "1"
+    #else
+    return false
+    #endif
+  }()
+  private static let log = Logger(subsystem: "com.xiaocai.gallery115", category: "GridArtworkTiming")
+  static func event(_ stage: String, id: String, detail: @autoclosure () -> String = "", since start: Double? = nil) {
+    #if DEBUG
+    guard enabled else { return }
+    let now = ProcessInfo.processInfo.systemUptime
+    let elapsed = start.map { (now - $0) * 1000 } ?? 0
+    let key = ArtworkIdentity.digest(id).prefix(12)
+    var info = mach_task_basic_info()
+    var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<integer_t>.size)
+    let status = withUnsafeMutablePointer(to: &info) { pointer in
+      pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+        task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+      }
+    }
+    let resident = status == KERN_SUCCESS ? info.resident_size : 0
+    log.debug("stage=\(stage, privacy: .public) id=\(key, privacy: .public) t=\(now) ms=\(elapsed) resident=\(resident) \(detail(), privacy: .public)")
+    #endif
+  }
 }

@@ -34,6 +34,10 @@ sources = [
 sources += [str(path.relative_to(ROOT)).replace("\\", "/")
             for path in (ROOT / "Gallery115").rglob("*.swift")
             if str(path.relative_to(ROOT)).replace("\\", "/") not in sources]
+sources += [str(path.relative_to(ROOT)).replace("\\", "/")
+            for path in (ROOT / "Tests/CacheRegression").glob("*.swift")
+            if str(path.relative_to(ROOT)).replace("\\", "/") not in sources]
+
 def diagnostics(data):
     data = data.replace(b"\r\n", b"\n")
     tree = parser.parse(data)
@@ -91,9 +95,9 @@ check(all(field in key for field in ["namespace", "itemID", "size", "modifiedAt"
 check("item.sha1" not in card and "thumbnailURLString" not in card, "Card task identity excludes rotating URLs/ETags")
 card_identity = card.split("private var itemThumbnailIdentity", 1)[1].split("@ViewBuilder", 1)[0]
 check("item.id" in card_identity and "item.size" in card_identity
-      and "modifiedAt" not in card_identity,
-      "Directory refresh metadata cannot restart unchanged artwork tasks")
-check("if renderedItemIdentity != identity" in card
+      and "modifiedAt" in card_identity,
+      "Artwork identity tracks content version independently of signed URLs")
+check("if renderedItemIdentity != itemThumbnailIdentity" in card
       and "guard let image else { return }" in card,
       "Artwork refresh keeps the existing image until a replacement is ready")
 check("activeRequestIdentity == identity" in card,
@@ -192,7 +196,7 @@ check("try Task.checkCancellation()" in player_model
       and "scrubGeneration == generation" in player_model
       and "self.player.currentItem === item" in player_model,
       "Player retains cancelled-preparation guards and scopes seek callbacks to the active item")
-check("boundedArtwork(seconds: 18)" in service and "boundedArtwork(seconds: frameBudget)" in service
+check("boundedResult(seconds: 18)" in service and "boundedArtwork(seconds: frameBudget)" in service
       and "boundedArtwork(seconds: 45)" not in card
       and "[0, 6, 15, 30, 60][min(attempt, 4)]" in card,
       "Active artwork stages have deadlines; queued cells retain automatic retries")
@@ -203,14 +207,14 @@ check("override func canBePrevented" in card and "other.isDescendant(of: view)" 
       and "trackedTouches.count >= 2" in card and "!hasMultipleTouches" in card
       and "coordinator.releaseTouchOwnership()" in card,
       "Two-touch intent blocks taps before recognition; hosted gestures cannot fail pinch; teardown releases pan")
-check("struct PhotoLibraryGrid" in card and "startInteractiveTransition(to: target)" in card,
+check("struct PhotoLibraryGrid" in card and "PhotoGridGeometry" in card and "startInteractiveTransition" not in card,
       "Media cells use a native interactive collection layout")
-check("PhotoGridTransitionPolicy.progress" in card and "finishInteractiveTransition()" in card
-      and "cancelInteractiveTransition()" in card,
-      "Pinch progress supports native finish and cancellation")
-check("final class PhotoGridTransitionLayout: UICollectionViewTransitionLayout" in card
-      and "override var transitionProgress" in card and "layout.focus = nil" in card,
-      "Anchoring continues during native settling and clears after layout installation")
+check("zoom.track(scale:" in card and "zoom.end(cancelled: true)" in card
+      and "zoom.step(seconds:" in card,
+      "Continuous pinch supports reversal, settling and cancellation")
+check("anchorFraction = CGPoint" in card and "anchoredOffset(layout:" in card
+      and "zoom.generation" in card and "pinch.scale = 1" not in card,
+      "One display-link driver owns XY anchoring and interruptible settling")
 check("loadFailed" not in card and "guard scenePhase == .active" in card,
       "Thumbnail retries keep a neutral placeholder and stop in background")
 check("loadedFolderScope == scope, !items.isEmpty { return }" in folder,
@@ -218,7 +222,7 @@ check("loadedFolderScope == scope, !items.isEmpty { return }" in folder,
 check("PhotoLibraryGrid(folders: displayedFolders" in folder and "UICollectionViewDiffableDataSource" in card
       and "for index in first..<last" in card,
       "Stable identities and viewport row calculation replace nested scroll containers")
-check("CGSize(width: 640, height: 360)" in service and "item.isPhoto ? 960 : 640" in service,
+check("CGSize(width: 640, height: 360)" in service and "enum ArtworkSizeTier" in service and "targetPixels: pixels" in card,
       "Video artwork decode pressure is reduced while photo resolution is retained")
 check("FavoriteRelocationPolicy.reconciled" in (ROOT / "Gallery115/Services/LibraryStore.swift").read_text(encoding="utf-8")
       and "reconcileFavorites(with: source)" in folder,
@@ -226,7 +230,7 @@ check("FavoriteRelocationPolicy.reconciled" in (ROOT / "Gallery115/Services/Libr
 check("cachedThumbnail(for: item)" in card and "warmLocalThumbnails(page.items)" in folder,
       "First-frame artwork can use memory and prewarmed disk covers")
 check("scaleEffect(max(scale, 1)" not in card and "ScrollViewReader" not in folder.split("case .grid:", 1)[1].split("case .list:", 1)[0]
-      and "CGPoint(x: 0, y: min(max(y, minimum), maximum))" in card,
+      and "y: min(max(y, minimum), maximum)" in card,
       "Pinch anchors clamp within the viewport without scaling the scroll surface")
 check("view.isPrefetchingEnabled = true" in card and "cancelPrefetchingForItemsAt" in card
       and "snapshot.reconfigureItems(visible.filter" in card,

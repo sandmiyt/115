@@ -23,6 +23,7 @@ final class ArtworkCacheTests: XCTestCase {
     await cache.fillLibrary(rootID: "root", api: api)
     let calls = await probe.calls
     XCTAssertEqual(calls, 2)
+    await cache.flushPersistence()
     XCTAssertNotNil(try disk.read(identity(later)))
     XCTAssertNotNil(try disk.read(identity(nested)))
     // Background scans must not fill the viewport's decoded-image cache with
@@ -51,6 +52,7 @@ final class ArtworkCacheTests: XCTestCase {
     await fulfillment(of: [completed], timeout: 2)
     await held.release()
     await scan.value
+    await cache.flushPersistence()
     XCTAssertNotNil(try disk.read(identity(fast)))
   }
 
@@ -132,6 +134,7 @@ final class ArtworkCacheTests: XCTestCase {
     await cache.prefetch([item()], api: APIClient())
     let calls = await frames.calls
     XCTAssertEqual(calls, 1)
+    await cache.flushPersistence()
     XCTAssertNotNil(try disk.read(identity(item())))
   }
 
@@ -311,6 +314,7 @@ final class ArtworkCacheTests: XCTestCase {
     let first = service(probe)
     let firstImage = await first.thumbnail(for: item(), api: APIClient())
     XCTAssertNotNil(firstImage)
+    await first.flushPersistence()
     // Simulate months passing and all HTTP/in-memory caches being lost.
     try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1)],
                                          ofItemAtPath: disk.fileURL(for: identity(item())).path)
@@ -328,6 +332,7 @@ final class ArtworkCacheTests: XCTestCase {
   func testRotatedETagAndSignedURLDoNotRedownload() async {
     let first = service(LoadProbe(image: image()))
     _ = await first.thumbnail(for: item(url: "https://example.invalid/a?sign=old"), api: APIClient())
+    await first.flushPersistence()
     let offline = LoadProbe(image: nil)
     let restored = await service(offline).thumbnail(
       for: item(etag: "new-etag", url: "https://example.invalid/a?sign=new"), api: APIClient())
@@ -379,7 +384,9 @@ final class ArtworkCacheTests: XCTestCase {
   func testCorruptCacheIsRepaired() async throws {
     try disk.write(Data("broken JPEG".utf8), for: identity(item()))
     let probe = LoadProbe(image: image())
-    let result = await service(probe).thumbnail(for: item(), api: APIClient())
+    let cache = service(probe)
+    let result = await cache.thumbnail(for: item(), api: APIClient())
+    await cache.flushPersistence()
     let calls = await probe.calls
     XCTAssertNotNil(result)
     XCTAssertEqual(calls, 1)
@@ -449,7 +456,9 @@ final class ArtworkCacheTests: XCTestCase {
 
   func testDiskHitsStillWorkWhilePlaybackOwnsNetwork() async {
     let probe = LoadProbe(image: image())
-    _ = await service(probe).thumbnail(for: item(), api: APIClient())
+    let first = service(probe)
+    _ = await first.thumbnail(for: item(), api: APIClient())
+    await first.flushPersistence()
     let offline = LoadProbe(image: nil)
     let cache = service(offline)
     let owner = UUID()
@@ -593,13 +602,80 @@ final class ArtworkCacheTests: XCTestCase {
       fileExtension: "jpg", isVideo: false, duration: 0, thumbnailURLString: nil,
       modifiedAt: Date(timeIntervalSince1970: 1000))
     let probe = LoadProbe(image: image())
-    let first = await service(probe).thumbnail(for: photo, api: APIClient())
+    let firstService = service(probe)
+    let first = await firstService.thumbnail(for: photo, api: APIClient())
+    await firstService.flushPersistence()
     let offline = LoadProbe(image: nil)
     let cached = await service(offline).thumbnail(for: photo, api: APIClient())
     XCTAssertNotNil(first)
     XCTAssertNotNil(cached)
     let calls = await offline.calls
     XCTAssertEqual(calls, 0)
+  }
+
+  func testDiskFailureDoesNotTurnVisibleImageIntoFailure() async throws {
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let invalid = root.appendingPathComponent("not-a-directory")
+    try Data([1]).write(to: invalid)
+    let ready = image()
+    let cache = ThumbnailService(disk: ArtworkDiskStore(directory: invalid, legacyDirectory: root.appendingPathComponent("old")),
+      namespace: { "mount-a" }, loader: { _, _ in ready })
+    let displayed = await cache.thumbnail(for: item(), api: APIClient())
+    XCTAssertNotNil(displayed)
+    await cache.flushPersistence()
+    XCTAssertNotNil(cache.cachedThumbnail(for: item()))
+  }
+
+  func testSmallThenLargeDiskDecodePreservesMasterAndAvoidsNetwork() async throws {
+    let format = UIGraphicsImageRendererFormat(); format.scale = 1
+    let master = UIGraphicsImageRenderer(size: CGSize(width: 1200, height: 800), format: format).image { context in
+      UIColor.blue.setFill(); context.fill(CGRect(x: 0, y: 0, width: 1200, height: 800))
+    }
+    let bytes = try XCTUnwrap(master.jpegData(compressionQuality: 0.8))
+    try disk.write(bytes, for: identity(item()))
+    let probe = LoadProbe(image: nil)
+    let cache = service(probe)
+    let small = await cache.thumbnail(for: item(), api: APIClient(), targetPixels: 180)
+    XCTAssertEqual(try XCTUnwrap(small).size.width, 320, accuracy: 1)
+    let large = await cache.thumbnail(for: item(), api: APIClient(), targetPixels: 900)
+    XCTAssertEqual(try XCTUnwrap(large).size.width, 960, accuracy: 1)
+    let again = await cache.thumbnail(for: item(), api: APIClient(), targetPixels: 180)
+    XCTAssertTrue(again === large)
+    XCTAssertEqual(try disk.read(identity(item())), bytes)
+    let calls = await probe.calls
+    XCTAssertEqual(calls, 0)
+  }
+
+  func testClearAfterVisibleDeliveryDrainsStalePersistence() async {
+    let cache = service(LoadProbe(image: image()))
+    let shown = await cache.thumbnail(for: item(), api: APIClient())
+    XCTAssertNotNil(shown)
+    let cleared = await cache.clearCache()
+    XCTAssertTrue(cleared)
+    await cache.flushPersistence()
+    let bytes = await cache.cacheUsageBytes()
+    XCTAssertEqual(bytes, 0)
+    XCTAssertNil(cache.cachedThumbnail(for: item()))
+  }
+
+  func testVisibleRequestHasCapacityWhilePrefetchDownloadsAreHeld() async {
+    let gate = FrameGate(image: image()), ready = image()
+    let completed = expectation(description: "reserved visible lane")
+    let cache = ThumbnailService(disk: disk, namespace: { "mount-a" }, loader: { item, _ in
+      if item.id.hasPrefix("prefetch") { return await gate.load() }
+      completed.fulfill(); return ready
+    })
+    let speculative = (0..<3).map { index in
+      let video = item("prefetch-\(index)")
+      return Task { await cache.thumbnail(for: video, api: APIClient(), isPrefetch: true) }
+    }
+    await waitForQueue(cache, visible: 0, prefetch: 1)
+    let video = item("visible")
+    let visible = Task { await cache.thumbnail(for: video, api: APIClient()) }
+    await fulfillment(of: [completed], timeout: 2)
+    await gate.release()
+    _ = await visible.value
+    for task in speculative { _ = await task.value }
   }
 
   private func waitForQueue(_ cache: ThumbnailService, visible: Int, prefetch: Int) async {

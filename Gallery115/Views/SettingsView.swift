@@ -576,7 +576,7 @@ private struct FFmpegIntegrationInfoView: View {
       Section("组件信息") {
         LabeledContent("实际库版本", value: info.version)
         LabeledContent("许可", value: info.license)
-        Text("默认使用 FFmpeg 播放，必要时自动尝试兼容内核。以下是组件编译能力；当前实际内核、解码和输出状态可在播放详情中查看。")
+        Text("默认使用 FFmpeg 播放，必要时自动尝试兼容内核。以下为组件编译能力和开源许可信息。")
           .font(.caption).foregroundStyle(.secondary)
       }
       Section("已编译解码器") { Text(info.decoders.joined(separator: ", ")).textSelection(.enabled) }
