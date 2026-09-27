@@ -87,6 +87,31 @@ struct RangeStatistics: Sendable {
   }
 }
 
+/// Only the primary AVIO reader can change this state. Preview/prefetch traffic
+/// must not make a cached seek look like a network stall.
+struct PlaybackReadState: Equatable, Sendable {
+  var generation:Int32
+  var networkWaits=0
+  var waitingForNetwork=false
+}
+
+/// Feedback and recovery for the current seek, including partially cached files.
+/// A new generation starts quietly; an actual primary cache miss enables the
+/// ordinary network feedback until playback resumes. Local decode alone cannot.
+struct CachedSeekReadiness: Equatable, Sendable {
+  private(set) var generation:Int32?
+  private(set) var needsNetwork=false
+  private var observedWaits=0
+  mutating func begin(generation:Int32) {
+    self.generation=generation; needsNetwork=false; observedWaits=0
+  }
+  mutating func observe(_ read:PlaybackReadState, buffering:Bool) {
+    guard read.generation==generation else { return }
+    needsNetwork=buffering && (needsNetwork || read.waitingForNetwork || read.networkWaits>observedWaits)
+    observedWaits=read.networkWaits
+  }
+}
+
 /// Durable byte coverage, never inferred media-time coverage. All mutation is on
 /// the utility queue; admission is bounded before any Data is retained by it.
 struct MediaCacheProgress: Sendable, Equatable {
@@ -398,6 +423,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
   private var nextPreviewToken:Int32=1_000_000
   private var readerErrors:[Int32:Int32]=[:]
   private var primaryReaders=0
+  private var primaryNetworkWaits=0, primaryNetworkReaders=0
   private var closed=false, refreshing=false, refreshed=false
   private var fatalError:Int32?
   private var responseValidator:String?
@@ -539,6 +565,11 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     maintenanceTimer=timer; timer.resume()
   }
   var statistics:RangeStatistics { condition.lock(); defer { condition.unlock() }; return stats }
+  var playbackReadState:PlaybackReadState {
+    condition.lock(); defer { condition.unlock() }
+    return PlaybackReadState(generation:generation,networkWaits:primaryNetworkWaits,
+      waitingForNetwork:primaryNetworkReaders>0)
+  }
   var fileSize:Int64 { condition.lock(); defer { condition.unlock() }; return length }
   // Preview scopes share verified pages, validators, URL refresh and the same
   // two-request budget, but never the primary cursor or cancellation lifetime.
@@ -567,6 +598,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     guard !closed else { condition.unlock(); return }
     yieldPrefetch(); prefetchAllowed=false
     let previous=generation; generation=value; readerErrors.removeValue(forKey:previous)
+    primaryNetworkWaits=0; primaryNetworkReaders=0
     cancelFlights(for:previous)
     if value<0 {
       closed=true; previewTokens.removeAll()
@@ -647,9 +679,15 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     condition.lock()
     let primary=wanted==generation
     if primary { primaryReaders+=1 }
+    var networkWait=false
+    func waitingOnNetwork() {
+      guard primary,wanted==generation,!networkWait else { return }
+      networkWait=true; primaryNetworkWaits+=1; primaryNetworkReaders+=1
+    }
     var result:Int32 = -1
     stats.lastReadOffset=offset; stats.lastReadCount=count
     defer {
+      if networkWait,wanted==generation { primaryNetworkReaders-=1 }
       if primary { primaryReaders-=1; stats.lastReadResult=result }
       condition.broadcast(); condition.unlock()
     }
@@ -692,6 +730,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
       // The OS may purge a formerly complete cache. Resolve the real source
       // only after an actual local hole, never as a prerequisite for local open.
       if source.url.scheme=="cineva-cache",!refreshing {
+        waitingOnNetwork()
         guard !refreshed,let refresh else { result = -1; return result }
         refreshed=true; refreshing=true; refreshOwner=wanted; stats.refreshes+=1
         refreshTask=Task.detached { [weak self] in
@@ -724,6 +763,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
         if let id=f.task?.taskIdentifier, observed.insert(id).inserted { stats.coalesced+=1 }
         // Errors win over buffered prefixes after a failed response has completed.
         if f.finished, f.error != 0, !f.retryPending {
+          waitingOnNetwork()
           if f.error == -5, !refreshed, let refresh {
             f.recovery.hadFailure=true
             if f.recovery.attempts.count>=3 { f.recovery.reason="attempt-limit"; result=terminate(f,reader:wanted); return result }
@@ -791,6 +831,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
           observed.insert(startFlight(at:offset,generation:wanted,recovery:continuation)); continuation=nil
         }
       }
+      waitingOnNetwork()
       _=condition.wait(until:Date(timeIntervalSinceNow:max(0,min(0.1,budget-ProcessInfo.processInfo.systemUptime))))
     }
   }

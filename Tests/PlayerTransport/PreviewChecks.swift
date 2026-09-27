@@ -133,6 +133,7 @@ import CoreImage
         for target in [0.0,330.731,650.517,10.333,500.917] {
           let began=ProcessInfo.processInfo.systemUptime
           let generation=CinevaFFmpegSessionSeek(localHandle.pointer,target)
+          var readiness=CachedSeekReadiness(); readiness.begin(generation:generation)
           var gotVideo=false,gotPCM=false
           let limit=ProcessInfo.processInfo.systemUptime+10
           while ProcessInfo.processInfo.systemUptime<limit && (!gotVideo || !gotPCM) {
@@ -148,6 +149,8 @@ import CoreImage
           expect(gotVideo && gotPCM,"Offline FFmpeg head/middle/tail video and non-silent PCM at \(target)")
           expect(local.statistics.requests==0,"Offline native session makes zero HTTP requests")
           expect(local.statistics.refreshes==0,"Offline primary and preview never refresh a remote URL")
+          readiness.observe(local.playbackReadState,buffering:true)
+          expect(!readiness.needsNetwork,"Actual local A/V seek keeps buffering feedback suppressed")
           var timing=CinevaFFmpegSnapshot(); CinevaFFmpegSessionSnapshot(localHandle.pointer,&timing)
           print("OFFLINE_SEEK target=\(target) framePCMms=\((ProcessInfo.processInfo.systemUptime-began)*1000) lookupMs=\(timing.seekLookupSeconds*1000) prerollMs=\(timing.seekPrerollSeconds*1000) HTTP=\(local.statistics.requests)")
           timeline.display.end()

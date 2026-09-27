@@ -30,8 +30,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   @ObservationIgnored private var cpuSeconds=0.0
   @ObservationIgnored private var usageAt=0.0
   @ObservationIgnored private var commitAt:Double?
-  @ObservationIgnored private var localSeek=false
-  @ObservationIgnored private var seekRequests=0
+  private var seekReadiness=CachedSeekReadiness()
   @ObservationIgnored private var dragIO:RangeStatistics?
   @ObservationIgnored private var seekIO:RangeStatistics?
   @ObservationIgnored private var seekBegan=0.0
@@ -78,6 +77,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   var transferredMegabytes: Double { Double(statistics.downloadedBytes ?? 0)/1048576 }
   var loadingFeedback: PlayerLoadingFeedback? {
     guard isBuffering || playbackState == .seeking else { return nil }
+    if seekReadiness.generation==serial, !seekReadiness.needsNetwork { return nil }
     return PlayerLoadingFeedback(delayMilliseconds:200,generation:Int(serial))
   }
   @ObservationIgnored private var handle: FFmpegSessionHandle?
@@ -162,7 +162,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     sourceResolvedAt=CACurrentMediaTime(); clickAt=startupOrigin ?? sourceResolvedAt
     playbackBeganAt=nil; audioRenderedAt=nil; displayReadyAt=nil; stableAt=nil; uninterruptedAt=nil
     finalSeekCount=0; seekFrameMilliseconds=nil; commitAt=nil
-    localSeek=false; seekIO=nil; dragIO=nil; seekGeneration=0; seekDiagnostic="尚未拖动"
+    seekReadiness=CachedSeekReadiness(); seekIO=nil; dragIO=nil; seekGeneration=0; seekDiagnostic="尚未拖动"
     wantsPlayback=playing; waiting=true; resumeTarget=0.75; serial=1
     backgroundAudioOnly=false
     rebufferCount=0; audioUnderruns=0; firstFrameAt=nil
@@ -255,13 +255,13 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     cache?.allowPrefetch(false)
     target=min(max(0,seconds),duration>0 ? max(0,duration-0.01) : max(0,seconds))
     let io=cache?.statistics
-    seekIO=dragIO ?? io; dragIO=nil; seekRequests=io?.requests ?? 0
-    localSeek=cache?.mediaCacheProgress.complete == true
+    seekIO=dragIO ?? io; dragIO=nil
     seekBegan=CACurrentMediaTime(); commitAt=seekBegan
     seekFrameMilliseconds=nil; seekAudioMilliseconds=nil
     // Stop already scheduled old audio before publishing a new generation.
     audio.pause(); renderer.setPlaying(false)
     serial=CinevaFFmpegSessionSeek(handle.pointer,target)
+    if inputBackend == .customAVIOCached { seekReadiness.begin(generation:serial) }
     seekGeneration=serial
     audio.reset(to:target,generation:serial); renderer.reset(to:target,preservingImage:true)
     pending=nil; currentTime=target; waiting=true; resumeTarget=0.75
@@ -457,7 +457,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
       resetSubtitleImage()
       toneMapTask?.cancel(); toneMapTask=nil; pendingToneMapped=false
       serial=snapshot.serial; target=snapshot.recoveryTarget
-      localSeek=false
+      if seekReadiness.generation != nil { seekReadiness.begin(generation:serial) }
       // Native decoder fallback can legitimately advance the generation during
       // a seek. Keep its overlay until the replacement target frame arrives.
       if commitAt != nil { seekGeneration=serial } else { seekGeneration=0; seekIO=nil }
@@ -544,22 +544,27 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     let audioEmpty=hasAudio && audio.queuedDuration < 0.015 && snapshot.audioDrained==0
     let videoEmpty = !backgroundAudioOnly && renderer.anchored && renderer.time>renderer.lastEnd+0.15 && pending==nil && snapshot.frameCount==0 && snapshot.videoDrained==0
     if !waiting, wantsPlayback, audioEmpty || videoEmpty {
-      localSeek=false
       audio.pause(); renderer.suspendForData(); waiting=true
       rebufferCount += 1; if audioEmpty { audioUnderruns += 1 }
       let ioTarget=min(4,max(2,2*max(snapshot.activeIOSeconds,snapshot.lastReadSeconds)))
       resumeTarget=max(ioTarget,min(4,2+Double(min(rebufferCount-1,2))))
       waitStarted=now; playbackState = .buffering
     }
+    if let cache, seekReadiness.generation==serial {
+      var readiness=seekReadiness
+      readiness.observe(cache.playbackReadState,buffering:waiting)
+      if readiness != seekReadiness { seekReadiness=readiness }
+    }
     if waiting, wantsPlayback, backgroundAudioOnly || renderer.anchored, !hasAudio || audio.hasScheduledAudio {
       let desired=resumeTarget*Double(rate)
       let tail=snapshot.demuxEOF != 0 && bufferedDuration>0
       let capacity=snapshot.readerBackpressured != 0 && now-waitStarted>=desired && bufferedDuration>0.3
-      // A local indexed seek needs a target frame and a small, scheduled PCM
-      // runway. Network underrun recovery retains its existing larger runway.
-      // A real disk hole/HTTP fallback immediately disables this fast path.
-      let localReady=localSeek && serial==seekGeneration && cache?.mediaCacheProgress.complete == true
-        && cache?.statistics.requests==seekRequests
+      // An already-loaded region works even when the rest of the file is not
+      // cached. Only actual primary AVIO network waits require network refill.
+      // Positive video runway prevents a local decoder stall from spinning in
+      // a resume/underrun loop while still showing the old frame.
+      let localReady=seekReadiness.generation==serial && !seekReadiness.needsNetwork
+        && bufferedDuration>=0.04*Double(rate)
         && (!hasAudio || audio.queuedDuration>=max(0.04,2*AVAudioSession.sharedInstance().ioBufferDuration)*Double(rate))
       if localReady || bufferedDuration>=desired || tail || capacity {
         do {
@@ -569,7 +574,6 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
             renderer.alignClock(to:hasAudio ? audio.audibleTime : currentTime,rate:Double(rate),running:true)
           }
           waiting=false; playbackState = .playing
-          localSeek=false
           if playbackBeganAt==nil { playbackBeganAt=now }
         } catch { fail("音频输出失败：\(error.localizedDescription)"); return }
       }

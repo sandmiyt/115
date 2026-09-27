@@ -50,6 +50,41 @@ private final class SlowDiskGate: @unchecked Sendable {
       if n>0 { expect((0..<Int(n)).allSatisfy { bytes[$0]==UInt8((offset+Int64($0))%251) },"Byte integrity at \(offset)") }
       return n
     }
+    // A partially downloaded file must suppress buffering feedback when this
+    // seek hits cached bytes, independently of preview/prefetch network work.
+    let feedback=client("/retry-stop?seek-feedback")
+    expect(read(feedback,0)>0,"Prime a partial cache for seek feedback")
+    for _ in 0..<200 where feedback.statistics.memoryBytes<1048576 { Thread.sleep(forTimeInterval:0.01) }
+    feedback.changeGeneration(2)
+    var readiness=CachedSeekReadiness(); readiness.begin(generation:2)
+    expect(read(feedback,4096,4096,2)>0,"Seek reads an already cached region")
+    readiness.observe(feedback.playbackReadState,buffering:true)
+    expect(!feedback.mediaCacheProgress.complete && !readiness.needsNetwork,
+      "Partial memory cache hit does not show a buffering prompt")
+    let previewReader=feedback.makePreviewToken(), previewBlocked=PendingRangeRead()
+    previewBlocked.start(feedback,at:1048576,generation:previewReader)
+    for _ in 0..<200 where feedback.statistics.requests<2 { Thread.sleep(forTimeInterval:0.005) }
+    readiness.observe(feedback.playbackReadState,buffering:true)
+    expect(!readiness.needsNetwork && feedback.playbackReadState.networkWaits==0,
+      "Preview network activity cannot enable primary seek feedback")
+    feedback.cancelPreview(previewReader)
+    expect(previewBlocked.done.wait(timeout:.now()+1) == .success,"Preview read cancels independently")
+    let miss=PendingRangeRead(); miss.start(feedback,at:2097152,generation:2)
+    for _ in 0..<200 where !feedback.playbackReadState.waitingForNetwork { Thread.sleep(forTimeInterval:0.005) }
+    let staleRead=feedback.playbackReadState
+    readiness.observe(staleRead,buffering:true)
+    expect(readiness.needsNetwork,"Uncached target enables genuine network buffering feedback")
+    feedback.changeGeneration(3); readiness.begin(generation:3)
+    expect(miss.done.wait(timeout:.now()+1) == .success && miss.result == -3,"New seek cancels old waiting read")
+    readiness.observe(staleRead,buffering:true)
+    expect(read(feedback,0,4096,3)>0,"Cached target remains available after cancelling a miss")
+    readiness.observe(feedback.playbackReadState,buffering:true)
+    expect(!readiness.needsNetwork && !feedback.playbackReadState.waitingForNetwork,
+      "Old seek cannot re-enable the spinner or leave a pending network reader")
+    readiness.observe(feedback.playbackReadState,buffering:false)
+    readiness.observe(feedback.playbackReadState,buffering:true)
+    expect(!readiness.needsNetwork,"Local decode underrun stays on local recovery without network feedback")
+    feedback.close()
     // Independent preview cursors share bytes and request capacity, not stop/seek.
     let scoped=client("/retry-stop?scope-test")
     expect(read(scoped,0)>0,"Prime verified primary cache")
@@ -329,6 +364,10 @@ private final class SlowDiskGate: @unchecked Sendable {
     expect(resumedDisk.restored(identity:resumeIdentity.key)?.complete==false,"Partial manifest is not complete")
     let resumed=RangeCoordinator(source:source("/ok"),identity:resumeIdentity,disk:resumedDisk)
     expect(read(resumed,0)>0 && resumed.statistics.requests==0,"Partial reopen serves verified old head without redownload")
+    var diskReadiness=CachedSeekReadiness(); diskReadiness.begin(generation:1)
+    diskReadiness.observe(resumed.playbackReadState,buffering:true)
+    expect(!diskReadiness.needsNetwork && resumed.statistics.diskHitBytes>0,
+      "Partial durable cache hit suppresses seek buffering just like a memory hit")
     resumed.allowPrefetch(true)
     for _ in 0..<200 where !resumed.mediaCacheProgress.complete { Thread.sleep(forTimeInterval:0.05) }
     expect(resumed.mediaCacheProgress.complete && resumed.statistics.networkBytes==size-1048576,"Resume fills only persistent gaps")
