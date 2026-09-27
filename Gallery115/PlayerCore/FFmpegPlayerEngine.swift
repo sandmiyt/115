@@ -132,6 +132,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   }
   private(set) var mediaCacheProgress=MediaCacheProgress()
   var mediaCacheText:String {
+    guard inputBackend == .customAVIOCached else { return "当前视频使用在线播放" }
     let p=mediaCacheProgress
     if let message=p.limitation { return message+" · 已缓存 \(ByteCountFormatter.string(fromByteCount:p.bytes,countStyle:.file))" }
     guard p.total>0 else { return "正在确认视频缓存" }
