@@ -40,4 +40,8 @@ xcrun --sdk iphonesimulator swiftc -target arm64-apple-ios17.0-simulator \
   Gallery115/PlayerCore/FFmpegTimelinePreview.swift Tests/PlayerTransport/PreviewChecks.swift \
   -o "$RUNNER_TEMP/preview-checks"
 codesign --force --sign - "$RUNNER_TEMP/preview-checks"
-xcrun simctl spawn "$SIM_ID" "$RUNNER_TEMP/preview-checks" "http://127.0.0.1:$(cat "$RUNNER_TEMP/preview-port")"
+# AAC encoder priming can place the container origin before the first video
+# frame. The burned-in frame number is relative to VIDEO start, not audio start.
+VIDEO_OFFSET=$(ffprobe -v error -show_entries format=start_time:stream=codec_type,start_time -of json "$MEDIA/origin.mp4" | \
+  python3 -c 'import json,sys; j=json.load(sys.stdin); print(float(next(s["start_time"] for s in j["streams"] if s["codec_type"]=="video"))-float(j["format"]["start_time"]))')
+xcrun simctl spawn "$SIM_ID" "$RUNNER_TEMP/preview-checks" "http://127.0.0.1:$(cat "$RUNNER_TEMP/preview-port")" "$VIDEO_OFFSET"

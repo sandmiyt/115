@@ -7,6 +7,7 @@ import CoreImage
   static func main() async {
     setbuf(stdout,nil)
     let base=CommandLine.arguments[1]
+    let originVideoOffset=Double(CommandLine.arguments[2])!
     var checks=0
     func expect(_ ok:Bool,_ text:String) { precondition(ok,text); checks+=1 }
     for file in ["bframes.mp4","longgop.mkv","hevc.mp4","fractional.mp4","vfr.mp4","noaudio.mp4","rotated.mp4","origin.mp4","subtitles.mkv","4k.mp4"] {
@@ -49,8 +50,9 @@ import CoreImage
           func number(_ y:Int) -> Int {
             (0..<8).reduce(0) { $0 | (bytes[y*image.bytesPerRow+(30+$1*32)*4]>128 ? (1 << $1) : 0) }
           }
-          let expected=Int((frame.pts*24).rounded())
-          expect(number(130)==expected || number(image.height-1-130)==expected,"Decoded pixels carry the actual source frame number; never relabel target as PTS")
+          let videoOffset=file=="origin.mp4" ? originVideoOffset : 0
+          let expected=Int(((frame.pts-videoOffset)*24).rounded())
+          expect(number(130)==expected || number(image.height-1-130)==expected,"Decoded pixels carry the actual source frame number: \(file) pts=\(frame.pts) offset=\(videoOffset) expected=\(expected), got=\(number(130))/\(number(image.height-1-130)); never relabel target as PTS")
         }
         print("Preview fixture \(file): target=\(target) pts=\(frame.pts) duration=\(frame.duration) \(frame.note)")
       }
