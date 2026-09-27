@@ -66,6 +66,53 @@ jobs:
       - name: Build iPhone app without signing
         run: |
           set -euo pipefail
+          # Exercise the production buffering policy with synthetic time before
+          # compiling iOS. No extra workflow, regression job or test artifact.
+          cat Gallery115/PlayerCore/DiagnosticBufferPolicy.swift > "$RUNNER_TEMP/buffer-policy.swift"
+          cat >> "$RUNNER_TEMP/buffer-policy.swift" <<'SWIFT'
+          var policy = DiagnosticBufferPolicy()
+          var checks = 0
+          func expect(_ ok: Bool, _ name: String) {
+            precondition(ok, name)
+            checks += 1
+          }
+          func ready(_ compressed: Double, decoded: Double = 0.04, pending: Double = 0.04,
+                     submitted: Double = 0, hasFrame: Bool = true, io: Double = 0,
+                     eof: Bool = false, full: Bool = false, now: Double = 1) -> Bool {
+            policy.canResume(compressed: compressed, decoded: decoded, pending: pending,
+              submitted: submitted, hasFrame: hasFrame, ioLatency: io,
+              eof: eof, backpressured: full, now: now)
+          }
+          policy.prepare(at: 0)
+          expect(!ready(0), "One preview frame must not start the clock")
+          expect(ready(0.7), "Startup should not wait for two seconds")
+          expect(!ready(5, hasFrame: false), "Compressed packets alone cannot resume")
+          policy.starved(at: 2)
+          expect(!ready(0, now: 3), "One frame after starvation must stay frozen")
+          expect(!ready(1.8, now: 4), "First starvation requires at least two seconds")
+          expect(ready(1.93, now: 4), "Compressed and decoded durations jointly satisfy runway")
+          policy.starved(at: 5)
+          expect(!ready(2.5, now: 6), "Repeated starvation escalates to three seconds")
+          expect(ready(3, now: 6), "Three seconds resumes second starvation")
+          policy.starved(at: 8)
+          expect(!ready(3.5, now: 9), "Third starvation escalates to four seconds")
+          policy.starved(at: 10)
+          expect(!ready(4.5, now: 11), "Fourth starvation escalates to five seconds")
+          expect(ready(5, io: 9, now: 12) && policy.rebufferTarget == 5, "Latency escalation is capped")
+          policy.starved(at: 50)
+          expect(ready(2, now: 51) && policy.rebufferTarget == 2, "Isolated starvation resets escalation")
+          expect(!ready(2.5, io: 1.6, now: 52) && policy.rebufferTarget == 4, "Current IO raises runway")
+          expect(ready(0, eof: true, now: 53), "Short EOF tail must drain")
+          expect(!ready(0, decoded: 0, pending: 0, eof: true, now: 53), "EOF without frames cannot resume")
+          expect(ready(0.7, full: true, now: 55) && policy.capacityLimited, "Bounded capacity cannot deadlock")
+          let stalls = policy.stallCount
+          policy.prepare(at: 60)
+          expect(policy.stallCount == stalls, "Seek/recovery does not count as starvation")
+          expect(ready(0, decoded: 0, pending: 0.8, now: 61), "One real VFR duration can satisfy startup")
+          expect(!ready(.nan, decoded: .infinity, pending: -2, now: 61), "Invalid durations are not runway")
+          print("Buffer policy checks passed: \(checks)")
+          SWIFT
+          swift "$RUNNER_TEMP/buffer-policy.swift"
           xcodebuild \
             -workspace Gallery115.xcworkspace \
             -scheme Gallery115 \

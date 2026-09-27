@@ -65,6 +65,14 @@ final class FFmpegDecodeSession {
   private(set) var ioTimingDescription = "等待读取耗时"
   private(set) var ioJumpDescription = "等待包位置统计"
   private(set) var compressedVideoSeconds = 0.0
+  private(set) var readMode: FFmpegReadMode = .videoOnlySequential
+  private(set) var modeDescription = "Video-only diagnostic"
+  private(set) var readStatistics = "等待读取统计"
+  private(set) var bufferDescription = "等待缓冲"
+  private(set) var trial = FFmpegDiagnosticTrial(mode: .videoOnlySequential, position: 0, hardware: true)
+  @ObservationIgnored private var bufferPolicy = DiagnosticBufferPolicy()
+  @ObservationIgnored private var firstPlaybackAt: Double?
+  @ObservationIgnored private var trialFrozen = false
 
   var diagnosticText: String {
     let version = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "unknown"
@@ -77,7 +85,7 @@ final class FFmpegDecodeSession {
       + "目标位置后输出：\(videoFrames) 帧；显示入队：\(submittedFrames)；丢帧：\(droppedFrames)；显示恢复：\(renderRecoveries)\n"
       + "队列：\(packetBytes / 1024) KB / \(frameCount) 帧；首帧可显示：\(displayReadiness)\n"
       + "\(containerDescription)\n\(nativeStageDescription)\n\(recoveryDescription)\n"
-      + "\(ioDescription)\n\(ioTimingDescription)\n\(ioJumpDescription)\n"
+      + "\(modeDescription)\n\(ioDescription)\n\(ioTimingDescription)\n\(ioJumpDescription)\n\(readStatistics)\n\(bufferDescription)\n"
       + String(format: "压缩视频队列：%.2f s（尚未解码）\n", compressedVideoSeconds)
       + "解码器输出：\(decodedVideoFrames) 帧；目标前预滚：\(prerollFrames) 帧\n"
       + "\(failure)\n" + (audioWarning ?? "") + "\n" + (fallbackDescription ?? "")
@@ -85,16 +93,26 @@ final class FFmpegDecodeSession {
 
   @ObservationIgnored private var handle: FFmpegSessionHandle?
   @ObservationIgnored private var displayLink: CADisplayLink?
-  @ObservationIgnored private var pending: (CVPixelBuffer, Double, Int32)?
+  @ObservationIgnored private var pending: (CVPixelBuffer, Double, Double, Int32)?
   @ObservationIgnored private var serial: Int32 = 1
   @ObservationIgnored private var startedAt = 0.0
   @ObservationIgnored private var seekStartedAt: Double?
   @ObservationIgnored private var lastPublishedAt = 0.0
   @ObservationIgnored private var frameStep = 1.0 / 30.0
 
-  func start(source: VideoSource, at seconds: Double, preferHardware: Bool = true) {
+  func start(source: VideoSource, at seconds: Double, preferHardware: Bool = true,
+             mode: FFmpegReadMode = .videoOnlySequential) {
     guard handle == nil else { return }
     let start = seconds.isFinite ? max(0, seconds) : 0
+    readMode = mode
+    modeDescription = mode.videoOnly ? "Video-only diagnostic · 等待容器识别" : "标准 FFmpeg · 音频仅解码计数"
+    bufferPolicy = DiagnosticBufferPolicy()
+    bufferPolicy.prepare(at: CACurrentMediaTime())
+    firstPlaybackAt = nil
+    trialFrozen = false
+    trial = FFmpegDiagnosticTrial(mode: mode, position: start, hardware: preferHardware)
+    readStatistics = "等待读取统计"
+    bufferDescription = "等待缓冲"
     renderer.reset(to: start, newSession: true)
     pending = nil
     frameStep = 1.0 / 30.0
@@ -143,7 +161,8 @@ final class FFmpegDecodeSession {
     let headers = source.headers.sorted { $0.key < $1.key }
       .map { "\($0.key): \($0.value)\r\n" }.joined()
     let pointer = source.url.absoluteString.withCString { url in
-      headers.withCString { CinevaFFmpegSessionCreate(url, $0, start, preferHardware ? 1 : 0) }
+      headers.withCString { CinevaFFmpegSessionCreate(url, $0, start,
+        CinevaFFmpegSessionOptions(preferHardware: preferHardware ? 1 : 0, videoOnly: mode.videoOnly ? 1 : 0)) }
     }
     guard let pointer else { state = .failed("无法创建 FFmpeg 解码会话。"); return }
     handle = FFmpegSessionHandle(pointer)
@@ -159,6 +178,7 @@ final class FFmpegDecodeSession {
   }
 
   func stop() {
+    interruptTrial("提前停止 / 切换模式")
     displayLink?.invalidate()
     displayLink = nil
     pending = nil
@@ -168,6 +188,7 @@ final class FFmpegDecodeSession {
   }
 
   func toggle() {
+    interruptTrial("含手动暂停 / 播放，未完成的窗口停止统计")
     if state == .ended { wantsPlayback = true; seek(to: 0); return }
     wantsPlayback.toggle()
     renderer.setPlaying(wantsPlayback)
@@ -176,13 +197,35 @@ final class FFmpegDecodeSession {
 
   func seek(to seconds: Double) {
     guard let handle, duration > 0, seconds.isFinite else { return }
+    interruptTrial("含手动定位，未完成的窗口停止统计；请固定起点重测")
     let target = min(max(0, seconds), max(0, duration - 0.1))
     serial = CinevaFFmpegSessionSeek(handle.pointer, target)
     pending = nil
     currentTime = target
     seekStartedAt = CACurrentMediaTime()
     renderer.reset(to: target)
+    bufferPolicy.prepare(at: CACurrentMediaTime())
     state = .seeking
+  }
+
+  private func interruptTrial(_ reason: String) {
+    guard !trialFrozen else { return }
+    trial.interruption = reason
+    trialFrozen = true
+  }
+
+  private func updateTrial(_ snapshot: CinevaFFmpegSnapshot, now: Double) {
+    guard !trialFrozen else { return }
+    trial.firstFrame = firstFrameSeconds
+    trial.firstPlayback = firstPlaybackAt.map { $0 - startedAt }
+    trial.elapsed = firstPlaybackAt.map { min(10, max(0, now - $0)) } ?? 0
+    trial.bytes = snapshot.ioBytesRead
+    trial.backwards = Int(snapshot.backwardPacketJumps)
+    trial.forwards = Int(snapshot.largeForwardPacketJumps)
+    trial.averageRead = snapshot.averageReadFrameDuration
+    trial.maximumRead = snapshot.maximumReadFrameDuration
+    trial.compressed = snapshot.queuedSeconds
+    if trial.elapsed >= 10 { trial.complete = true; trialFrozen = true }
   }
 
   private func errorText(_ code: Int32) -> String {
@@ -240,7 +283,7 @@ final class FFmpegDecodeSession {
       let video = String(cString: CinevaFFmpegCodecName(snapshot.videoCodec))
       let audio = snapshot.audioCodec == 0 ? "无音轨" : String(cString: CinevaFFmpegCodecName(snapshot.audioCodec))
       mediaDescription = "\(video) · \(snapshot.width)×\(snapshot.height) · 音频 \(audio)"
-      if snapshot.fps.isFinite, snapshot.fps > 0 { frameStep = 1 / min(240, max(1, snapshot.fps)) }
+      if snapshot.fps.isFinite, snapshot.fps > 0 { frameStep = 1 / snapshot.fps }
     }
     if renderer.anchored { currentTime = max(0, renderer.time) }
     submittedFrames = renderer.submittedFrames
@@ -274,6 +317,18 @@ final class FFmpegDecodeSession {
       + (snapshot.lastPacketAge < 0 ? " · 尚未取得媒体包" :
         String(format: " · 距上次包 %.2f s", snapshot.lastPacketAge))
     ioJumpDescription = "包位置回退 \(snapshot.backwardPacketJumps) 次 · 前跳超过 1 MiB \(snapshot.largeForwardPacketJumps) 次（不是 HTTP 请求数）"
+    modeDescription = (snapshot.videoOnly != 0 ? "Video-only diagnostic" : "标准 FFmpeg · 音频仅解码计数")
+      + " · MOV interleaved read: " + (snapshot.movInterleavedRead < 0 ? "N/A" : (snapshot.movInterleavedRead == 0 ? "OFF" : "ON"))
+      + " · audio demux: " + (snapshot.audioDemux == 0 ? "OFF" : "ON")
+    readStatistics = "packetReadCount（av_read_frame 调用，含 EOF / 错误）：\(snapshot.packetReadCount)\n"
+      + String(format: "averageReadFrameDuration %.4f s · maximumReadFrameDuration %.4f s\n", snapshot.averageReadFrameDuration, snapshot.maximumReadFrameDuration)
+      + "backwardJumpBytesTotal \(snapshot.backwardJumpBytesTotal) · largestBackwardJump \(snapshot.largestBackwardJump) bytes\n"
+      + "forwardGapBytesTotal \(snapshot.forwardGapBytesTotal) · largestForwardGap \(snapshot.largestForwardGap) bytes\n"
+      + "HTTP requests / Range 次数 / 200 / 206 / 416 / Cache hit / miss：不可获得（尚未接入 Custom AVIO）"
+    bufferDescription = String(format: "startupBufferTarget %.2f s · rebufferTarget %.2f s · stallCount %d\n估算可播放余量 %.3f s / 恢复目标 %.3f s · decoded %.3f s",
+      bufferPolicy.startupBufferTarget, bufferPolicy.rebufferTarget, bufferPolicy.stallCount,
+      bufferPolicy.runway, bufferPolicy.resumeTarget, snapshot.decodedQueueSeconds)
+      + (bufferPolicy.capacityLimited ? "\n已触及有界队列容量，按现有余量恢复（未达到时间目标）" : "")
     audioWarning = snapshot.audioWarningCode == 0 ? nil :
       "音轨验证已跳过：\(errorText(snapshot.audioWarningCode))（\(snapshot.audioWarningCode)）；无声视频验证继续。"
     let container = withUnsafeBytes(of: snapshot.container) { bytes in
@@ -290,6 +345,8 @@ final class FFmpegDecodeSession {
     CinevaFFmpegSessionSnapshot(handle.pointer, &snapshot)
     if snapshot.status < 0 {
       publish(snapshot, now: CACurrentMediaTime())
+      updateTrial(snapshot, now: CACurrentMediaTime())
+      interruptTrial("会话失败，未完成的对照窗口停止统计")
       let failureStage = stageName(snapshot.failureStage)
       let detail = errorText(snapshot.errorCode)
       let code = snapshot.errorCode
@@ -307,32 +364,38 @@ final class FFmpegDecodeSession {
     // Decoder failure can trigger an internal keyframe restart in software.
     // Treat it exactly like a new seek; no old hardware frame may reappear.
     if snapshot.serial != serial {
+      interruptTrial("内部解码恢复，未完成的对照窗口停止统计")
       serial = snapshot.serial
       pending = nil
       currentTime = snapshot.recoveryTarget
       renderer.reset(to: currentTime)
+      bufferPolicy.prepare(at: CACurrentMediaTime())
       state = .seeking
     }
     if renderer.anchored { CinevaFFmpegSessionSetPosition(handle.pointer, renderer.time) }
     let now = CACurrentMediaTime()
-    if now - lastPublishedAt >= 0.25 { publish(snapshot, now: now) }
+    let shouldPublish = now - lastPublishedAt >= 0.25
+    if shouldPublish { publish(snapshot, now: now) }
     // Bounded feeding; native output schedules against its host timebase.
     // Polling never performs network reads, software decoding or pixel copies.
     for _ in 0..<8 {
       if pending == nil {
         var pts = 0.0
+        var frameDuration = 0.0
         var frameSerial: Int32 = 0
-        if let pixel = CinevaFFmpegSessionCopyFrame(handle.pointer, &pts, &frameSerial) {
-          pending = (pixel, pts, frameSerial)
+        if let pixel = CinevaFFmpegSessionCopyFrame(handle.pointer, &pts, &frameDuration, &frameSerial) {
+          pending = (pixel, pts, frameDuration.isFinite && frameDuration > 0 ? frameDuration : frameStep, frameSerial)
         }
       }
-      guard let (pixel, pts, frameSerial) = pending else { break }
+      guard let (pixel, pts, frameDuration, frameSerial) = pending else { break }
       guard frameSerial == serial else { pending = nil; continue }
-      let result = renderer.submit(pixel, pts: pts, duration: frameStep, playing: wantsPlayback, now: now)
+      let recoveries = renderer.recoveryCount
+      let result = renderer.submit(pixel, pts: pts, duration: frameDuration, playing: wantsPlayback, now: now)
+      if renderer.recoveryCount != recoveries { bufferPolicy.prepare(at: now) }
       switch result {
       case .accepted:
         pending = nil
-        state = wantsPlayback ? .playing : .paused
+        state = wantsPlayback ? (renderer.waitingForData ? .buffering : .playing) : .paused
         if firstFrameSeconds == nil { firstFrameSeconds = now - startedAt }
         if let seekStartedAt {
           lastSeekSeconds = now - seekStartedAt
@@ -351,18 +414,38 @@ final class FFmpegDecodeSession {
     // the snapshot taken before consuming frames at the beginning of this tick.
     CinevaFFmpegSessionSnapshot(handle.pointer, &snapshot)
     guard snapshot.serial == serial, snapshot.status >= 0 else { return }
+    if shouldPublish || (!trialFrozen && firstPlaybackAt.map { now - $0 >= 10 } == true) {
+      updateTrial(snapshot, now: now)
+    }
     if renderer.anchored && wantsPlayback && !renderer.waitingForData {
       if renderer.time > renderer.lastEnd + 0.15, pending == nil, snapshot.frameCount == 0 {
         renderer.suspendForData()
         state = snapshot.status == 2 ? .ended : .buffering
         if state == .ended { wantsPlayback = false }
+        else {
+          bufferPolicy.starved(at: now)
+          if !trialFrozen, let firstPlaybackAt, now - firstPlaybackAt < 10 { trial.stalls += 1 }
+        }
       }
     }
-    if (!renderer.anchored || renderer.waitingForData), snapshot.status == 2,
-      snapshot.frameCount == 0, pending == nil {
+    if renderer.waitingForData, wantsPlayback, renderer.anchored {
+      let submitted = max(0, renderer.lastEnd - renderer.time)
+      let hasFrame = pending != nil || submitted > 0
+      if bufferPolicy.canResume(compressed: snapshot.queuedSeconds, decoded: snapshot.decodedQueueSeconds,
+        pending: pending?.2 ?? 0, submitted: submitted, hasFrame: hasFrame,
+        ioLatency: max(snapshot.lastReadSeconds, snapshot.activeIOSeconds),
+        eof: snapshot.demuxEOF != 0, backpressured: snapshot.readerBackpressured != 0, now: now) {
+        renderer.resume(nextPTS: pending?.1, playing: true)
+        if firstPlaybackAt == nil { firstPlaybackAt = now }
+        state = .playing
+      }
+    }
+    if (!renderer.anchored || (renderer.waitingForData && renderer.time >= renderer.lastEnd)),
+      snapshot.status == 2, snapshot.frameCount == 0, pending == nil {
       state = .ended
       wantsPlayback = false
       renderer.setPlaying(false)
     }
+    if state == .ended { interruptTrial("媒体结束，未满 10 秒") }
   }
 }

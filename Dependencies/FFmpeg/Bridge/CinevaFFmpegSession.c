@@ -8,6 +8,8 @@
 #include <libavutil/display.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/log.h>
+#include <libavutil/opt.h>
+#include <libavutil/bprint.h>
 #include <libavutil/time.h>
 #include <libswscale/swscale.h>
 #include <pthread.h>
@@ -22,7 +24,7 @@
 #define FRAMES 6
 #define BYTE_LIMIT (16 * 1024 * 1024)
 typedef struct { AVPacket *packet; int serial, eof; double duration, target; } Packet;
-typedef struct { CVPixelBufferRef buffer; double pts; int serial; } Frame;
+typedef struct { CVPixelBufferRef buffer; double pts, duration; int serial; } Frame;
 struct CinevaFFmpegSession {
     pthread_mutex_t mutex;
     pthread_cond_t changed;
@@ -38,7 +40,7 @@ struct CinevaFFmpegSession {
     int disableHardware, hardwareAttempted;
     double playbackPosition;
     int64_t ioStartedUs, lastPacketUs, previousPacketEnd;
-    int videoIndex, audioIndex;
+    int videoIndex, audioIndex, audioSourceIndex, videoOnly;
     AVRational videoTimeBase;
     struct SwsContext *scale;
     Packet packets[PACKETS];
@@ -47,6 +49,7 @@ struct CinevaFFmpegSession {
     double packetSeconds;
     Frame frames[FRAMES];
     int frameHead, frameCount;
+    double frameSeconds;
     CinevaFFmpegSnapshot snapshot;
 };
 
@@ -79,8 +82,13 @@ static void readerStage(CinevaFFmpegSession *s, int stage) {
 // concurrently reads libavformat's mutable counters or calls avio_size/seek.
 static void readerFinished(CinevaFFmpegSession *s, int packetRead) {
     pthread_mutex_lock(&s->mutex);
-    if (packetRead && s->ioStartedUs)
+    if (packetRead && s->ioStartedUs) {
         s->snapshot.lastReadSeconds = (av_gettime_relative() - s->ioStartedUs) / 1000000.0;
+        s->snapshot.packetReadCount++;
+        s->snapshot.averageReadFrameDuration += (s->snapshot.lastReadSeconds -
+            s->snapshot.averageReadFrameDuration) / s->snapshot.packetReadCount;
+        s->snapshot.maximumReadFrameDuration = fmax(s->snapshot.maximumReadFrameDuration, s->snapshot.lastReadSeconds);
+    }
     s->ioStartedUs = 0;
     if (s->format && s->format->pb) {
         s->snapshot.ioBytesRead = s->format->pb->bytes_read;
@@ -111,14 +119,19 @@ static void clearQueues(CinevaFFmpegSession *s) {
         CVPixelBufferRelease(s->frames[(s->frameHead + i) % FRAMES].buffer);
     s->packetCount = s->packetHead = s->frameCount = s->frameHead = 0;
     s->packetBytes = 0; s->packetSeconds = 0;
+    s->frameSeconds = 0;
+    s->snapshot.demuxEOF = 0;
 }
 static int putPacket(CinevaFFmpegSession *s, Packet entry) {
     pthread_mutex_lock(&s->mutex);
     int bytes = entry.packet ? entry.packet->size : 0;
     while (!atomic_load(&s->cancelled) && entry.serial == atomic_load(&s->generation) &&
            (s->packetCount >= PACKETS || s->packetBytes + bytes > BYTE_LIMIT ||
-            (s->packetCount > 0 && s->packetSeconds >= 8.0)))
+            (s->packetCount > 0 && s->packetSeconds >= 8.0))) {
+        s->snapshot.readerBackpressured = 1;
         pthread_cond_wait(&s->changed, &s->mutex);
+    }
+    s->snapshot.readerBackpressured = 0;
     int ok = !atomic_load(&s->cancelled) && entry.serial == atomic_load(&s->generation);
     if (ok) {
         s->packets[(s->packetHead + s->packetCount++) % PACKETS] = entry;
@@ -135,8 +148,11 @@ static int emitVideo(CinevaFFmpegSession *s, AVFrame *frame, int serial, double 
     double pts = frame->best_effort_timestamp == AV_NOPTS_VALUE ? *nextPTS :
         frame->best_effort_timestamp * av_q2d(s->videoTimeBase) - s->origin;
     if (!isfinite(pts)) pts = *nextPTS;
-    double step = frame->duration > 0 ? frame->duration * av_q2d(s->videoTimeBase) :
-        1.0 / (s->snapshot.fps > 0 ? s->snapshot.fps : 30);
+    AVRational durationBase = frame->time_base.num > 0 && frame->time_base.den > 0 ?
+        frame->time_base : s->videoTimeBase;
+    double step = frame->duration > 0 ? frame->duration * av_q2d(durationBase) : 0;
+    if (!isfinite(step) || step <= 0)
+        step = 1.0 / (isfinite(s->snapshot.fps) && s->snapshot.fps > 0 ? s->snapshot.fps : 30);
     *nextPTS = pts + step;
     if (serial != atomic_load(&s->generation)) return 0;
     if (pts + 0.001 < target) {
@@ -154,7 +170,8 @@ static int emitVideo(CinevaFFmpegSession *s, AVFrame *frame, int serial, double 
     if (atomic_load(&s->cancelled) || serial != atomic_load(&s->generation)) {
         CVPixelBufferRelease(pixel);
     } else {
-        s->frames[(s->frameHead + s->frameCount++) % FRAMES] = (Frame){pixel, fmax(0, pts), serial};
+        s->frames[(s->frameHead + s->frameCount++) % FRAMES] = (Frame){pixel, fmax(0, pts), step, serial};
+        s->frameSeconds += step;
         s->snapshot.videoFrames++;
         s->snapshot.decoderType = output.decoderType;
         s->snapshot.hardwareFrames += output.decoderType == 2;
@@ -379,7 +396,7 @@ static void publishMedia(CinevaFFmpegSession *s) {
     s->snapshot.videoCodec = video->codecpar->codec_id;
     s->snapshot.videoProfile = video->codecpar->profile;
     s->snapshot.videoStreamIndex = s->videoIndex;
-    s->snapshot.audioCodec = s->audioIndex >= 0 ? s->format->streams[s->audioIndex]->codecpar->codec_id : AV_CODEC_ID_NONE;
+    s->snapshot.audioCodec = s->audioSourceIndex >= 0 ? s->format->streams[s->audioSourceIndex]->codecpar->codec_id : AV_CODEC_ID_NONE;
     s->snapshot.fps = av_q2d(av_guess_frame_rate(s->format, video, NULL));
     s->snapshot.duration = s->format->duration > 0 ? (double)s->format->duration / AV_TIME_BASE : 0;
     s->snapshot.colorPrimaries = video->codecpar->color_primaries;
@@ -421,14 +438,45 @@ static void *readLoop(void *opaque) {
         result = openInput(s, attempt);
         readerFinished(s, 0);
         if (result < 0) goto done;
+        // Detect the actual demuxer, never a filename suffix or URL. Set before
+        // stream probing too, so audio-only verification cannot cause MP4 seeks.
+        int mov = s->format->iformat == av_find_input_format("mov");
+        if (mov) {
+            result = av_opt_set_int(s->format->priv_data, "interleaved_read", s->videoOnly ? 0 : 1, 0);
+            if (result < 0) goto done;
+        }
+        if (s->videoOnly) for (unsigned i = 0; i < s->format->nb_streams; i++) {
+            AVStream *stream = s->format->streams[i];
+            if (stream->codecpar->codec_type != AVMEDIA_TYPE_VIDEO ||
+                (stream->disposition & AV_DISPOSITION_ATTACHED_PIC)) stream->discard = AVDISCARD_ALL;
+        }
+        if (s->videoOnly) {
+            // find_stream_info may try opening an audio decoder even for a
+            // discarded stream. Restrict its internal probe decoders too.
+            AVBPrint names;
+            av_bprint_init(&names, 128, AV_BPRINT_SIZE_UNLIMITED);
+            void *iterator = NULL;
+            const AVCodec *codec;
+            while ((codec = av_codec_iterate(&iterator))) {
+                if (av_codec_is_decoder(codec) && codec->type == AVMEDIA_TYPE_VIDEO)
+                    av_bprintf(&names, "%s%s", names.len ? "," : "", codec->name);
+            }
+            int complete = av_bprint_is_complete(&names);
+            result = complete ? av_opt_set(s->format, "codec_whitelist", names.str, 0) : AVERROR(ENOMEM);
+            av_bprint_finalize(&names, NULL);
+            if (result < 0) goto done;
+        }
         pthread_mutex_lock(&s->mutex);
+        s->snapshot.movInterleavedRead = mov ? !s->videoOnly : -1;
         snprintf(s->snapshot.container, sizeof(s->snapshot.container), "%s", s->format->iformat->name);
         pthread_mutex_unlock(&s->mutex);
         stage = CinevaStageProbe; readerStage(s, stage);
         result = avformat_find_stream_info(s->format, NULL);
         readerFinished(s, 0);
         s->videoIndex = selectVideo(s->format);
-        s->audioIndex = av_find_best_stream(s->format, AVMEDIA_TYPE_AUDIO, -1, s->videoIndex, NULL, 0);
+        s->audioSourceIndex = av_find_best_stream(s->format, AVMEDIA_TYPE_AUDIO, -1, s->videoIndex, NULL, 0);
+        s->audioIndex = s->videoOnly ? -1 : s->audioSourceIndex;
+        pthread_mutex_lock(&s->mutex); s->snapshot.audioDemux = s->audioIndex >= 0; pthread_mutex_unlock(&s->mutex);
         // Keep partial metadata even when probing or decoder opening fails.
         publishMedia(s);
         int incomplete = s->videoIndex < 0;
@@ -453,7 +501,7 @@ static void *readLoop(void *opaque) {
     if (atomic_load(&s->cancelled)) goto done;
     // A dropped packet after av_read_frame is already downloaded. Discard
     // unused tracks at the demuxer instead, before MP4 seeks/reads their bytes.
-    // Keep both selected video AND selected audio for the decoder validation.
+    // Standard A keeps both tracks; video-only B never queues audio packets.
     for (unsigned i = 0; i < s->format->nb_streams; i++) {
         s->format->streams[i]->discard = (int)i == s->videoIndex || (int)i == s->audioIndex ?
             AVDISCARD_DEFAULT : AVDISCARD_ALL;
@@ -548,6 +596,9 @@ static void *readLoop(void *opaque) {
         atomic_store(&s->interruptSeek, 0);
         if (serial != atomic_load(&s->generation)) { av_packet_free(&packet); continue; }
         if (result == AVERROR_EOF) {
+            pthread_mutex_lock(&s->mutex);
+            if (serial == atomic_load(&s->generation)) s->snapshot.demuxEOF = 1;
+            pthread_mutex_unlock(&s->mutex);
             av_packet_free(&packet);
             putPacket(s, (Packet){NULL, serial, 1, 0, target}); eof = 1; continue;
         }
@@ -559,10 +610,18 @@ static void *readLoop(void *opaque) {
         pthread_mutex_lock(&s->mutex);
         s->lastPacketUs = av_gettime_relative();
         if (packet->pos >= 0) {
-            if (s->previousPacketEnd >= 0 && packet->pos < s->previousPacketEnd)
+            if (s->previousPacketEnd >= 0 && packet->pos < s->previousPacketEnd) {
                 s->snapshot.backwardPacketJumps++;
-            if (s->previousPacketEnd >= 0 && packet->pos - s->previousPacketEnd > 1048576)
-                s->snapshot.largeForwardPacketJumps++;
+                int64_t distance = s->previousPacketEnd - packet->pos;
+                s->snapshot.backwardJumpBytesTotal += distance;
+                s->snapshot.largestBackwardJump = FFMAX(s->snapshot.largestBackwardJump, distance);
+            }
+            if (s->previousPacketEnd >= 0 && packet->pos > s->previousPacketEnd) {
+                int64_t gap = packet->pos - s->previousPacketEnd;
+                s->snapshot.forwardGapBytesTotal += gap;
+                s->snapshot.largestForwardGap = FFMAX(s->snapshot.largestForwardGap, gap);
+                if (gap > 1048576) s->snapshot.largeForwardPacketJumps++;
+            }
             s->snapshot.lastPacketPosition = packet->pos;
             s->previousPacketEnd = packet->pos + packet->size;
         }
@@ -571,6 +630,11 @@ static void *readLoop(void *opaque) {
         // used to report four seconds while often retaining only two seconds.
         double seconds = packet->stream_index == s->videoIndex && packet->duration > 0 ? packet->duration *
             av_q2d(s->format->streams[packet->stream_index]->time_base) : 0;
+        // Keyframe preroll before the requested position is not playable runway.
+        if (seconds > 0 && packet->pts != AV_NOPTS_VALUE) {
+            double pts = packet->pts * av_q2d(s->videoTimeBase) - s->origin;
+            seconds = fmax(0, fmin(seconds, pts + seconds - target));
+        }
         putPacket(s, (Packet){packet, serial, 0, fmin(seconds, 8.0), target});
     }
 done:
@@ -580,7 +644,7 @@ done:
     return NULL;
 }
 
-CinevaFFmpegSession *CinevaFFmpegSessionCreate(const char *url, const char *headers, double startTime, int preferHardware) {
+CinevaFFmpegSession *CinevaFFmpegSessionCreate(const char *url, const char *headers, double startTime, CinevaFFmpegSessionOptions options) {
     if (strncmp(url, "https://", 8) && strncmp(url, "http://", 7)) return NULL;
     CinevaFFmpegSession *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
@@ -596,8 +660,12 @@ CinevaFFmpegSession *CinevaFFmpegSessionCreate(const char *url, const char *head
     s->snapshot.videoProfile = AV_PROFILE_UNKNOWN;
     s->previousPacketEnd = -1;
     s->snapshot.lastPacketPosition = -1;
-    s->disableHardware = !preferHardware;
-    s->snapshot.fallbackReason = preferHardware ? 0 : 5;
+    s->videoOnly = !!options.videoOnly;
+    s->snapshot.videoOnly = s->videoOnly;
+    s->snapshot.movInterleavedRead = -1;
+    s->audioIndex = s->audioSourceIndex = -1;
+    s->disableHardware = !options.preferHardware;
+    s->snapshot.fallbackReason = options.preferHardware ? 0 : 5;
     if (!s->url || !s->headers || pthread_create(&s->reader, NULL, readLoop, s)) {
         CinevaFFmpegSessionDestroy(s); return NULL;
     }
@@ -643,17 +711,19 @@ void CinevaFFmpegSessionSnapshot(CinevaFFmpegSession *s, CinevaFFmpegSnapshot *s
     snapshot->serial = atomic_load(&s->generation);
     snapshot->packetBytes = s->packetBytes; snapshot->packetCount = s->packetCount;
     snapshot->frameCount = s->frameCount; snapshot->queuedSeconds = s->packetSeconds;
+    snapshot->decodedQueueSeconds = s->frameSeconds;
     int64_t now = av_gettime_relative();
     snapshot->activeIOSeconds = s->ioStartedUs ? (now - s->ioStartedUs) / 1000000.0 : 0;
     snapshot->lastPacketAge = s->lastPacketUs ? (now - s->lastPacketUs) / 1000000.0 : -1;
     pthread_mutex_unlock(&s->mutex);
 }
-CVPixelBufferRef CinevaFFmpegSessionCopyFrame(CinevaFFmpegSession *s, double *pts, int *serial) {
+CVPixelBufferRef CinevaFFmpegSessionCopyFrame(CinevaFFmpegSession *s, double *pts, double *duration, int *serial) {
     pthread_mutex_lock(&s->mutex);
     CVPixelBufferRef result = NULL;
     if (s->frameCount) {
         Frame frame = s->frames[s->frameHead]; s->frameHead = (s->frameHead + 1) % FRAMES;
-        s->frameCount--; *pts = frame.pts; *serial = frame.serial; result = frame.buffer;
+        s->frameCount--; *pts = frame.pts; *duration = frame.duration; *serial = frame.serial; result = frame.buffer;
+        s->frameSeconds = fmax(0, s->frameSeconds - frame.duration);
     }
     pthread_cond_broadcast(&s->changed); pthread_mutex_unlock(&s->mutex);
     return result;

@@ -18,9 +18,13 @@ int CinevaFFmpegHasVideoToolbox(const char * _Nonnull decoder);
 // No network, media playback or hardware session is opened in Phase 2.
 int CinevaFFmpegRuntimeCheck(void);
 
-// Phase 4: hardware-preferred decode workers. Audio is decoded for validation,
-// but not rendered until the audio-clock phase. No libav types cross this ABI.
+// Hardware-preferred validation workers. Optional audio decode remains available
+// for standard A, but videoOnly excludes it. No libav types cross this ABI.
 typedef struct CinevaFFmpegSession CinevaFFmpegSession;
+typedef struct {
+    int preferHardware;
+    int videoOnly; // Validation defaults true; false retains audio decode capability.
+} CinevaFFmpegSessionOptions;
 typedef struct {
     int status; // 0 opening, 1 decoding, 2 drained, -1 failed
     int errorCode;
@@ -44,6 +48,13 @@ typedef struct {
     int64_t ioBytesRead, ioPosition, lastPacketPosition;
     int backwardPacketJumps, largeForwardPacketJumps;
     double activeIOSeconds, lastReadSeconds, lastPacketAge;
+    int videoOnly, audioDemux, movInterleavedRead; // MOV: -1 not applicable, 0 OFF, 1 ON
+    double decodedQueueSeconds;
+    int demuxEOF, readerBackpressured;
+    int64_t backwardJumpBytesTotal, largestBackwardJump;
+    int64_t forwardGapBytesTotal, largestForwardGap;
+    int64_t packetReadCount;
+    double averageReadFrameDuration, maximumReadFrameDuration;
 } CinevaFFmpegSnapshot;
 enum {
     CinevaStageOpen = 1, CinevaStageProbe, CinevaStageSelectVideo,
@@ -52,7 +63,7 @@ enum {
     CinevaStageVideoSurface, CinevaStageWorker
 };
 CinevaFFmpegSession * _Nullable CinevaFFmpegSessionCreate(
-    const char * _Nonnull url, const char * _Nonnull headers, double startTime, int preferHardware);
+    const char * _Nonnull url, const char * _Nonnull headers, double startTime, CinevaFFmpegSessionOptions options);
 void CinevaFFmpegSessionCancel(CinevaFFmpegSession * _Nonnull session);
 // Must run off the main thread, after the consumer has stopped using session.
 void CinevaFFmpegSessionDestroy(CinevaFFmpegSession * _Nonnull session);
@@ -61,7 +72,7 @@ void CinevaFFmpegSessionSetPosition(CinevaFFmpegSession * _Nonnull session, doub
 void CinevaFFmpegSessionSnapshot(CinevaFFmpegSession * _Nonnull session,
     CinevaFFmpegSnapshot * _Nonnull snapshot);
 CVPixelBufferRef _Nullable CinevaFFmpegSessionCopyFrame(CinevaFFmpegSession * _Nonnull session,
-    double * _Nonnull pts, int * _Nonnull serial) CF_RETURNS_RETAINED;
+    double * _Nonnull pts, double * _Nonnull duration, int * _Nonnull serial) CF_RETURNS_RETAINED;
 const char * _Nonnull CinevaFFmpegCodecName(int codec);
 void CinevaFFmpegErrorText(int code, char * _Nonnull buffer, int capacity);
 

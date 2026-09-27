@@ -12,7 +12,7 @@ final class NativeVideoRenderer {
   private var format: CMVideoFormatDescription?
   private var blockedSince: Double?
   private(set) var anchored = false
-  private(set) var waitingForData = false
+  private(set) var waitingForData = true
   private(set) var lastPTS = -1.0
   private(set) var lastEnd = -1.0
   private(set) var submittedFrames = 0
@@ -38,7 +38,7 @@ final class NativeVideoRenderer {
     layer.flushAndRemoveImage()
     format = nil
     anchored = false
-    waitingForData = false
+    waitingForData = true
     blockedSince = nil
     lastPTS = -1
     lastEnd = -1
@@ -48,6 +48,16 @@ final class NativeVideoRenderer {
 
   func setPlaying(_ playing: Bool) {
     setRate(playing && anchored && !waitingForData ? 1 : 0)
+  }
+
+  /// The controller must approve the buffered runway before advancing time.
+  func resume(nextPTS: Double?, playing: Bool) {
+    guard anchored, waitingForData, playing else { return }
+    if let nextPTS, nextPTS.isFinite, time > lastEnd { setTime(nextPTS) }
+    waitingForData = false
+    blockedSince = nil
+    waitReason = "缓冲余量已满足 · 按时间戳显示"
+    setRate(1)
   }
 
   func suspendForData() {
@@ -62,6 +72,7 @@ final class NativeVideoRenderer {
   private func recover() -> Bool {
     guard recoveryCount < 2 else { return false }
     recoveryCount += 1
+    setRate(0)
     output.flush()
     format = nil
     blockedSince = nil
@@ -79,13 +90,14 @@ final class NativeVideoRenderer {
       let code = (output.error as NSError?)?.code ?? 0
       guard recover() else { return .failed("原生显示恢复失败（\(code)）。请返回原播放器。") }
     }
-    // Resume the clock BEFORE checking readiness. Otherwise a full native queue
-    // can wait for a paused clock while the producer waits for queue readiness.
-    let restarting = !anchored || waitingForData
+    // Preview one frame with a frozen clock. Only resume() may release the
+    // waiting gate, after the controller has checked all bounded queues.
+    let restarting = !anchored
     if restarting {
       setTime(pts)
-      setRate(playing ? 1 : 0)
+      setRate(0)
     } else {
+      if waitingForData { waitReason = "积累恢复缓冲 · 保留当前画面"; return .waiting }
       if !playing { return .waiting }
       if pts <= lastPTS || pts + duration < time - 0.1 {
         droppedFrames += 1
@@ -134,11 +146,10 @@ final class NativeVideoRenderer {
     }
     output.enqueue(sample)
     anchored = true
-    waitingForData = false
     lastPTS = pts
     lastEnd = pts + duration
     submittedFrames += 1
-    waitReason = playing ? "按时间戳显示" : "已暂停"
+    waitReason = waitingForData ? "首帧预览 · 等待缓冲余量" : (playing ? "按时间戳显示" : "已暂停")
     return .accepted
   }
 

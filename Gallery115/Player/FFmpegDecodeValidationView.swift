@@ -12,6 +12,10 @@ struct FFmpegDecodeValidationView: View {
   @State private var dragging = false
   @State private var preferHardware = true
   @State private var copiedDiagnostics = false
+  @State private var readMode: FFmpegReadMode = .videoOnlySequential
+  @State private var comparisonPosition = 0.0
+  @State private var trials: [FFmpegDiagnosticTrial] = []
+  @State private var started = false
 
   var body: some View {
     ScrollView {
@@ -23,6 +27,20 @@ struct FFmpegDecodeValidationView: View {
           .clipped()
         Text("原生渲染验证 · 暂不输出声音")
           .font(.headline)
+        VStack(alignment: .leading, spacing: 8) {
+          Text("远程 MP4 读取模式").font(.subheadline.weight(.medium))
+          Picker("远程 MP4 读取模式", selection: $readMode) {
+            ForEach(FFmpegReadMode.allCases) { mode in Text(mode.title).tag(mode) }
+          }.pickerStyle(.menu)
+          Text(session.modeDescription).font(.caption)
+          Text(String(format: "A/B 共用当前取流 URL · 固定起点 %.3f 秒", comparisonPosition)).font(.caption)
+          HStack {
+            Button("重测当前模式") { restart() }
+            Button("设为当前进度并重测") { restart(at: session.currentTime) }
+          }.font(.caption)
+          Text("切换 A/B 会从同一起点重新验证。起播后计时 10 秒（含缓冲等待），结果保留在下方；暂停或手动拖动会标记未完成的对照。")
+            .font(.caption).foregroundStyle(.secondary)
+        }.frame(maxWidth: .infinity, alignment: .leading)
         Text(session.mediaDescription).font(.caption).foregroundStyle(.secondary)
         Text(session.decoderDescription).font(.subheadline.weight(.medium))
         Toggle("优先硬件解码", isOn: $preferHardware)
@@ -30,9 +48,7 @@ struct FFmpegDecodeValidationView: View {
         if case .failed(let message) = session.state {
           Text(message).font(.callout).foregroundStyle(.red)
           Button("从头验证") {
-            session.stop()
-            copiedDiagnostics = false
-            session.start(source: source, at: 0, preferHardware: preferHardware)
+            restart(at: 0)
           }
         } else {
           HStack {
@@ -62,6 +78,8 @@ struct FFmpegDecodeValidationView: View {
           Text(session.ioDescription)
           Text(session.ioTimingDescription)
           Text(session.ioJumpDescription)
+          Text(session.readStatistics)
+          Text(session.bufferDescription)
           Text(String(format: "压缩视频队列：%.2f 秒（尚未解码）", session.compressedVideoSeconds))
           Text("解码器输出 \(session.decodedVideoFrames) 帧 · 目标前预滚 \(session.prerollFrames) 帧")
           if let warning = session.audioWarning { Text(warning).foregroundStyle(.secondary) }
@@ -75,11 +93,22 @@ struct FFmpegDecodeValidationView: View {
           Text("队列：\(session.packetBytes / 1024) KB 压缩数据 / \(session.frameCount) 待显示帧")
           if let latency = session.firstFrameSeconds { Text(String(format: "首帧入显示队列：%.2f 秒", latency)) }
           if let latency = session.lastSeekSeconds { Text(String(format: "最近定位至首帧入队：%.2f 秒", latency)) }
-          Text("硬解保持原分辨率和像素缓冲，HDR10 / HLG 保留 10 位及色彩标记；软件对照最高 720p，保留 HDR 位深。音频仍仅解码计数。Dolby Vision、字幕、音画同步及画中画尚未接入此入口。")
+          Text("硬解保持原分辨率和像素缓冲，HDR10 / HLG 保留 10 位及色彩标记；软件对照最高 720p，保留 HDR 位深。A 模式音频仅解码计数，B 模式不解码音频。Dolby Vision、字幕、音画同步及画中画尚未接入此入口。")
             .foregroundStyle(.secondary)
         }.font(.caption).frame(maxWidth: .infinity, alignment: .leading)
+        VStack(alignment: .leading, spacing: 12) {
+          Text("A/B 诊断记录").font(.headline)
+          Text("首帧指提交显示层；AVIO、包跳转和读取耗时自会话创建累计至观察点，并非实际 HTTP 请求统计。压缩队列是观察点快照。")
+            .foregroundStyle(.secondary)
+          ForEach(trials) { trial in
+            Text(trial.text).textSelection(.enabled)
+            Divider()
+          }
+          Text("当前记录\n" + session.trial.text).textSelection(.enabled)
+        }.font(.caption).frame(maxWidth: .infinity, alignment: .leading)
         Button(copiedDiagnostics ? "播放诊断已复制" : "复制播放诊断") {
-          UIPasteboard.general.string = session.diagnosticText
+          UIPasteboard.general.string = session.diagnosticText + "\n\nA/B 诊断记录\n"
+            + (trials + [session.trial]).map(\.text).joined(separator: "\n\n")
           copiedDiagnostics = true
         }.font(.caption)
         Spacer(minLength: 0)
@@ -88,20 +117,29 @@ struct FFmpegDecodeValidationView: View {
     }
     .navigationTitle("FFmpeg 解码验证")
     .navigationBarTitleDisplayMode(.inline)
-    .onAppear { session.start(source: source, at: startTime, preferHardware: preferHardware) }
-    .onChange(of: preferHardware) { _, enabled in
-      let position = session.currentTime
-      let wasPlaying = session.wantsPlayback
-      session.stop()
-      session.start(source: source, at: position, preferHardware: enabled)
-      if !wasPlaying { session.toggle() }
+    .onAppear {
+      guard !started else { return }
+      started = true
+      comparisonPosition = startTime.isFinite ? max(0, startTime) : 0
+      session.start(source: source, at: comparisonPosition, preferHardware: preferHardware, mode: readMode)
     }
+    .onChange(of: preferHardware) { _, _ in restart() }
+    .onChange(of: readMode) { _, _ in restart() }
     .onDisappear { session.stop() }
     .onChange(of: session.currentTime) { _, time in if !dragging { slider = time } }
     .onChange(of: scenePhase) { _, phase in
       // No experimental decoder survives backgrounding/privacy lock.
       if phase != .active { session.stop(); dismiss() }
     }
+  }
+
+  private func restart(at position: Double? = nil) {
+    session.stop()
+    trials.append(session.trial)
+    if let position { comparisonPosition = position.isFinite ? max(0, position) : 0 }
+    copiedDiagnostics = false
+    slider = comparisonPosition
+    session.start(source: source, at: comparisonPosition, preferHardware: preferHardware, mode: readMode)
   }
 }
 
