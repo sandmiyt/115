@@ -180,7 +180,13 @@ actor ThumbnailService {
         completion.finish(nil)
         Task { await self.cancelClient(clientID, key: identity.key, workID: work.id) }
       }
-      guard !Task.isCancelled else { return nil }
+      guard !Task.isCancelled else {
+        // A cancelled consumer must acknowledge ownership removal on this actor
+        // before returning. Otherwise resumeNetwork can start its abandoned job
+        // before the cancellation handler's unstructured cleanup task runs.
+        cancelClient(clientID, key: identity.key, workID: work.id)
+        return nil
+      }
       if inFlight[identity.key]?.id == work.id {
         inFlight[identity.key] = nil
         if result == nil, !isPrefetch, !work.task.isCancelled, generation == cacheGeneration {

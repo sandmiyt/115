@@ -471,21 +471,26 @@ final class ArtworkCacheTests: XCTestCase {
   }
 
   func testCancelledQueuedCardDoesNotConsumeNetworkSlot() async throws {
-    let probe = LoadProbe(image: image())
-    let cache = service(probe)
-    let owner = UUID()
-    await cache.suspendNetwork(for: owner)
-    let video = item()
-    let pending = Task { await cache.thumbnail(for: video, api: APIClient()) }
-    try await Task.sleep(nanoseconds: 30_000_000)
-    pending.cancel()
-    let result = await pending.value
-    XCTAssertNil(result)
-    await cache.resumeNetwork(for: owner)
-    let loaded = await cache.thumbnail(for: video, api: APIClient())
-    let calls = await probe.calls
-    XCTAssertNotNil(loaded)
-    XCTAssertEqual(calls, 1)
+    // Stress the cancellation acknowledgment, then open the network gate
+    // immediately. No arbitrary sleep is allowed to hide delayed cleanup.
+    for round in 0..<20 {
+      let probe = LoadProbe(image: image())
+      let cache = service(probe)
+      let owner = UUID()
+      await cache.suspendNetwork(for: owner)
+      let video = item("cancel-round-\(round)")
+      let pending = Task { await cache.thumbnail(for: video, api: APIClient()) }
+      await waitForQueue(cache, visible: 1, prefetch: 0)
+      pending.cancel()
+      let result = await pending.value
+      XCTAssertNil(result)
+      await cache.resumeNetwork(for: owner)
+      let loaded = await cache.thumbnail(for: video, api: APIClient())
+      let calls = await probe.calls
+      XCTAssertNotNil(loaded)
+      XCTAssertEqual(calls, 1, "round=\(round)")
+      await cache.flushPersistence()
+    }
   }
 
   func testClearPreventsInFlightWorkFromRepopulatingDisk() async {
