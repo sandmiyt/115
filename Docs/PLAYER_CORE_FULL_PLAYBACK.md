@@ -1,9 +1,30 @@
 # Cineva full FFmpeg playback — implementation and acceptance record
 
 Baseline: 2.2.9 (49), commit adfb52b. Build 50 introduces a selectable normal
-FFmpeg backend. Build 51 adds subtitle decoding/rendering; build 52 completes SUP sidecars, encoding selection, SDR mapping and further lifecycle handling. Existing AVPlayer and
+FFmpeg backend. Build 51 adds subtitle decoding/rendering; build 52 completes SUP sidecars, encoding selection, SDR mapping and further lifecycle handling. Build 53 corrects audio routing, background work and unknown-duration packet runway accounting. Existing AVPlayer and
 VLC remain available; login, file browsing and library data contracts are unchanged.
 This is not a claim that every PlayerCore requirement or device test is complete.
+
+## Changed-file map
+
+Paths below are relative to the shipping repository, not the untracked historical
+`115/` directory. The full change list is reproducible with
+`git diff --name-only adfb52b 5bd94c9`.
+
+| Files | Responsibility |
+|---|---|
+| `Gallery115/PlayerCore/FFmpegPlayerEngine.swift`, `PlayerTypes.swift` | Formal engine, joint A/V state, tracks, diagnostic trials and SDR conversion |
+| `Gallery115/PlayerCore/RangeCoordinator.swift`, `FFmpegIOBridge.swift` | Real HTTP Range, bounded caches and C callback lifetime |
+| `Dependencies/FFmpeg/Bridge/CinevaFFmpegSession.c`, `CinevaFFmpeg.h` | Demux, independent video/audio workers, PCM, queues, seek generation and exported API |
+| `Gallery115/PlayerCore/NativeAudioRenderer.swift`, `NativeVideoRenderer.swift` | Audio output/master clock and native video scheduling |
+| `Dependencies/FFmpeg/Bridge/CinevaSubtitles.c`, `CinevaSubtitles.h` | Separate subtitle decode and styled/bitmap rendering |
+| `Gallery115/PlayerCore/FFmpegPiPController.swift`, `Gallery115/Player/FFmpegPlayerSurface.swift` | System sample-buffer PiP and existing-screen video/subtitle surface |
+| `Gallery115/Views/PlayerScreen.swift`, `Gallery115/Player/PlayerModel.swift` | Normal entrance, single active backend, state-preserving fallback and controls |
+| `Gallery115/Player/FFmpegDecodeValidationView.swift`, `Gallery115/PlayerCore/FFmpegDecodeSession.swift`, `DiagnosticBufferPolicy.swift` | Preserved video-only comparison and full-path diagnostics |
+| `Gallery115/Services/WebDAVProvider.swift` | SUP sidecar discovery; playback request method unchanged |
+| `Dependencies/FFmpeg/build-apple.sh`, `Dependencies/Subtitles/build-apple.sh`, `Gallery115.xcodeproj/project.pbxproj`, `.gitignore` | Pinned native dependencies, license/source bundle, target membership and generated-file exclusion |
+| `Tests/PlayerTransport/RangeChecks.swift`, `range_server.py`, `.github/workflows/build-unsigned-ipa.yml` | Controlled HTTP assertions in the existing IPA job |
+| This document and `Docs/PLAYER_CORE_VIDEO_ONLY_AB.md` | Implementation, evidence and explicit device acceptance limits |
 
 ## Actual playback path
 
@@ -127,10 +148,10 @@ and is not included by the ordinary overlay. Existing
 | Feature | Implementation | Runtime evidence |
 |---|---|---|
 | Original-file FFmpeg playback with audio | Real Swr/PCM/AVAudioEngine, normal screen | Device acceptance pending |
-| Cached HTTP seek | Custom AVIO actually connected | Controlled HTTP checks passed for build 50 |
+| Cached HTTP seek | Custom AVIO actually connected | Controlled HTTP checks passed for build 53 |
 | 0.5–2x pitch-preserving speed | TimePitch + clock/rate handling | Device pitch/sync checks pending |
 | Multi-audio selection | Decoder switch + coordinated seek + failure restore | Device multi-track checks pending |
-| Internal SRT/WebVTT/ASS/SSA/PGS | Separate worker + libass/bitmap rendering | Build 51 device checks pending |
+| Internal SRT/WebVTT/ASS/SSA/PGS | Separate worker + libass/bitmap rendering | Build 53 compiled; device checks pending |
 | External text subtitles | Raw text decode + styled renderer | Styling/encoding checks pending |
 | External PGS/SUP | Bounded 8 MiB input, separate worker, five-second lookahead | Device palette/timing/seek validation pending |
 | HDR10/HLG | 10-bit native buffers + color metadata + EDR request | Actual display output unverified |
@@ -180,7 +201,18 @@ The integrity assertion count varies when CFNetwork delivers a prefix before a
 truncated response; both verified-prefix and bounded-error outcomes are checked.
 Build 53 includes lazy font discovery, audio-session category correction, explicit
 background-audio video suppression and a verified 64-bit/416 boundary test.
-Final status must be recorded for its exact revision.
+Final build 53, code revision **5bd94c9a5689098a24b32d07d3b4c56620ccbd43**, passed
+on 2026-09-27: **19 buffer-policy checks, 41 transport/integrity checks, Apple native
+dependency compilation, iPhone Release compilation and unsigned IPA packaging**.
+Run: https://github.com/sandmiyt/115/actions/runs/36298874358
+Artifact: https://github.com/sandmiyt/115/actions/runs/36298874358/artifacts/10924664381
+The artifact is `Gallery115-unsigned-ipa`, 59,428,864 bytes (outer ZIP).
+Both Debug and Release source settings identify Cineva 2.2.9 (53).
+Windows preflight reports zero failures; `git diff --check` passes.
+There are compiler warnings, including existing deprecations and Swift 6 strict
+concurrency migration warnings around PiP delegates / pixel-buffer transfer.
+The current project compiles in its configured language mode; a Swift 6 migration
+is not claimed here. These checks do not supply device playback or HDR evidence.
 
 ## Same-file device acceptance still required
 
