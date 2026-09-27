@@ -74,8 +74,20 @@ iPhone Release xcodebuild. Added cases include one/two 500s then 206; perpetual
 while another gap recovers; ETag change after a retry. Original short/nonaligned
 206, identity, body integrity, timeout, refresh and credential isolation remain.
 
-Final exact build/test result is recorded after CI completes. Local HTTP fixtures
-are synthetic byte patterns, not private 115 media or an audio playback test.
+Final tested code: `d55b74330728959a611df770a7d6162f322b446d`, build **2.2.9 (55)**.
+On 2026-09-27 the existing macOS job passed **19 buffer-policy assertions,
+1034 transport/byte-integrity assertions, iPhone Release compilation and IPA
+packaging**. This includes two readers coalescing onto exactly one retry.
+
+- Run: https://github.com/sandmiyt/115/actions/runs/36310413255
+- IPA: https://github.com/sandmiyt/115/actions/runs/36310413255/artifacts/10928762427
+- Outer artifact ZIP: 59,463,624 bytes, `Gallery115-unsigned-ipa`.
+
+The assertion count includes per-delivery byte checks and varies with network
+chunk delivery; it is not a count of independent scenarios. Existing compiler
+warnings remain. A later documentation-only commit does not alter this built code.
+Local HTTP fixtures are synthetic byte patterns, not private 115 media or an
+audio playback test.
 
 ## Device acceptance remains unmeasured
 
