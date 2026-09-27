@@ -557,7 +557,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
         + String(format:"A/V偏差估算 %.3f s · A连续 %.2f / V连续 %.2f s · 恢复 %.2f s\n",renderer.time-audio.audibleTime,max(0,audioEnd-currentTime),max(0,videoEnd-currentTime),resumeTarget)
         + "音频欠载 \(audioUnderruns) · rebuffer \(rebufferCount) · AAC/其他音轨 → Swr → Float32 48kHz stereo PCM（非 Atmos）\n"
         + "AVIO bytes \(snapshot.ioBytesRead) · packet jumps \(snapshot.backwardPacketJumps)/\(snapshot.largeForwardPacketJumps)（不是 HTTP 请求）\n"
-        + (io.map { "HTTP requests \($0.requests) · 200/206/416 \($0.responses200)/\($0.responses206)/\($0.responses416) · 网络 bytes \($0.networkBytes)\n内存命中字节 \($0.memoryHitBytes) · 磁盘命中字节 \($0.diskHitBytes) · miss \($0.misses) · refresh \($0.refreshes)\n\($0.lastError ?? "")" } ?? "HTTP 请求数不可获得")
+        + (io.map { "HTTP requests \($0.requests) · 200/206/416 \($0.responses200)/\($0.responses206)/\($0.responses416) · 网络 bytes \($0.networkBytes)\n内存命中字节 \($0.memoryHitBytes) · 磁盘命中字节 \($0.diskHitBytes) · miss \($0.misses) · refresh \($0.refreshes)\n\($0.lastError ?? "")\n\($0.recoveryText)" } ?? "HTTP 请求数不可获得")
       saveProgress()
     }
   }

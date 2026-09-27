@@ -2,11 +2,15 @@
 import argparse
 import socket
 import time
+import threading
+from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 SIZE = 3 * 1048576 + 97
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
+    attempts = {}
+    attempts_lock = threading.Lock()
     def handle_error(self, *args):
         import traceback
         traceback.print_exc()  # Fixture-only failures, no private media/credentials.
@@ -28,6 +32,31 @@ class Handler(BaseHTTPRequestHandler):
         first, last = self.headers.get("Range", "bytes=0-").removeprefix("bytes=").split("-")
         start = int(first); total = 131072 if path == "/small200" else SIZE
         end = min(int(last) if last else total - 1, total - 1)
+        if path.startswith("/retry-"):
+            key = (self.path, start)
+            with self.server.attempts_lock:
+                attempt = self.server.attempts.get(key, 0) + 1
+                self.server.attempts[key] = attempt
+            transient = {"/retry-once": (500, 1), "/retry-twice": (500, 2),
+                         "/retry-forever": (500, 99), "/retry-502": (502, 1),
+                         "/retry-504": (504, 1), "/retry-503": (503, 1),
+                         "/retry-429": (429, 1), "/retry-date": (503, 1),
+                         "/retry-huge": (429, 99), "/retry-stop": (503, 99),
+                         "/retry-cache": (500, 1), "/retry-version": (500, 1),
+                         "/retry-404": (404, 99)}
+            code, failures = transient.get(path, (500, 0))
+            if path == "/retry-auth-cap": code, failures = (500 if attempt <= 2 else 403), 99
+            eligible = path not in ("/retry-cache", "/retry-version", "/retry-stop") or start >= 1048576
+            if eligible and attempt <= failures:
+                self.send_response(code)
+                if path == "/retry-date": self.send_header("Retry-After", formatdate(time.time()+2, usegmt=True))
+                elif path == "/retry-huge": self.send_header("Retry-After", "999999999999999999999999999")
+                elif path in ("/retry-503", "/retry-429", "/retry-stop", "/retry-cache"): self.send_header("Retry-After", "1")
+                body = b"THIS IS AN ERROR PAGE, NOT MEDIA"
+                self.send_header("Content-Length", str(len(body))); self.end_headers()
+                try: self.wfile.write(body); self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError): pass
+                return
         if path == "/416" or start >= total:
             self.send_response(416); self.send_header("Content-Range", f"bytes */{total}")
             self.send_header("Content-Length", "0"); self.end_headers(); return
@@ -49,7 +78,7 @@ class Handler(BaseHTTPRequestHandler):
             declared = start + 1 if path == "/wrongrange" else start
             self.send_header("Content-Range", f"bytes {declared}-{end}/{total}")
         if path != "/novalidator" and not (path == "/missingetag" and start >= 1048576):
-            changed = path == "/v2" or (path == "/changed" and start >= 1048576) or (path == "/shortchange" and start >= 10000)
+            changed = path == "/v2" or (path == "/retry-version" and start >= 1048576) or (path == "/changed" and start >= 1048576) or (path == "/shortchange" and start >= 10000)
             self.send_header("ETag", '"v2"' if changed else '"v1"')
         self.end_headers()
         for pos in range(start, end + 1, 16384):

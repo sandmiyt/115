@@ -1,5 +1,22 @@
 import Foundation
 
+private final class PendingRangeRead: @unchecked Sendable {
+  let done=DispatchSemaphore(value:0)
+  private let lock=NSLock()
+  private var value:Int32?
+  private var integrity=true
+  var result:Int32? { lock.lock(); defer { lock.unlock() }; return value }
+  var validBytes:Bool { lock.lock(); defer { lock.unlock() }; return integrity }
+  func start(_ client:RangeCoordinator,at offset:Int64,generation:Int32 = 1) {
+    DispatchQueue.global().async {
+      var bytes=[UInt8](repeating:0,count:4096)
+      let n=client.read(offset:offset,buffer:&bytes,count:4096,generation:generation)
+      let valid=n<=0 || (0..<Int(n)).allSatisfy { bytes[$0]==UInt8((offset+Int64($0))%251) }
+      self.lock.lock(); self.value=n; self.integrity=valid; self.lock.unlock(); self.done.signal()
+    }
+  }
+}
+
 @main struct RangeChecks {
   static func main() throws {
     let base=CommandLine.arguments[1]
@@ -22,6 +39,73 @@ import Foundation
       if n>0 { expect((0..<Int(n)).allSatisfy { bytes[$0]==UInt8((offset+Int64($0))%251) },"Byte integrity at \(offset)") }
       return n
     }
+    for (path,requests) in [("/retry-once",2),("/retry-twice",3),("/retry-502",2),("/retry-504",2)] {
+      let c=client(path)
+      expect(read(c,12345)>0,"Transient status must recover inside custom AVIO")
+      expect(c.statistics.requests==requests,"Includes first request in three-attempt bound")
+      expect(c.statistics.recovery?.outcome=="recovered" && c.statistics.recovery?.attempts.last?.status==206,"Recovered trace records successful attempt")
+      expect(c.statistics.lastIssue==nil && c.statistics.terminalFailure==nil,"Recovered HTTP error is not current or terminal")
+      expect(c.statistics.recovery?.attempts.allSatisfy { $0.offset==12345 } == true,"Retries use exact missing offset")
+      c.close()
+    }
+    let authCap=client("/retry-auth-cap",refresh:{ source("/ok") })
+    expect(read(authCap,12345)<0 && authCap.statistics.requests==3,"Authentication refresh cannot bypass total attempt cap")
+    expect(authCap.statistics.refreshes==0 && authCap.statistics.recovery?.attempts.map(\.status)==[500,500,403],"Mixed failure attempts share the cap")
+    authCap.close()
+    let forever=client("/retry-forever"), began=Date()
+    expect(read(forever,9876)<0,"Persistent 500 exhausts")
+    expect(forever.statistics.requests==3 && forever.statistics.recovery?.outcome=="exhausted","Exactly three attempts before terminal failure")
+    expect(forever.statistics.terminalFailure?.kind == .serverError,"500 is status failure, not malformed response")
+    expect(forever.statistics.recovery?.attempts.map(\.status)==[500,500,500],"All exhausted status codes retained")
+    expect(forever.statistics.memoryBytes==0 && Date().timeIntervalSince(began)<9.5,"Error body never cached; total budget bounded")
+    let frozen=forever.statistics.text; forever.close()
+    expect(forever.statistics.text==frozen,"Exhaustion evidence survives close")
+    for path in ["/retry-503","/retry-429","/retry-date"] {
+      let c=client(path)
+      expect(read(c,7654)>0,"Retry-After recovers without returning premature negative")
+      let attempt=c.statistics.recovery!.attempts[0]
+      expect(attempt.actualWait+0.03>=attempt.plannedWait && attempt.plannedWait>=0.25,"Server delay honored")
+      if path != "/retry-date" { expect(attempt.plannedWait>=1,"Delta-seconds Retry-After") }
+      expect(c.statistics.requests==2,"Retry-After has bounded requests"); c.close()
+    }
+    let huge=client("/retry-huge"), hugeStart=Date()
+    expect(read(huge,0)<0 && huge.statistics.requests==1,"Unfit Retry-After cannot be shortened into immediate retry")
+    expect(Date().timeIntervalSince(hugeStart)<1 && huge.statistics.recovery?.reason=="retry-after-exceeds-budget","Huge delay does not expand budget")
+    huge.close()
+    let notFound=client("/retry-404")
+    expect(read(notFound,0)<0 && notFound.statistics.requests==1,"404 does not retry")
+    expect(notFound.statistics.terminalFailure?.kind == .httpStatus,"Non-media HTTP status is not malformed 206"); notFound.close()
+    let epochDate=Date(timeIntervalSince1970:0)
+    expect(RangeCoordinator.retryAfter("Thu, 01 Jan 1970 00:00:02 GMT",now:epochDate)==2,"HTTP-date parsed")
+    expect(RangeCoordinator.retryAfter("-1")==nil && RangeCoordinator.retryAfter("garbage")==nil,"Invalid delay uses bounded fallback")
+    for stopping in [false,true] {
+      let c=client("/retry-stop?case="+UUID().uuidString), pending=PendingRangeRead()
+      pending.start(c,at:2*1048576)
+      for _ in 0..<300 where (c.statistics.recovery?.attempts.first?.plannedWait ?? 0)==0 { Thread.sleep(forTimeInterval:0.01) }
+      expect(c.statistics.terminalFailure==nil && c.statistics.requests==1,"Backoff attempt is not terminal")
+      let cancelledAt=Date()
+      if stopping { c.close() } else { c.changeGeneration(2) }
+      expect(pending.done.wait(timeout:.now()+1) == .success && pending.result == -3,"Stop/seek interrupts backoff promptly")
+      expect(Date().timeIntervalSince(cancelledAt)<1 && c.statistics.recovery?.outcome=="cancelled","Cancellation recorded separately from exhaustion")
+      expect(c.statistics.requests==1 && c.statistics.terminalFailure==nil,"No old-generation retry or terminal snapshot")
+      if !stopping { expect(read(c,0,4096,2)>0,"New generation proceeds immediately") }
+      c.close()
+    }
+    let cacheRecovery=client("/retry-cache"), cachePending=PendingRangeRead()
+    expect(read(cacheRecovery,0)>0,"Seed validated cache")
+    for _ in 0..<200 where cacheRecovery.statistics.memoryBytes<1048576 { Thread.sleep(forTimeInterval:0.01) }
+    cachePending.start(cacheRecovery,at:2*1048576)
+    for _ in 0..<200 where (cacheRecovery.statistics.recovery?.attempts.first?.plannedWait ?? 0)==0 { Thread.sleep(forTimeInterval:0.01) }
+    expect(cacheRecovery.statistics.terminalFailure==nil,"500 leaves cache readable while recovering")
+    expect(read(cacheRecovery,50000)>0 && cacheRecovery.statistics.memoryHitBytes>0,"Verified cache remains usable during backoff")
+    expect(cachePending.done.wait(timeout:.now()+3) == .success && (cachePending.result ?? -1)>0 && cachePending.validBytes,"Uncached gap recovers independently")
+    expect(cacheRecovery.statistics.lastIssue==nil && cacheRecovery.statistics.recovery?.outcome=="recovered","Recovery clears stale 500 issue")
+    cacheRecovery.close()
+    let retryChanged=client("/retry-version")
+    expect(read(retryChanged,0)>0,"Pin version before retry")
+    expect(read(retryChanged,2*1048576)==(-4),"206 after retry still must match version")
+    expect(retryChanged.statistics.terminalFailure?.kind == .resourceChanged && retryChanged.statistics.recovery?.outcome=="rejected","Version conflict is not recovered")
+    retryChanged.close()
     let cold=client("/ok",id:"warm")
     expect(read(cold,0)>0,"206 startup")
     expect(read(cold,1040000,8576)>0,"First transfer tail")

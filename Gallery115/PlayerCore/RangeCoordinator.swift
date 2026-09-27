@@ -16,6 +16,7 @@ struct RangeCacheIdentity: Sendable {
 enum RangeFailureKind: String, Sendable {
   case cancelled, timeout, authentication, unsupportedBackend, malformedResponse
   case metadataConflict, resourceChanged, network, redirectPolicy
+  case serverError, rateLimited, httpStatus
 }
 
 /// Only allowlisted numeric/protocol facts cross the diagnostic boundary.
@@ -40,6 +41,26 @@ struct RangeFailureEvidence: Sendable {
   }
 }
 
+struct RangeAttempt: Sendable {
+  let number: Int
+  let offset: Int64
+  var status = 0
+  var plannedWait = 0.0
+  var actualWait = 0.0
+  var retryAfter: Double?
+}
+struct RangeRecoveryReport: Sendable {
+  let generation: Int32
+  let outcome: String
+  let elapsed: Double
+  let reason: String
+  let attempts: [RangeAttempt]
+  var text: String {
+    "HTTP recovery=\(outcome) · generation=\(generation) · attempts=\(attempts.count)/3 · elapsed=\(String(format: "%.3f",elapsed)) s · reason=\(reason)\n"
+    + attempts.map { "#\($0.number) status=\($0.status) offset=\($0.offset) Retry-After=\($0.retryAfter.map { String(format:"%.3f",$0) } ?? "none") wait=\(String(format:"%.3f/%.3f",$0.actualWait,$0.plannedWait)) s" }.joined(separator:"; ")
+  }
+}
+
 struct RangeStatistics: Sendable {
   var requests = 0, responses200 = 0, responses206 = 0, responses416 = 0
   var networkBytes: Int64 = 0, memoryHitBytes: Int64 = 0, diskHitBytes: Int64 = 0
@@ -53,8 +74,11 @@ struct RangeStatistics: Sendable {
   var lastReadResult: Int32 = 0
   var hintedLength: Int64 = -1, verifiedLength: Int64 = -1
   var clues: [String] = []
+  var recovery: RangeRecoveryReport?
+  var recovered = 0, exhausted = 0, recoveryCancelled = 0
+  var recoveryText: String { recovery?.text ?? "HTTP recovery: none" }
   var text: String {
-    (terminalFailure ?? lastIssue)?.text ?? "transport: no failure captured"
+    ((terminalFailure ?? lastIssue)?.text ?? "transport: no current failure") + "\n" + recoveryText
   }
 }
 
@@ -130,6 +154,15 @@ final class SegmentDiskCache: @unchecked Sendable {
 /// not a minimum download prerequisite for the first frame.
 final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Sendable {
   typealias Refresh = @Sendable () async throws -> VideoSource
+  private final class Recovery {
+    let id=UUID(), started=ProcessInfo.processInfo.systemUptime
+    let generation:Int32
+    var attempts:[RangeAttempt]=[]
+    var hadFailure=false
+    var outcome="recovering"
+    var reason="none"
+    init(generation:Int32) { self.generation=generation }
+  }
   private final class Flight {
     let start: Int64, end: Int64, generation: Int32
     var data = Data()
@@ -145,8 +178,14 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     var observedLength: Int64 = -1, declaredBytes: Int64 = -1
     var uaPreserved = true
     var issue: RangeFailureEvidence?
-    init(start: Int64, end: Int64, generation: Int32) {
+    let recovery: Recovery
+    let attemptIndex: Int
+    var retryAfter: Double?
+    init(start: Int64, end: Int64, generation: Int32, recovery: Recovery? = nil) {
       self.start=start; self.end=end; self.generation=generation; consumedThrough=start
+      self.recovery=recovery ?? Recovery(generation:generation)
+      attemptIndex=self.recovery.attempts.count
+      self.recovery.attempts.append(RangeAttempt(number:attemptIndex+1,offset:start))
     }
   }
   private struct Page {
@@ -185,6 +224,8 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
   private var order:[Int64]=[]
   private var stats=RangeStatistics()
   private var session:URLSession!
+  private var issueOwner:UUID?
+  private var refreshTask:Task<Void,Never>?
   // A new schema prevents reuse of v53 pages whose HTTP representation was not checked.
   private var diskKey:String? {
     guard cacheEnabled, length>0, !identity.validator.isEmpty, let responseValidator else { return nil }
@@ -210,6 +251,12 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     condition.lock(); generation=value
     if value<0 { closed=true }
     let tasks=flights.values.compactMap(\.task); stats.cancelled+=tasks.count
+    for f in flights.values where f.recovery.hadFailure && f.recovery.outcome=="recovering" {
+      publishRecovery(f.recovery,outcome:"cancelled")
+    }
+    if stats.terminalFailure==nil { stats.lastIssue=nil; stats.lastError=nil; issueOwner=nil }
+    refreshTask?.cancel(); refreshTask=nil
+    if refreshing { refreshing=false; refreshed=false }
     if stats.terminalFailure != nil, stats.clues.count<4 { stats.clues.append("subsequent cancellation generation=\(value)") }
     flights.removeAll(); condition.broadcast(); condition.unlock()
     tasks.forEach { $0.cancel() }; if value<0 { session.invalidateAndCancel() }
@@ -224,13 +271,32 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
       verifiedLength:length,observedLength:f.observedLength,redirects:f.redirects,
       applicationUAPreserved:f.uaPreserved,networkDomain:domain,networkCode:native?.code ?? 0)
     if stats.terminalFailure != nil, stats.clues.count<4 { stats.clues.append("subsequent transport=\(kind.rawValue)") }
-    f.issue=evidence; stats.lastIssue=evidence; stats.lastError=kind.rawValue
+    f.issue=evidence; stats.lastIssue=evidence; stats.lastError=kind.rawValue; issueOwner=f.recovery.id
     if [.malformedResponse,.metadataConflict,.resourceChanged,.unsupportedBackend,.redirectPolicy].contains(kind) {
       if stats.terminalFailure==nil { stats.terminalFailure=evidence }
       if fatalError==nil { fatalError=code }
+      f.recovery.reason=kind.rawValue; publishRecovery(f.recovery,outcome:"rejected")
     }
   }
+  private func publishRecovery(_ recovery:Recovery,outcome:String? = nil) {
+    guard recovery.hadFailure else { return }
+    if let outcome, recovery.outcome=="recovering" {
+      recovery.outcome=outcome
+      if outcome=="recovered" { stats.recovered+=1 }
+      if outcome=="exhausted" { stats.exhausted+=1 }
+      if outcome=="cancelled" { stats.recoveryCancelled+=1 }
+    }
+    stats.recovery=RangeRecoveryReport(generation:recovery.generation,outcome:recovery.outcome,
+      elapsed:ProcessInfo.processInfo.systemUptime-recovery.started,reason:recovery.reason,attempts:recovery.attempts)
+  }
+  private func recovered(_ f:Flight) {
+    guard f.recovery.hadFailure, f.recovery.outcome=="recovering" else { return }
+    publishRecovery(f.recovery,outcome:"recovered")
+    if stats.terminalFailure==nil, issueOwner==f.recovery.id { stats.lastIssue=nil; stats.lastError=nil; issueOwner=nil }
+  }
   private func terminate(_ f:Flight) -> Int32 {
+    publishRecovery(f.recovery,outcome:"exhausted")
+    f.finished=true; f.task?.cancel()
     if stats.terminalFailure==nil { stats.terminalFailure=f.issue }
     // Resource/protocol failures invalidate this session; never serve its stale pages afterwards.
     if fatalError==nil { fatalError=f.error == 0 ? -1 : f.error }
@@ -243,11 +309,18 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     stats.lastReadOffset=offset; stats.lastReadCount=count
     defer { stats.lastReadResult=result; condition.unlock() }
     guard offset>=0, count>0 else { return result }
-    let base=offset/page*page, deadline=Date().addingTimeInterval(9)
-    var attempts=0, observed=Set<Int>(), checkedDisk=false
+    let base=offset/page*page, deadline=ProcessInfo.processInfo.systemUptime+9
+    var observed=Set<Int>(), checkedDisk=false
+    var continuation:Recovery?
     while true {
-      if closed || wanted != generation { result = -3; return result }
-      if let fatalError { result=fatalError; return result }
+      if closed || wanted != generation {
+        if let continuation { publishRecovery(continuation,outcome:"cancelled") }
+        result = -3; return result
+      }
+      if let fatalError {
+        if let continuation { publishRecovery(continuation,outcome:"exhausted") }
+        result=fatalError; return result
+      }
       if length>=0, offset>=length { result=0; return result }
       if cacheEnabled, let cached=memory[base], cached.available(at:Int(offset-base))>0 {
         let start=Int(offset-base), n=min(count,cached.available(at:start))
@@ -267,8 +340,11 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
           result=Int32(n); return result
         }
       }
-      if Date()>=deadline {
-        let f=flights.values.first(where: { $0.start<=offset && offset<=$0.end }) ?? Flight(start:offset,end:offset,generation:wanted)
+      let active=flights.values.first(where: { $0.start<=offset && offset<=$0.end })
+      let budget=active.map { $0.recovery.hadFailure && $0.recovery.outcome=="recovering" ? min(deadline,$0.recovery.started+9) : deadline } ?? continuation.map { min(deadline,$0.started+9) } ?? deadline
+      if ProcessInfo.processInfo.systemUptime>=budget {
+        let f=active ?? Flight(start:offset,end:offset,generation:wanted)
+        f.recovery.reason="total-budget"
         issue(.timeout,flight:f,code:-2); result=terminate(f); return result
       }
       if let f=flights.values.first(where: { $0.start<=offset && offset<=$0.end }) {
@@ -278,23 +354,48 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
         if let id=f.task?.taskIdentifier, observed.insert(id).inserted { stats.coalesced+=1 }
         // Errors win over buffered prefixes after a failed response has completed.
         if f.finished, f.error != 0 {
-          if let id=f.task?.taskIdentifier { flights.removeValue(forKey:id) }
           if f.error == -5, !refreshed, let refresh {
+            f.recovery.hadFailure=true
+            if f.recovery.attempts.count>=3 { f.recovery.reason="attempt-limit"; result=terminate(f); return result }
+            continuation=f.recovery; publishRecovery(f.recovery)
+            if let id=f.task?.taskIdentifier { flights.removeValue(forKey:id) }
             refreshed=true; refreshing=true; stats.refreshes+=1
-            Task.detached { [weak self] in
-              do { self?.didRefresh(try await refresh()) } catch { self?.didRefresh(nil) }
+            refreshTask=Task.detached { [weak self] in
+              do { self?.didRefresh(try await refresh(),generation:wanted) }
+              catch { self?.didRefresh(nil,generation:wanted) }
             }
-          } else {
-            attempts+=1
-            if attempts>=2 || ![-1,-2].contains(f.error) { result=terminate(f); return result }
-          }
+          } else if [-1,-2,-10,-11].contains(f.error) {
+            let cycle=f.recovery
+            cycle.hadFailure=true; publishRecovery(cycle)
+            let budget=min(deadline,cycle.started+9)
+            let backoff=f.error == -11 ? Double(cycle.attempts.count) : 0.25*pow(2,Double(cycle.attempts.count-1))
+            let delay=max(backoff,f.retryAfter ?? 0)
+            if cycle.attempts.count>=3 || ProcessInfo.processInfo.systemUptime+delay>=budget {
+              cycle.reason=cycle.attempts.count>=3 ? "attempt-limit" : "retry-after-exceeds-budget"
+              result=terminate(f); return result
+            }
+            cycle.attempts[f.attemptIndex].plannedWait=delay
+            let waitStart=ProcessInfo.processInfo.systemUptime, until=waitStart+delay
+            publishRecovery(cycle)
+            while !closed && wanted==generation && fatalError==nil && ProcessInfo.processInfo.systemUptime<until {
+              _=condition.wait(until:Date(timeIntervalSinceNow:min(0.1,until-ProcessInfo.processInfo.systemUptime)))
+              cycle.attempts[f.attemptIndex].actualWait=ProcessInfo.processInfo.systemUptime-waitStart
+            }
+            cycle.attempts[f.attemptIndex].actualWait=ProcessInfo.processInfo.systemUptime-waitStart
+            publishRecovery(cycle)
+            if closed || wanted != generation { publishRecovery(cycle,outcome:"cancelled"); result = -3; return result }
+            if let fatalError { result=fatalError; return result }
+            if ProcessInfo.processInfo.systemUptime>=budget { result=terminate(f); return result }
+            if let id=f.task?.taskIdentifier { flights.removeValue(forKey:id) }
+            observed.insert(startFlight(at:offset,generation:wanted,recovery:cycle))
+          } else { result=terminate(f); return result }
           continue
         }
         let start=Int(offset-f.start)
         if f.accepted, start<f.data.count {
           let n=min(count,f.data.count-start)
           f.data.copyBytes(to:buffer,from:start..<(start+n)); f.consumedThrough=offset+Int64(n)
-          result=Int32(n); return result
+          recovered(f); result=Int32(n); return result
         }
         if f.finished {
           // A valid short prefix is complete, not a failed whole-window transfer.
@@ -303,9 +404,11 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
         }
       } else if !refreshing {
         if flights.count>=2, let old=flights.values.first(where:{ $0.finished }), let id=old.task?.taskIdentifier { flights.removeValue(forKey:id) }
-        if flights.count<2 { observed.insert(startFlight(at:offset,generation:wanted)) }
+        if flights.count<2 {
+          observed.insert(startFlight(at:offset,generation:wanted,recovery:continuation)); continuation=nil
+        }
       }
-      _=condition.wait(until:min(deadline,Date().addingTimeInterval(0.1)))
+      _=condition.wait(until:Date(timeIntervalSinceNow:max(0,min(0.1,budget-ProcessInfo.processInfo.systemUptime))))
     }
   }
   @discardableResult private func storeVerified(_ data:Data,at start:Int64) -> [(Int64,Data)] {
@@ -329,11 +432,12 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     }
     return complete
   }
-  private func startFlight(at start:Int64,generation:Int32) -> Int {
+  private func startFlight(at start:Int64,generation:Int32,recovery:Recovery? = nil) -> Int {
     let span=cacheEnabled ? window : page
     let end=min(start+min(span-1,Int64.max-start),length>0 ? length-1 : Int64.max)
-    let f=Flight(start:start,end:end,generation:generation)
+    let f=Flight(start:start,end:end,generation:generation,recovery:recovery)
     var request=URLRequest(url:source.url)
+    if let recovery { request.timeoutInterval=max(0.01,min(5,recovery.started+9-ProcessInfo.processInfo.systemUptime)) }
     for (key,value) in source.headers { request.setValue(value,forHTTPHeaderField:key) }
     request.setValue("bytes=\(start)-\(end)",forHTTPHeaderField:"Range")
     request.setValue("identity",forHTTPHeaderField:"Accept-Encoding")
@@ -341,9 +445,10 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     let task=session.dataTask(with:request); f.task=task; flights[task.taskIdentifier]=f
     stats.requests+=1; stats.misses+=1; task.resume(); return task.taskIdentifier
   }
-  private func didRefresh(_ value:VideoSource?) {
+  private func didRefresh(_ value:VideoSource?,generation wanted:Int32) {
     condition.lock(); defer { condition.broadcast(); condition.unlock() }
-    refreshing=false
+    guard !closed, generation==wanted, refreshing else { return }
+    refreshing=false; refreshTask=nil
     if let value, value.isOriginal==source.isOriginal { source=value }
     else {
       // Preserve the original 401/403 facts if refreshing the signed URL fails.
@@ -368,6 +473,9 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     condition.lock()
     guard let f=flights[dataTask.taskIdentifier],let http=response as? HTTPURLResponse else { condition.unlock(); completionHandler(.cancel); return }
     f.status=http.statusCode; f.declaredBytes=http.expectedContentLength
+    f.recovery.attempts[f.attemptIndex].status=http.statusCode
+    f.retryAfter=Self.retryAfter(http.value(forHTTPHeaderField:"Retry-After"))
+    f.recovery.attempts[f.attemptIndex].retryAfter=f.retryAfter
     switch http.statusCode { case 200:stats.responses200+=1; case 206:stats.responses206+=1; case 416:stats.responses416+=1; default:break }
     let validator=http.value(forHTTPHeaderField:"ETag").flatMap { $0.hasPrefix("\"") && $0.hasSuffix("\"") ? $0 : nil }
     let identityEncoding=http.value(forHTTPHeaderField:"Content-Encoding").map { $0.lowercased()=="identity" } ?? true
@@ -397,10 +505,31 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
       }
     }
     if !valid {
-      if f.issue==nil { issue([401,403].contains(http.statusCode) ? .authentication : .malformedResponse,flight:f,code:[401,403].contains(http.statusCode) ? -5 : -6) }
+      if f.issue==nil {
+        if [500,502,503,504].contains(http.statusCode) {
+          issue(.serverError,flight:f,code:-10); f.recovery.hadFailure=true; publishRecovery(f.recovery)
+        } else if http.statusCode==429 {
+          issue(.rateLimited,flight:f,code:-11); f.recovery.hadFailure=true; publishRecovery(f.recovery)
+        } else if [401,403].contains(http.statusCode) { issue(.authentication,flight:f,code:-5) }
+        else if [200,206,416].contains(http.statusCode) { issue(.malformedResponse,flight:f,code:-6) }
+        else { issue(.httpStatus,flight:f,code:-12) }
+      }
       f.finished=true
     }
     f.accepted=valid; condition.broadcast(); condition.unlock(); completionHandler(valid ? .allow : .cancel)
+  }
+  /// RFC 9110 delay-seconds or HTTP-date. Never shorten a valid server delay;
+  /// if it cannot fit the unchanged budget, the caller exhausts without retrying.
+  static func retryAfter(_ value:String?, now:Date = Date()) -> Double? {
+    guard let value=value?.trimmingCharacters(in:.whitespacesAndNewlines), !value.isEmpty else { return nil }
+    if value.utf8.allSatisfy({ $0>=48 && $0<=57 }) { return min(Double(value) ?? .greatestFiniteMagnitude,Double.greatestFiniteMagnitude) }
+    let formatter=DateFormatter(); formatter.locale=Locale(identifier:"en_US_POSIX")
+    formatter.timeZone=TimeZone(secondsFromGMT:0); formatter.isLenient=false
+    for format in ["EEE, dd MMM yyyy HH:mm:ss 'GMT'","EEEE, dd-MMM-yy HH:mm:ss 'GMT'","EEE MMM d HH:mm:ss yyyy"] {
+      formatter.dateFormat=format
+      if let date=formatter.date(from:value) { return max(0,date.timeIntervalSince(now)) }
+    }
+    return nil
   }
   static func contentRange(_ text:String)->(start:Int64,end:Int64,total:Int64)? {
     guard text.hasPrefix("bytes ") else { return nil }
@@ -434,6 +563,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
         if f.receivedBytes>0 { _=terminate(f) }
       }
     }
+    if f.error==0, f.accepted { recovered(f) }
     let pages=f.error==0 && f.accepted ? storeVerified(f.data,at:f.start) : []
     let key=diskKey
     condition.broadcast(); condition.unlock()
