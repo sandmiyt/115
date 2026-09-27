@@ -957,7 +957,10 @@ done:
 }
 
 CinevaFFmpegSession *CinevaFFmpegSessionCreate(const char *url, const char *headers, double startTime, CinevaFFmpegSessionOptions options) {
-    if (strncmp(url, "https://", 8) && strncmp(url, "http://", 7)) return NULL;
+    // A cache URI is only a demuxer label, never an FFmpeg/network protocol.
+    // It is accepted exclusively with the application's verified custom AVIO.
+    int localCache = !strncmp(url, "cineva-cache://", 15) && options.read && options.size && options.ioContext;
+    if (!localCache && strncmp(url, "https://", 8) && strncmp(url, "http://", 7)) return NULL;
     CinevaFFmpegSession *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
     pthread_mutex_init(&s->mutex, NULL); pthread_cond_init(&s->changed, NULL);

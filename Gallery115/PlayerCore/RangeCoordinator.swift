@@ -225,7 +225,7 @@ final class SegmentDiskCache: @unchecked Sendable {
       }
       records[key]=record
       let bytes=record.pages.reduce(Int64(0)) { $0+min(65536,total-$1) }
-      let missing=max(0,total-bytes), overhead=(missing/65536+1)*128+1048576
+      let missing=max(0,total-bytes), overhead=(missing/65536+1)*8192+1048576
       let limited=reserveWhole && !room(for:missing+overhead,key:key)
       let message=limited ? "空间或视频缓存额度不足，已暂停整片下载；正常播放不受影响" : writeFailures[key]
       // Record is intentionally created before the first async page batch.
@@ -665,9 +665,9 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
       if primary {
         lastForegroundMiss=ProcessInfo.processInfo.systemUptime
         // Coalesce an exact active range; unrelated speculative work yields now.
-        if let token=prefetchToken,let f=flight(at:offset,reader:wanted),f.readers.contains(token) {
-          f.readers.insert(wanted); f.task?.priority=URLSessionTask.highPriority
-        } else { yieldPrefetch() }
+        let shared=flight(at:offset,reader:wanted)
+        if let shared { shared.readers.insert(wanted); shared.task?.priority=URLSessionTask.highPriority }
+        if let token=prefetchToken,shared?.readers.contains(token) != true { yieldPrefetch() }
         for (id,f) in flights where !f.finished && !f.readers.contains(generation) {
           f.task?.cancel(); flights.removeValue(forKey:id)
         }

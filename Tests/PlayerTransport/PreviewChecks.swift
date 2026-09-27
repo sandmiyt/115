@@ -87,7 +87,7 @@ import CoreImage
           validator:"sha1:"+String(repeating:"c",count:40))
         let fill=RangeCoordinator(source:source,identity:identity,disk:disk)
         var probe=[UInt8](repeating:0,count:4096)
-        expect(fill.read(offset:0,buffer:&probe,count:probe.count,generation:1)>0,"Offline fixture begins incrementally")
+        expect(fill.read(offset:0,buffer:&probe,count:4096,generation:1)>0,"Offline fixture begins incrementally")
         fill.allowPrefetch(true)
         for _ in 0..<300 where !fill.mediaCacheProgress.complete { try? await Task.sleep(for:.milliseconds(50)) }
         expect(fill.mediaCacheProgress.complete,"Independent fixture fill reaches all media bytes")
