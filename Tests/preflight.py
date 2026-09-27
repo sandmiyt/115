@@ -79,7 +79,7 @@ check("FFmpegDecodeSession.swift" not in project_source and "FFmpegDecodeValidat
 
 disk = (ROOT / sources[0]).read_text(encoding="utf-8")
 service = (ROOT / sources[1]).read_text(encoding="utf-8")
-card = (ROOT / sources[2]).read_text(encoding="utf-8")
+card = (ROOT / sources[2]).read_text(encoding="utf-8") + (ROOT / "Gallery115/Views/PhotoGridLayout.swift").read_text(encoding="utf-8")
 player = (ROOT / sources[3]).read_text(encoding="utf-8")
 folder = (ROOT / "Gallery115/Views/FolderView.swift").read_text(encoding="utf-8")
 cloud_item = (ROOT / "Gallery115/Models/CloudItem.swift").read_text(encoding="utf-8")

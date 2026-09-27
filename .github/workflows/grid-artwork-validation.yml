@@ -3,6 +3,10 @@ on:
   workflow_dispatch:
   push:
     branches: [codex/grid-artwork]
+concurrency:
+  group: grid-regression-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   regression:
     runs-on: macos-latest

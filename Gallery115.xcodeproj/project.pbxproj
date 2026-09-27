@@ -6,6 +6,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+        C20260927000000000000001 /* PhotoGridLayout.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20260927000000000000002 /* PhotoGridLayout.swift */; };
 		B20260828000000000000001 /* ArtworkDiskStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20260828000000000000002 /* ArtworkDiskStore.swift */; };
 		521FB18B426BCF1EA800706D /* AppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 40438E2D45CDB29E1083E055 /* AppState.swift */; };
 		AE9364A65643882550E6EA92 /* Gallery115App.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00548918D52A82A65A1D74A2 /* Gallery115App.swift */; };
@@ -48,6 +49,7 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+        C20260927000000000000002 /* PhotoGridLayout.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Views/PhotoGridLayout.swift"; sourceTree = "<group>"; };
 		B20260828000000000000002 /* ArtworkDiskStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Services/ArtworkDiskStore.swift"; sourceTree = "<group>"; };
 		40438E2D45CDB29E1083E055 /* AppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "App/AppState.swift"; sourceTree = "<group>"; };
 		00548918D52A82A65A1D74A2 /* Gallery115App.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "App/Gallery115App.swift"; sourceTree = "<group>"; };
@@ -135,6 +137,7 @@
 			B4D1FC7E20CAFB535E6B1E9F /* SettingsView.swift */,
 			FA71D14E84D7F5704D7814FD /* SetupView.swift */,
 			62673D659023784438FDE21D /* VideoCard.swift */,
+            C20260927000000000000002 /* PhotoGridLayout.swift */,
 			80682A187638843CB5D250F2 /* Assets.xcassets */,
 		); path = Gallery115; sourceTree = "<group>"; };
 		021F2B7F3E0C61452C987484 /* Products */ = {isa = PBXGroup; children = (38A007151ABE87CC01A5B6E9 /* Gallery115.app */); name = Products; sourceTree = "<group>"; };
@@ -217,6 +220,7 @@
 			5A048A5962D239BE0A1D024E /* SettingsView.swift in Sources */,
 			2A876095635AE55CFFD42230 /* SetupView.swift in Sources */,
 			87A68ABA2598221C583482FA /* VideoCard.swift in Sources */,
+            C20260927000000000000001 /* PhotoGridLayout.swift in Sources */,
 		); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 

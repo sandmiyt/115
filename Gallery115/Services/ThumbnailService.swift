@@ -118,6 +118,11 @@ actor ThumbnailService {
     return memoryCache.object(forKey: identity.key as NSString)
   }
 
+  nonisolated func traceKey(for item: CloudItem) -> String {
+    ArtworkIdentity(namespace: memoryCache.namespaceSnapshot ?? namespace(), itemID: item.id,
+      size: item.size, modifiedAt: item.modifiedAt, legacyKey: item.sha1.isEmpty ? item.id : item.sha1).key
+  }
+
   func warmLocalThumbnails(_ items: [CloudItem], limit: Int = 24) async {
     for item in items.lazy.filter({ $0.isVideo || $0.isPhoto }).prefix(max(0, limit)) {
       guard !Task.isCancelled, playbackOwners.isEmpty else { return }
@@ -946,6 +951,7 @@ enum GridArtworkTrace {
     return false
     #endif
   }()
+  private static let scenario = ProcessInfo.processInfo.environment["CINEVA_ARTWORK_SCENARIO"] ?? "unspecified"
   private static let log = Logger(subsystem: "com.xiaocai.gallery115", category: "GridArtworkTiming")
   static func event(_ stage: String, id: String, detail: @autoclosure () -> String = "", since start: Double? = nil) {
     #if DEBUG
@@ -962,7 +968,7 @@ enum GridArtworkTrace {
     }
     let resident = status == KERN_SUCCESS ? info.resident_size : 0
     let message = detail()
-    log.debug("stage=\(stage, privacy: .public) id=\(key, privacy: .public) t=\(now) ms=\(elapsed) resident=\(resident) \(message, privacy: .public)")
+    log.debug("scenario=\(scenario, privacy: .public) stage=\(stage, privacy: .public) id=\(key, privacy: .public) t=\(now) ms=\(elapsed) resident=\(resident) \(message, privacy: .public)")
     #endif
   }
 }

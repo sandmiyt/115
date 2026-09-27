@@ -5,6 +5,10 @@ on:
   push:
     branches: [ main, codex/grid-artwork ]
 
+concurrency:
+  group: iphone-build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: macos-latest
