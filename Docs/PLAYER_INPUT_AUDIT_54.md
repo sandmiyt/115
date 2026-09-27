@@ -73,8 +73,25 @@ Windows: `python -X utf8 Tests/preflight.py` reports zero failures;
 The existing GitHub macOS job compiles the production RangeCoordinator with
 `swiftc`, launches `Tests/PlayerTransport/range_server.py`, runs RangeChecks and
 the existing buffer-policy checks, then invokes the existing unsigned iPhone
-Release `xcodebuild` and IPA packaging. Final exact revision/results are recorded
-after the job completes.
+Release `xcodebuild` and IPA packaging.
+
+Final tested code revision: `e729777f3d4eb3b88f7b7da33de8f5503f6ada6b`,
+Cineva **2.2.9 (54)**, completed successfully on 2026-09-27:
+
+- 19 buffer-policy assertions passed.
+- 974 transport / byte-integrity assertions passed, including repeated
+  per-read byte checks (not 974 separate playback scenarios).
+- Native FFmpeg bridge/dependencies and iPhone Release app compiled; unsigned
+  IPA packaged and uploaded, outer artifact ZIP 59,458,274 bytes.
+- Run: https://github.com/sandmiyt/115/actions/runs/36307638612
+- IPA: https://github.com/sandmiyt/115/actions/runs/36307638612/artifacts/10928047222
+
+An intermediate revision 5da0727 reached the existing truncation assertion and
+failed: a delivered prefix could be retried as another prefix. The final version
+terminates a response that disconnects after partial delivery; legitimate short
+206 completion remains distinct. Its final run passed the truncation check.
+Existing compiler warnings remain; a warning-free / Swift 6 migration is not
+claimed. A later documentation-only commit does not change this built code.
 
 Coverage includes original transport cases, UA plus credential isolation,
 64 KiB and 10,000-byte short prefixes through over 3 MiB, random holes and back
