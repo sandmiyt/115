@@ -124,9 +124,10 @@ actor ThumbnailService {
   }
 
   func warmLocalThumbnails(_ items: [CloudItem], limit: Int = 24) async {
+    let generation = cacheGeneration
     for item in items.lazy.filter({ $0.isVideo || $0.isPhoto }).prefix(max(0, limit)) {
-      guard !Task.isCancelled, playbackOwners.isEmpty else { return }
-      _ = await localImage(identity(for: item), maximumPixelSize: 320, generation: cacheGeneration)
+      guard !Task.isCancelled, generation == cacheGeneration, playbackOwners.isEmpty else { return }
+      _ = await localImage(identity(for: item), maximumPixelSize: 320, generation: generation)
       await Task.yield()
     }
   }
@@ -290,6 +291,7 @@ actor ThumbnailService {
     if cachedThumbnail(for: item) != nil { return }
     // Inspect disk metadata without decoding every cached cover into memory.
     if await imageWorker.contains(identity, generation: generation) { return }
+    guard !Task.isCancelled, generation == cacheGeneration, libraryScanID == scanID else { return }
     if let until = backgroundFailedUntil[identity.key], until > Date() { return }
     let revision = libraryReloadRevision
     if await thumbnail(for: item, api: api, isPrefetch: true) == nil,
@@ -509,7 +511,7 @@ actor ThumbnailService {
       }
     }
     guard !Task.isCancelled, generation == cacheGeneration, identity.namespace == namespace(),
-      let image else { return nil }
+      inFlight[identity.key]?.id == workID, let image else { return nil }
     failedUntil[identity.key] = nil
     frameAttempts[identity.key] = nil
     cacheInMemory(image, key: identity.key, pixels: artifact?.data == nil ? 960 : pixels)
