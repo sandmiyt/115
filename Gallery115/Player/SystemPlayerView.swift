@@ -161,7 +161,7 @@ final class TimelinePreviewController {
   private(set) var requestedPreviewTime=0.0
   private(set) var previewNote:String?
   func beginExternal(at seconds:Double) {
-    cancelRequest(); isActive=true; requestedPreviewTime=seconds; previewNote="正在读取预览"
+    cancelRequest(); isActive=true; requestedPreviewTime=seconds; previewNote=""
   }
   func targetExternal(_ seconds:Double) { requestedPreviewTime=seconds }
   func displayExternal(_ image:UIImage?,pts:Double,note:String) {
@@ -365,7 +365,7 @@ struct TimelinePreviewOverlay: View {
         .clipped()
         .overlay(alignment: .topLeading) {
           Text(previews.previewNote.map {
-            "目标 \(PlaybackPolicy.timestamp(previews.requestedPreviewTime)) · 画面 \(PlaybackPolicy.timestamp(previews.imageTime)) · \($0)"
+            "目标 \(PlaybackPolicy.timestamp(previews.requestedPreviewTime)) · 画面 \(PlaybackPolicy.timestamp(previews.imageTime))" + ($0.isEmpty ? "" : " · \($0)")
           } ?? "预览 \(PlaybackPolicy.timestamp(previews.imageTime))")
             .font(.caption.monospacedDigit())
             .padding(6)
@@ -377,7 +377,7 @@ struct TimelinePreviewOverlay: View {
     } else if previews.isActive {
       VStack {
         Spacer()
-        Text("\(PlaybackPolicy.timestamp(previews.requestedPreviewTime)) · \(previews.previewNote ?? "正在读取预览…")")
+        Text(PlaybackPolicy.timestamp(previews.requestedPreviewTime) + (previews.previewNote.flatMap { $0.isEmpty ? nil : " · \($0)" } ?? ""))
           .font(.caption)
           .padding(8)
           .background(.black.opacity(0.55), in: Capsule())
