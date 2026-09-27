@@ -331,6 +331,10 @@ private final class SlowDiskGate: @unchecked Sendable {
     for _ in 0..<200 where !resumed.mediaCacheProgress.complete { Thread.sleep(forTimeInterval:0.05) }
     expect(resumed.mediaCacheProgress.complete && resumed.statistics.networkBytes==size-1048576,"Resume fills only persistent gaps")
     resumed.close()
+    let reducedQuota=SegmentDiskCache(root:resumeRoot,capacity:{ 1048576 })
+    let completedUnderQuota=reducedQuota.inspect(key:resumeIdentity.key,identity:resumeIdentity.key,
+      total:size,validator:"\"v1\"",persistent:true,reserveWhole:true).0
+    expect(completedUnderQuota.complete && completedUnderQuota.limitation==nil,"Lowering quota cannot mislabel an already complete file as a paused download")
     // Retain a completed unaligned seek flight while its partial memory pages
     // age out of the 32 MiB LRU. Gap fill must reassemble the old flight's tail.
     let fragmentSize:Int64=40*1048576+97

@@ -229,7 +229,7 @@ final class SegmentDiskCache: @unchecked Sendable {
       records[key]=record
       let bytes=record.pages.reduce(Int64(0)) { $0+min(65536,total-$1) }
       let missing=max(0,total-bytes), overhead=(missing/65536+1)*8192+1048576
-      let limited=reserveWhole && (missing>Int64.max-overhead || !room(for:missing+overhead,key:key))
+      let limited=reserveWhole && missing>0 && (missing>Int64.max-overhead || !room(for:missing+overhead,key:key))
       let message=limited ? "空间或视频缓存额度不足，已暂停整片下载；正常播放不受影响" : writeFailures[key]
       // Record is intentionally created before the first async page batch.
       if !FileManager.default.fileExists(atPath:manifest(key).path) { try? save(record,key:key) }
@@ -288,6 +288,7 @@ final class SegmentDiskCache: @unchecked Sendable {
       try? excluded.setResourceValues(attributes)
       guard var record=self.load(key) ?? identity.map({ Record(identity:$0,total:total,validator:validator) }),record.total>0 else { return }
       let fresh=pages.filter { !record.pages.contains($0.0) }
+      guard !fresh.isEmpty else { return }
       guard self.room(for:Int64(fresh.reduce(0) { $0+$1.1.count+32 })+1048576,key:key) else {
         self.writeFailures[key]="空间或视频缓存额度不足，已暂停写入；正常播放不受影响"; return
       }
