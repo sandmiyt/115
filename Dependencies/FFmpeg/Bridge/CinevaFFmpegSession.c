@@ -39,6 +39,7 @@ struct CinevaFFmpegSession {
     int hasReader, hasDecoder;
     atomic_int cancelled, generation, interruptSeek, ioGeneration;
     atomic_int wantedAudioIndex;
+    atomic_int videoSuppressed;
     atomic_llong deadline;
     char *url, *headers;
     double target, origin;
@@ -187,7 +188,7 @@ static int putPacket(CinevaFFmpegSession *s, Packet entry) {
         while (!atomic_load(&s->cancelled) && entry.serial == atomic_load(&s->generation) &&
             (s->audioCount >= PACKETS || s->audioBytes + bytes > 4*1024*1024 || s->audioSeconds >= 8))
         {
-            if (!s->packetCount && !s->frameCount && av_gettime_relative()-blockedAt>8000000) {
+            if (!atomic_load(&s->videoSuppressed) && !s->packetCount && !s->frameCount && av_gettime_relative()-blockedAt>8000000) {
                 pthread_mutex_unlock(&s->mutex); av_packet_free(&entry.packet);
                 fail(s,AVERROR(ENOBUFS),CinevaStageRead); return 0;
             }
@@ -291,6 +292,7 @@ static int emitAudio(CinevaFFmpegSession *s, AVFrame *frame, Packet entry) {
 
 static int emitVideo(CinevaFFmpegSession *s, AVFrame *frame, int serial, double target,
                      double *nextPTS) {
+    if(atomic_load(&s->videoSuppressed)) return 0;
     double pts = frame->best_effort_timestamp == AV_NOPTS_VALUE ? *nextPTS :
         frame->best_effort_timestamp * av_q2d(s->videoTimeBase) - s->origin;
     if (!isfinite(pts)) pts = *nextPTS;
@@ -313,7 +315,7 @@ static int emitVideo(CinevaFFmpegSession *s, AVFrame *frame, int serial, double 
     int frameLimit = output.outputWidth * output.outputHeight > 1920 * 1080 ? 3 : FRAMES;
     while (s->frameCount >= frameLimit && !atomic_load(&s->cancelled) &&
            serial == atomic_load(&s->generation)) pthread_cond_wait(&s->changed, &s->mutex);
-    if (atomic_load(&s->cancelled) || serial != atomic_load(&s->generation)) {
+    if (atomic_load(&s->cancelled) || serial != atomic_load(&s->generation) || atomic_load(&s->videoSuppressed)) {
         CVPixelBufferRelease(pixel);
     } else {
         s->frames[(s->frameHead + s->frameCount++) % FRAMES] = (Frame){pixel, fmax(0, pts), step, serial};
@@ -413,6 +415,14 @@ static void *decodeLoop(void *opaque) {
         pthread_cond_broadcast(&s->changed);
         pthread_mutex_unlock(&s->mutex);
         if (entry.serial != atomic_load(&s->generation)) { av_packet_free(&entry.packet); continue; }
+        if(atomic_load(&s->videoSuppressed)) {
+            if(entry.eof) {
+                pthread_mutex_lock(&s->mutex); s->snapshot.videoDrained=1;
+                if(s->snapshot.audioDrained) s->snapshot.status=2;
+                pthread_mutex_unlock(&s->mutex);
+            }
+            av_packet_free(&entry.packet); continue;
+        }
         if (serial != entry.serial) {
             avcodec_flush_buffers(s->video);
             serial = entry.serial; nextPTS = entry.target;
@@ -434,6 +444,7 @@ static void *decodeLoop(void *opaque) {
             result = decodePacket(s, isVideo ? s->video : s->audio, frame, isVideo, entry, &nextPTS, &failureStage);
             if (result < 0 && !isVideo) { disableValidationAudio(s, result); result = 0; }
         }
+        if(videoOperation && atomic_load(&s->videoSuppressed)) result=0;
         if (result < 0 && videoOperation && entry.serial == atomic_load(&s->generation) &&
             !atomic_load(&s->cancelled)) {
             int recovered = recoverSoftware(s, entry);
@@ -793,17 +804,25 @@ static void *readLoop(void *opaque) {
     stage = CinevaStageWorker; readerStage(s, stage);
     if (pthread_create(&s->decoder, NULL, decodeLoop, s)) { result = AVERROR(ENOMEM); goto done; }
     s->hasDecoder = 1;
-    int serial = -1, eof = 0;
+    int serial = -1, eof = 0, videoSuppressed=-1;
     double target = 0;
     while (!atomic_load(&s->cancelled)) {
+        int suppressed=atomic_load(&s->videoSuppressed);
+        if(suppressed!=videoSuppressed) {
+            s->format->streams[s->videoIndex]->discard=suppressed?AVDISCARD_ALL:AVDISCARD_DEFAULT;
+            int subtitle=cineva_sub_index(s->subtitles);
+            if(subtitle>=0) s->format->streams[subtitle]->discard=suppressed?AVDISCARD_ALL:AVDISCARD_DEFAULT;
+            videoSuppressed=suppressed;
+        }
         int wanted = atomic_load(&s->generation);
         if (wanted != serial) {
             if (!s->videoOnly) {
                 s->audioIndex=atomic_load(&s->wantedAudioIndex);
                 for (unsigned i=0;i<s->format->nb_streams;i++)
                     s->format->streams[i]->discard=((int)i==s->videoIndex || (int)i==s->audioIndex ||
-                        (int)i==cineva_sub_index(s->subtitles))?AVDISCARD_DEFAULT:AVDISCARD_ALL;
+                        (!suppressed && (int)i==cineva_sub_index(s->subtitles)))?AVDISCARD_DEFAULT:AVDISCARD_ALL;
                 pthread_mutex_lock(&s->mutex); s->snapshot.selectedAudioIndex=s->audioIndex; pthread_mutex_unlock(&s->mutex);
+                s->format->streams[s->videoIndex]->discard=suppressed?AVDISCARD_ALL:AVDISCARD_DEFAULT;
             }
             pthread_mutex_lock(&s->mutex);
             target = s->target;
@@ -865,8 +884,10 @@ static void *readLoop(void *opaque) {
             putPacket(s, (Packet){NULL, serial, 1, 0, target}); eof = 1; continue;
         }
         if (result < 0) { av_packet_free(&packet); goto done; }
+        if(packet->stream_index==s->videoIndex && atomic_load(&s->videoSuppressed)) { av_packet_free(&packet); continue; }
         if (packet->stream_index == cineva_sub_index(s->subtitles)) {
-            cineva_sub_put(s->subtitles,packet,serial); av_packet_free(&packet); continue;
+            if(!atomic_load(&s->videoSuppressed)) cineva_sub_put(s->subtitles,packet,serial);
+            av_packet_free(&packet); continue;
         }
         if (packet->stream_index != s->videoIndex && packet->stream_index != s->audioIndex) {
             av_packet_free(&packet); continue;
@@ -917,6 +938,7 @@ CinevaFFmpegSession *CinevaFFmpegSessionCreate(const char *url, const char *head
     pthread_mutex_init(&s->mutex, NULL); pthread_cond_init(&s->changed, NULL);
     atomic_init(&s->cancelled, 0); atomic_init(&s->generation, 1);
     atomic_init(&s->wantedAudioIndex,-1);
+    atomic_init(&s->videoSuppressed,0);
     atomic_init(&s->interruptSeek, 0); atomic_init(&s->ioGeneration, 1);
     atomic_init(&s->deadline, 0);
     s->url = strdup(url); s->headers = strdup(headers);
@@ -977,6 +999,22 @@ void CinevaFFmpegSessionSetPosition(CinevaFFmpegSession *s, double seconds) {
     pthread_mutex_lock(&s->mutex);
     s->playbackPosition = fmax(0, seconds);
     pthread_mutex_unlock(&s->mutex);
+}
+void CinevaFFmpegSessionSetVideoActive(CinevaFFmpegSession *s,int active) {
+    if(!s->options.outputAudio) return;
+    atomic_store(&s->videoSuppressed,!active);
+    pthread_mutex_lock(&s->mutex);
+    if(!active) {
+        for(int i=0;i<s->packetCount;i++) av_packet_free(&s->packets[(s->packetHead+i)%PACKETS].packet);
+        for(int i=0;i<s->frameCount;i++) CVPixelBufferRelease(s->frames[(s->frameHead+i)%FRAMES].buffer);
+        s->packetHead=s->packetCount=s->frameHead=s->frameCount=0;
+        s->packetBytes=0; s->packetSeconds=s->frameSeconds=0;
+        if(s->snapshot.demuxEOF) {
+            s->snapshot.videoDrained=1;
+            if(s->snapshot.audioDrained) s->snapshot.status=2;
+        }
+    }
+    pthread_cond_broadcast(&s->changed); pthread_mutex_unlock(&s->mutex);
 }
 typedef struct { double start,end; } TimeRange;
 static int compareRange(const void *a,const void *b) {

@@ -78,6 +78,7 @@ _CinevaFFmpegSessionCancel
 _CinevaFFmpegSessionDestroy
 _CinevaFFmpegSessionSeek
 _CinevaFFmpegSessionSetPosition
+_CinevaFFmpegSessionSetVideoActive
 _CinevaFFmpegSessionSnapshot
 _CinevaFFmpegSessionCopyFrame
 _CinevaFFmpegSessionCopyAudio

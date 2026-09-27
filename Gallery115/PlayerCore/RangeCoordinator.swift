@@ -249,7 +249,9 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     }
   }
   private func startFlight(at start: Int64, generation: Int32) -> Int {
-    let end = min(start / window * window + window - 1, length > 0 ? length - 1 : Int64.max)
+    let aligned=start/window*window
+    let windowEnd=aligned+min(window-1,Int64.max-aligned)
+    let end = min(windowEnd, length > 0 ? length - 1 : Int64.max)
     let flight = Flight(start: start, end: end, generation: generation)
     var request = URLRequest(url: source.url)
     for (key, value) in source.headers { request.setValue(value, forHTTPHeaderField: key) }

@@ -27,7 +27,7 @@ struct CinevaSubtitles {
     double origin, time;
     SubPacket packets[SUB_PACKETS];
     BitmapEvent bitmaps[BITMAP_EVENTS];
-    int bitmapCount, dirty, width, height;
+    int bitmapCount, dirty, width, height, fontsReady;
     AVCodecParameters *parameters[32];
     AVRational bases[32];
     CinevaFFmpegSubtitleTrack tracks[32];
@@ -199,7 +199,6 @@ CinevaSubtitles *cineva_sub_create(AVFormatContext *format,double origin,int wid
         snprintf(track->language,sizeof(track->language),"%s",lang?lang->value:"und");
         snprintf(track->title,sizeof(track->title),"%s",title?title->value:""); s->count++;
     }
-    ass_set_fonts(s->renderer,NULL,"Arial",ASS_FONTPROVIDER_CORETEXT,NULL,1);
     makeTrack(s,NULL);
     if(pthread_create(&s->worker,NULL,worker,s)) { cineva_sub_destroy(s); return NULL; }
     s->started=1; return s;
@@ -219,6 +218,7 @@ void cineva_sub_destroy(CinevaSubtitles *s) {
 void cineva_sub_reset(CinevaSubtitles *s,int serial) {
     if(!s) return;
     pthread_mutex_lock(&s->lock); s->serial=serial; clearPackets(s); clearBitmap(s);
+    s->error=0;
     if(s->external==2) { s->externalNeedsSeek=1; pthread_cond_signal(&s->changed); }
     else avcodec_free_context(&s->decoder);
     if(!s->external) makeTrack(s,NULL);
@@ -261,6 +261,16 @@ int cineva_sub_render(CinevaSubtitles *s,double time,int serial,CVPixelBufferRef
     *pixel=NULL; if(!s || !isfinite(time))return 0;
     pthread_mutex_lock(&s->lock);
     if(s->serial!=serial) { pthread_mutex_unlock(&s->lock); return 0; }
+    if(s->selected<0 && !s->external) {
+        int changed=s->dirty; s->dirty=0;
+        pthread_mutex_unlock(&s->lock); return changed;
+    }
+    if(!s->fontsReady) {
+        // Font discovery is off the startup/demux path and runs only when an
+        // actual subtitle track is selected, on the rendering worker.
+        ass_set_fonts(s->renderer,NULL,"Arial",ASS_FONTPROVIDER_CORETEXT,NULL,1);
+        s->fontsReady=1;
+    }
     if(s->external==2) {
         if(time<s->time-0.1 || time>s->time+2) s->externalNeedsSeek=1;
         pthread_cond_signal(&s->changed);

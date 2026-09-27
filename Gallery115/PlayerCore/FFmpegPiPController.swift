@@ -4,6 +4,8 @@ import Observation
 @MainActor @Observable
 final class FFmpegPiPController: NSObject, AVPictureInPictureSampleBufferPlaybackDelegate, AVPictureInPictureControllerDelegate {
   private(set) var active = false
+  private(set) var starting = false
+  var requiresVideo: Bool { active || starting }
   private(set) var failure: String?
   @ObservationIgnored private weak var engine: FFmpegPlayerEngine?
   @ObservationIgnored private var controller: AVPictureInPictureController?
@@ -52,10 +54,11 @@ final class FFmpegPiPController: NSObject, AVPictureInPictureSampleBufferPlaybac
       completionHandler()
     }
   }
-  func pictureInPictureControllerDidStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) { active=true }
-  func pictureInPictureControllerDidStopPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) { active=false }
+  func pictureInPictureControllerWillStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) { starting=true }
+  func pictureInPictureControllerDidStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) { starting=false; active=true }
+  func pictureInPictureControllerDidStopPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) { starting=false; active=false }
   func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, failedToStartPictureInPictureWithError error: Error) {
-    active=false; failure=error.localizedDescription
+    starting=false; active=false; failure=error.localizedDescription
   }
   func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
     restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void) {

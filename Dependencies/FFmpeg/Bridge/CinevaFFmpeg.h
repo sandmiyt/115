@@ -99,6 +99,7 @@ void CinevaFFmpegSessionCancel(CinevaFFmpegSession * _Nonnull session);
 void CinevaFFmpegSessionDestroy(CinevaFFmpegSession * _Nonnull session);
 int CinevaFFmpegSessionSeek(CinevaFFmpegSession * _Nonnull session, double seconds);
 void CinevaFFmpegSessionSetPosition(CinevaFFmpegSession * _Nonnull session, double seconds);
+void CinevaFFmpegSessionSetVideoActive(CinevaFFmpegSession * _Nonnull session, int active);
 void CinevaFFmpegSessionSnapshot(CinevaFFmpegSession * _Nonnull session,
     CinevaFFmpegSnapshot * _Nonnull snapshot);
 CVPixelBufferRef _Nullable CinevaFFmpegSessionCopyFrame(CinevaFFmpegSession * _Nonnull session,

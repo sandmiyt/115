@@ -43,6 +43,9 @@ import Foundation
     }
     let small=client("/small200",size:131072)
     expect(read(small,0)>0,"Bounded offset-zero 200"); small.close()
+    let beyond=client("/ok",size:-1)
+    expect(read(beyond,Int64.max)==0 && beyond.statistics.responses416==1,"64-bit seek verifies EOF using 416 without overflow")
+    beyond.close()
     let changed=client("/changed")
     expect(read(changed,0)>0,"First validator")
     expect(read(changed,2*1048576)==(-4),"Changed ETag rejected"); changed.close()

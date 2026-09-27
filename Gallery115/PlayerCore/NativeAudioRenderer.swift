@@ -26,6 +26,7 @@ final class NativeAudioRenderer {
   }
   var queuedDuration: Double { max(0,submittedEnd-audibleTime) }
   var hasScheduledAudio: Bool { anchor != nil }
+  var notificationObject: AnyObject { engine }
 
   init() {
     engine.attach(node); engine.attach(pitch)
@@ -35,7 +36,9 @@ final class NativeAudioRenderer {
   }
   func prepare() throws {
     let session = AVAudioSession.sharedInstance()
-    try session.setCategory(.playback,mode:.moviePlayback,options:[.allowAirPlay,.allowBluetoothA2DP])
+    // Playback already permits AirPlay and A2DP. allowAirPlay may only be set
+    // explicitly for playAndRecord; using it here can reject session setup.
+    try session.setCategory(.playback,mode:.moviePlayback,options:[])
     try session.setActive(true)
     if !engine.isRunning { try engine.start() }
   }

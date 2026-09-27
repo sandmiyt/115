@@ -48,6 +48,13 @@ when duration is invalid. Its native timebase is anchored at explicit boundaries
 while playing it receives a bounded rate correction toward the audio clock,
 not a per-frame time jump. No-audio files have a separate video-clock path.
 
+Background audio without PiP suppresses the video stream/decoder and GPU overlay
+work while continuing the audio clock and bounded audio queues. Foreground/PiP
+restoration coordinates a seek at that clock to rebuild video state. An active or
+starting PiP keeps video enabled. Background pumps are throttled separately.
+Audio-session playback uses its implicit AirPlay/A2DP routes rather than invalid
+playAndRecord-only category options. Actual route continuity remains a device test.
+
 Continuous decoded/submitted/packet intervals are merged **within each track**.
 The playable A/V runway is the intersection, never the sum. Startup targets
 0.75 seconds. Rebuffer starts at 2 seconds, escalates to at most 4 seconds with
@@ -171,7 +178,9 @@ build 51 (b0c55ee) passed 19 buffer checks, 39 transport/integrity checks and iO
 compilation: https://github.com/sandmiyt/115/actions/runs/36297394080
 The integrity assertion count varies when CFNetwork delivers a prefix before a
 truncated response; both verified-prefix and bounded-error outcomes are checked.
-Build 52 final status must be recorded for its exact revision.
+Build 53 includes lazy font discovery, audio-session category correction, explicit
+background-audio video suppression and a verified 64-bit/416 boundary test.
+Final status must be recorded for its exact revision.
 
 ## Same-file device acceptance still required
 

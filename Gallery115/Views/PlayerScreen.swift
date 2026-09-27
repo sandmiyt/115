@@ -1327,6 +1327,8 @@ struct PlayerScreen: View {
               }
               if let reason=ffmpegReason { Text(reason).font(.caption).foregroundStyle(.orange) }
               if useFFmpeg {
+                Text("AirPlay 可选择系统音频路由；远端视频播放请尝试 AVPlayer，实际可用性取决于文件与鉴权。")
+                  .font(.caption).foregroundStyle(.secondary)
                 Text(ffmpegEngine.diagnostics).font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
                 Button("复制 FFmpeg 播放诊断") { UIPasteboard.general.string=ffmpegEngine.diagnostics }
                 Button("清空 FFmpeg 分段缓存并重新读取") { Task { await ffmpegEngine.clearSegmentCache() } }

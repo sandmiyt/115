@@ -65,6 +65,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   @ObservationIgnored private var resumeTarget = 0.75
   @ObservationIgnored private var waitStarted = 0.0
   @ObservationIgnored private var lastPublished = 0.0
+  @ObservationIgnored private var lastPump = 0.0
   @ObservationIgnored private var firstFrameAt: Double?
   @ObservationIgnored private var startAt = 0.0
   @ObservationIgnored private var sourceItem: CloudItem?
@@ -79,6 +80,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   @ObservationIgnored private var lastNetworkAt = 0.0
   @ObservationIgnored private var scrubTask: Task<Void,Never>?
   @ObservationIgnored private var audioTail = false
+  @ObservationIgnored private var backgroundAudioOnly = false
   @ObservationIgnored private var restoredAudioPreference = false
   @ObservationIgnored private var defaultAudioID: String?
   @ObservationIgnored private var audioPreferenceKey: String?
@@ -99,6 +101,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     trial=FFmpegDiagnosticTrial(mode:useCache ? .cachedAudio : .standard,position:target,hardware:preferHardware)
     trialPlaybackAt=nil; trialFrozen=false
     wantsPlayback=playing; waiting=true; resumeTarget=0.75; serial=1
+    backgroundAudioOnly=false
     rebufferCount=0; audioUnderruns=0; firstFrameAt=nil
     audioTracks=[]; selectedAudioOptionID=nil; audioTail=false; restoredAudioPreference=false
     defaultAudioID=nil; audioPreferenceKey=nil
@@ -324,10 +327,12 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
           AVAudioSession.InterruptionOptions(rawValue:options).contains(.shouldResume) { self.resume() }
       }
     })
-    for name in [AVAudioSession.routeChangeNotification, AVAudioSession.mediaServicesWereResetNotification] {
+    for name in [AVAudioSession.routeChangeNotification, AVAudioSession.mediaServicesWereResetNotification, Notification.Name.AVAudioEngineConfigurationChange] {
       observers.append(center.addObserver(forName:name,object:nil,queue:.main) { [weak self] note in
         MainActor.assumeIsolated {
           guard let self else { return }
+          if note.name == .AVAudioEngineConfigurationChange,
+            (note.object as AnyObject?) !== self.audio.notificationObject { return }
           if note.name==AVAudioSession.mediaServicesWereResetNotification {
             self.audio.stop(); self.audio=NativeAudioRenderer()
             self.audio.setRate(self.rate); self.audio.setVolume(self.volume)
@@ -348,6 +353,9 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   private func pump() {
     guard let handle else { return }
     let now=CACurrentMediaTime()
+    if backgroundAudioOnly, UIApplication.shared.applicationState == .background,
+      pip?.requiresVideo != true, now-lastPump<0.04 { return }
+    lastPump=now
     var snapshot=CinevaFFmpegSnapshot(); CinevaFFmpegSessionSnapshot(handle.pointer,&snapshot)
     if snapshot.status<0 {
       var message=[CChar](repeating:0,count:192); CinevaFFmpegErrorText(snapshot.errorCode,&message,192)
@@ -361,6 +369,16 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
       waiting=true; waitStarted=now; resumeTarget=0.75
     }
     hasAudio=snapshot.audioEnabled != 0 && !audioTail
+    let audioInBackground=UIApplication.shared.applicationState == .background &&
+      snapshot.audioEnabled != 0 && pip?.requiresVideo != true
+    if audioInBackground != backgroundAudioOnly {
+      backgroundAudioOnly=audioInBackground
+      CinevaFFmpegSessionSetVideoActive(handle.pointer,audioInBackground ? 0 : 1)
+      toneMapTask?.cancel(); toneMapTask=nil; pendingToneMapped=false; pending=nil
+      resetSubtitleImage()
+      if audioInBackground { renderer.setPlaying(false) }
+      else { seek(to:currentTime); return } // Rebuild video/keyframe state at the audio clock.
+    }
     if snapshot.duration>0 { duration=snapshot.duration }
     for _ in 0..<12 where hasAudio && audio.queuedDuration < 0.6*Double(rate) {
       var pts=0.0, generation:Int32=0
@@ -372,7 +390,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
       currentTime=max(0,hasAudio ? audio.audibleTime : renderer.time)
       CinevaFFmpegSessionSetPosition(handle.pointer,currentTime)
     }
-    for _ in 0..<8 {
+    for _ in 0..<8 where !backgroundAudioOnly {
       if pending==nil {
         var pts=0.0, duration=0.0, generation:Int32=0
         if let pixel=CinevaFFmpegSessionCopyFrame(handle.pointer,&pts,&duration,&generation) {
@@ -409,7 +427,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     }
     CinevaFFmpegSessionSnapshot(handle.pointer,&snapshot)
     guard snapshot.serial==serial else { return }
-    if !waiting, renderer.waitingForData {
+    if !waiting, !backgroundAudioOnly, renderer.waitingForData {
       // Display recovery invalidates its submitted runway: freeze audio until
       // the common buffering gate can release both outputs together.
       audio.pause(); waiting=true; waitStarted=now; resumeTarget=0.75
@@ -419,6 +437,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
       heldStart:pending?.1,heldEnd:pending.map { $0.1+$0.2 },queueStart:snapshot.videoStart,queueEnd:snapshot.videoEnd)
     var audioEnd=hasAudio ? contiguousEnd(from:currentTime,submitted:audio.submittedEnd,
       queueStart:snapshot.audioStart,queueEnd:snapshot.audioEnd) : videoEnd
+    if backgroundAudioOnly { videoEnd=audioEnd }
     if hasAudio, snapshot.audioDrained != 0, snapshot.pcmCount==0, audio.queuedDuration<0.015 {
       currentTime=audio.audibleTime; audio.pause(); audioTail=true; hasAudio=false
       renderer.alignClock(to:currentTime,rate:Double(rate),running:wantsPlayback && !waiting)
@@ -427,7 +446,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     if snapshot.videoDrained != 0, snapshot.frameCount==0, pending==nil, currentTime>=renderer.lastEnd { videoEnd=audioEnd }
     bufferedUntil=min(videoEnd,audioEnd) // Track intersection, never audio+video sum.
     let audioEmpty=hasAudio && audio.queuedDuration < 0.015 && snapshot.audioDrained==0
-    let videoEmpty=renderer.anchored && renderer.time>renderer.lastEnd+0.15 && pending==nil && snapshot.frameCount==0 && snapshot.videoDrained==0
+    let videoEmpty = !backgroundAudioOnly && renderer.anchored && renderer.time>renderer.lastEnd+0.15 && pending==nil && snapshot.frameCount==0 && snapshot.videoDrained==0
     if !waiting, wantsPlayback, audioEmpty || videoEmpty {
       audio.pause(); renderer.suspendForData(); waiting=true
       rebufferCount += 1; if audioEmpty { audioUnderruns += 1 }
@@ -435,29 +454,31 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
       resumeTarget=max(ioTarget,min(4,2+Double(min(rebufferCount-1,2))))
       waitStarted=now; playbackState = .buffering
     }
-    if waiting, wantsPlayback, renderer.anchored, !hasAudio || audio.hasScheduledAudio {
+    if waiting, wantsPlayback, backgroundAudioOnly || renderer.anchored, !hasAudio || audio.hasScheduledAudio {
       let desired=resumeTarget*Double(rate)
       let tail=snapshot.demuxEOF != 0 && bufferedDuration>0
       let capacity=snapshot.readerBackpressured != 0 && now-waitStarted>=desired && bufferedDuration>0.3
       if bufferedDuration>=desired || tail || capacity {
         do {
           if hasAudio { try audio.resume() }
-          renderer.resume(nextPTS:pending?.1,playing:true)
-          renderer.alignClock(to:hasAudio ? audio.audibleTime : currentTime,rate:Double(rate),running:true)
+          if !backgroundAudioOnly {
+            renderer.resume(nextPTS:pending?.1,playing:true)
+            renderer.alignClock(to:hasAudio ? audio.audibleTime : currentTime,rate:Double(rate),running:true)
+          }
           waiting=false; playbackState = .playing
           if trialPlaybackAt==nil { trialPlaybackAt=now }
         } catch { fail("音频输出失败：\(error.localizedDescription)"); return }
       }
     }
     if snapshot.status==2, pending==nil, snapshot.frameCount==0, snapshot.pcmCount==0,
-      (!hasAudio || audio.queuedDuration<0.02), renderer.time>=renderer.lastEnd {
+      (!hasAudio || audio.queuedDuration<0.02), backgroundAudioOnly || renderer.time>=renderer.lastEnd {
       pause(); playbackState = .ended; saveProgress(force:true)
     }
-    if !wantsPlayback, firstFrameAt != nil { playbackState = .paused }
-    renderSubtitle(now:now)
+    if !wantsPlayback, renderer.anchored { playbackState = .paused }
+    if !backgroundAudioOnly { renderSubtitle(now:now) }
     if now-lastPublished>=0.25 {
       lastPublished=now
-      if hasAudio, !waiting, wantsPlayback { renderer.disciplineClock(to:audio.audibleTime,rate:Double(rate)) }
+      if hasAudio, !waiting, wantsPlayback, !backgroundAudioOnly { renderer.disciplineClock(to:audio.audibleTime,rate:Double(rate)) }
       rotation=snapshot.rotation; videoSize=CGSize(width:Int(snapshot.width),height:Int(snapshot.height))
       pip?.update()
       var tracks:[PlayerTrack]=[]
