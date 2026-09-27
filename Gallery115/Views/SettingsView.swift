@@ -558,7 +558,7 @@ private struct AboutSettingsView: View {
         LabeledContent("版本", value: (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "")
         LabeledContent("媒体协议", value: "115 Open API + WebDAV")
         LabeledContent("播放内核", value: "AVPlayer + VLC")
-        NavigationLink("FFmpeg 集成信息") {
+        NavigationLink("FFmpeg 开源信息") {
           FFmpegIntegrationInfoView()
         }
       }
@@ -573,11 +573,10 @@ private struct FFmpegIntegrationInfoView: View {
 
   var body: some View {
     List {
-      Section("依赖验证") {
+      Section("组件信息") {
         LabeledContent("实际库版本", value: info.version)
-        LabeledContent("内存对象检查", value: info.allocationCheckPassed ? "通过" : "失败")
         LabeledContent("许可", value: info.license)
-        Text("当前第 5 阶段已接入独立原生渲染、显示阻塞恢复及 HDR10/HLG 像素输出，可在播放详情中打开无声验证入口。日常播放仍使用 AVPlayer / VLC。以下列表表示编译进库的能力，不代表设备已验证硬解。")
+        Text("默认使用 FFmpeg 播放，必要时自动尝试兼容内核。以下是组件编译能力；当前实际内核、解码和输出状态可在播放详情中查看。")
           .font(.caption).foregroundStyle(.secondary)
       }
       Section("已编译解码器") { Text(info.decoders.joined(separator: ", ")).textSelection(.enabled) }
@@ -595,6 +594,6 @@ private struct FFmpegIntegrationInfoView: View {
         }
       }
     }
-    .navigationTitle("FFmpeg 集成信息")
+    .navigationTitle("FFmpeg 开源信息")
   }
 }

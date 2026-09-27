@@ -4,8 +4,9 @@ set -euo pipefail
 command -v ffmpeg >/dev/null || brew install ffmpeg
 MEDIA="$RUNNER_TEMP/cineva-preview-media"
 mkdir -p "$MEDIA"
-ffmpeg -hide_banner -loglevel error -y -f lavfi -i 'testsrc2=size=320x180:rate=24:duration=6' \
-  -f lavfi -i 'sine=frequency=440:duration=6' -vf "drawtext=fontfile=/System/Library/Fonts/Supplemental/Arial.ttf:text='%{n}':x=10:y=10:fontsize=24:fontcolor=white" -c:v libx264 -g 120 -bf 3 -c:a aac \
+python3 Tests/PlayerTransport/preview_frames.py "$MEDIA/frames"
+ffmpeg -hide_banner -loglevel error -y -framerate 24 -i "$MEDIA/frames/%03d.ppm" \
+  -f lavfi -i 'sine=frequency=440:duration=6' -c:v libx264 -pix_fmt yuv420p -g 120 -bf 3 -c:a aac \
   -movflags +faststart "$MEDIA/bframes.mp4"
 ffmpeg -hide_banner -loglevel error -y -i "$MEDIA/bframes.mp4" -c copy "$MEDIA/longgop.mkv"
 ffmpeg -hide_banner -loglevel error -y -i "$MEDIA/bframes.mp4" -c:v libx265 -x265-params log-level=error \
@@ -14,6 +15,12 @@ ffmpeg -hide_banner -loglevel error -y -i "$MEDIA/bframes.mp4" -r 24000/1001 -c:
 ffmpeg -hide_banner -loglevel error -y -i "$MEDIA/bframes.mp4" -vf "select='if(lt(t,3),1,not(mod(n,2)))'" \
   -fps_mode vfr -c:v libx264 -c:a copy "$MEDIA/vfr.mp4"
 ffmpeg -hide_banner -loglevel error -y -i "$MEDIA/bframes.mp4" -an -c:v copy "$MEDIA/noaudio.mp4"
+ffmpeg -hide_banner -loglevel error -y -i "$MEDIA/bframes.mp4" -c copy -metadata:s:v rotate=90 "$MEDIA/rotated.mp4"
+ffmpeg -hide_banner -loglevel error -y -i "$MEDIA/bframes.mp4" -c copy -output_ts_offset 2 "$MEDIA/origin.mp4"
+printf '1\n00:00:01,000 --> 00:00:05,000\nFixture subtitles\n' > "$MEDIA/text.srt"
+ffmpeg -hide_banner -loglevel error -y -i "$MEDIA/bframes.mp4" -i "$MEDIA/text.srt" -map 0 -map 1 -c copy -c:s srt "$MEDIA/subtitles.mkv"
+ffmpeg -hide_banner -loglevel error -y -f lavfi -i 'color=c=blue:size=3840x2160:rate=24:duration=6' \
+  -f lavfi -i 'sine=frequency=440:duration=6' -c:v libx264 -preset ultrafast -g 24 -c:a aac "$MEDIA/4k.mp4"
 python3 Tests/PlayerTransport/range_server.py --port-file "$RUNNER_TEMP/preview-port" --media-dir "$MEDIA" &
 SERVER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT

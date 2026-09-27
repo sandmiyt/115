@@ -1,14 +1,13 @@
 import Foundation
 import CinevaFFmpeg
 
-/// Dependency capabilities only. Actual Phase 3 demux/decode is implemented in
+/// Dependency capabilities only. Playback demux/decode is implemented in
 /// FFmpegPlayerEngine, independently of AVPlayer and VLC.
 enum FFmpegRuntime {
   struct BuildInfo {
     let version: String
     let license: String
     let configuration: String
-    let allocationCheckPassed: Bool
     let decoders: [String]
     let videoToolboxConfigurations: [String]
     let demuxers: [String]
@@ -22,7 +21,6 @@ enum FFmpegRuntime {
       version: String(cString: CinevaFFmpegVersion()),
       license: String(cString: CinevaFFmpegLicense()),
       configuration: String(cString: CinevaFFmpegConfiguration()),
-      allocationCheckPassed: CinevaFFmpegRuntimeCheck() == 1,
       decoders: names.filter { name in name.withCString { CinevaFFmpegHasDecoder($0) == 1 } },
       videoToolboxConfigurations: names.filter { name in name.withCString { CinevaFFmpegHasVideoToolbox($0) == 1 } },
       demuxers: formats.filter { name in name.withCString { CinevaFFmpegHasDemuxer($0) == 1 } }

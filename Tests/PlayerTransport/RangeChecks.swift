@@ -70,6 +70,17 @@ private final class PendingRangeRead: @unchecked Sendable {
     coalesced.cancelPreview(sharing)
     expect(read(coalesced,16384)>0 && coalesced.statistics.requests==requests,"Cancellation retains coalesced primary flight")
     coalesced.close()
+    let retryShare=client("/retry-503?preview-owner-cancel")
+    let sharedToken=retryShare.makePreviewToken(), owner=PendingRangeRead(), follower=PendingRangeRead()
+    owner.start(retryShare,at:23456,generation:sharedToken)
+    for _ in 0..<100 where retryShare.statistics.recovery?.attempts.first?.plannedWait == nil || retryShare.statistics.recovery?.attempts.first?.plannedWait == 0 { Thread.sleep(forTimeInterval:0.01) }
+    follower.start(retryShare,at:23456)
+    for _ in 0..<100 where retryShare.statistics.coalesced<1 { Thread.sleep(forTimeInterval:0.01) }
+    retryShare.cancelPreview(sharedToken)
+    expect(owner.done.wait(timeout:.now()+1) == .success && owner.result == -3,"Cancelled retry owner wakes immediately")
+    expect(follower.done.wait(timeout:.now()+4) == .success && (follower.result ?? -1)>0 && follower.validBytes,"Primary takes over coalesced backoff")
+    expect(retryShare.statistics.requests==2 && retryShare.statistics.terminalFailure==nil,"Shared 503 uses one retry, no duplicate request or primary failure")
+    retryShare.close()
     for (path,requests) in [("/retry-once",2),("/retry-twice",3),("/retry-502",2),("/retry-504",2)] {
       let c=client(path)
       expect(read(c,12345)>0,"Transient status must recover inside custom AVIO")

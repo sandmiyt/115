@@ -340,6 +340,12 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     }
     return error
   }
+  private func flight(at offset:Int64,reader:Int32) -> Flight? {
+    flights.values.first {
+      $0.start<=offset && offset<=$0.end && ($0.error==0 || $0.readers.contains(reader) ||
+        ([-1,-2,-10,-11].contains($0.error) && $0.recovery.outcome=="recovering"))
+    }
+  }
   /// Returns 0 only after HTTP confirms EOF. Negative outcomes retain typed evidence.
   func read(offset:Int64, buffer:UnsafeMutablePointer<UInt8>, count:Int, generation wanted:Int32) -> Int32 {
     condition.lock()
@@ -383,14 +389,14 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
           result=Int32(n); return result
         }
       }
-      let active=flights.values.first(where: { $0.start<=offset && offset<=$0.end && ($0.error==0 || $0.readers.contains(wanted)) })
+      let active=flight(at:offset,reader:wanted)
       let budget=active.map { $0.recovery.hadFailure && $0.recovery.outcome=="recovering" ? min(deadline,$0.recovery.started+9) : deadline } ?? continuation.map { min(deadline,$0.started+9) } ?? deadline
       if ProcessInfo.processInfo.systemUptime>=budget {
         let f=active ?? Flight(start:offset,end:offset,generation:wanted)
         f.recovery.reason="total-budget"
         issue(.timeout,flight:f,code:-2); result=terminate(f,reader:wanted); return result
       }
-      if let f=flights.values.first(where: { $0.start<=offset && offset<=$0.end && ($0.error==0 || $0.readers.contains(wanted)) }) {
+      if let f=flight(at:offset,reader:wanted) {
         f.readers.insert(wanted)
         if !cacheEnabled, offset<f.consumedThrough {
           f.task?.cancel(); if let id=f.task?.taskIdentifier { flights.removeValue(forKey:id) }; continue
@@ -413,20 +419,21 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
             cycle.hadFailure=true; publishRecovery(cycle)
             let budget=min(deadline,cycle.started+9)
             let backoff=f.error == -11 ? Double(cycle.attempts.count) : 0.25*pow(2,Double(cycle.attempts.count-1))
-            let delay=max(backoff,f.retryAfter ?? 0)
+            let waited=cycle.attempts[f.attemptIndex].actualWait
+            let delay=max(0,max(backoff,f.retryAfter ?? 0)-waited)
             if cycle.attempts.count>=3 || ProcessInfo.processInfo.systemUptime+delay>=budget {
               cycle.reason=cycle.attempts.count>=3 ? "attempt-limit" : "retry-after-exceeds-budget"
               result=terminate(f,reader:wanted); return result
             }
             f.retryPending=true // One waiter owns the retry; other readers coalesce.
-            cycle.attempts[f.attemptIndex].plannedWait=delay
+            cycle.attempts[f.attemptIndex].plannedWait=waited+delay
             let waitStart=ProcessInfo.processInfo.systemUptime, until=waitStart+delay
             publishRecovery(cycle)
             while valid(wanted) && fatalError==nil && ProcessInfo.processInfo.systemUptime<until {
               _=condition.wait(until:Date(timeIntervalSinceNow:min(0.1,until-ProcessInfo.processInfo.systemUptime)))
-              cycle.attempts[f.attemptIndex].actualWait=ProcessInfo.processInfo.systemUptime-waitStart
+              cycle.attempts[f.attemptIndex].actualWait=waited+ProcessInfo.processInfo.systemUptime-waitStart
             }
-            cycle.attempts[f.attemptIndex].actualWait=ProcessInfo.processInfo.systemUptime-waitStart
+            cycle.attempts[f.attemptIndex].actualWait=waited+ProcessInfo.processInfo.systemUptime-waitStart
             publishRecovery(cycle)
             if !valid(wanted) {
               f.retryPending=false
