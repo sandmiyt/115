@@ -51,8 +51,21 @@ import Foundation
     expect(read(changed,2*1048576)==(-4),"Changed ETag rejected"); changed.close()
     let refreshed=client("/expired",refresh:{ source("/ok") })
     expect(read(refreshed,0)>0 && refreshed.statistics.refreshes==1,"Single expired URL refresh"); refreshed.close()
-    let redirect=client("/redirect",headers:["Authorization":"secret","Cookie":"private","X-Private":"private"])
+    let redirect=client("/redirect",headers:["Authorization":"secret","Cookie":"private","X-Private":"private", "uSeR-aGeNt":"Cineva-iOS/2.0", "Referer":"https://private.invalid/?token=secret", "Origin":"https://private.invalid"])
     expect(read(redirect,0)>0,"Cross-origin redirect strips credentials"); redirect.close()
+    for path in ["/short64", "/short10"] {
+      let c=client(path)
+      var offset:Int64=0
+      while offset<size {
+        let n=read(c,offset,65536)
+        expect(n>0,"Short 206 continues from actual coverage at \(offset)")
+        offset+=Int64(n)
+      }
+      expect(read(c,size)==0,"Short 206 verified EOF")
+      expect(read(c,7777)>0 && read(c,2*1048576+37)>0,"Short 206 backward/random reads")
+      expect(c.statistics.requests<400,"Short 206 finite request count")
+      c.close()
+    }
     let slow=client("/slow"), before=Date()
     expect(read(slow,0)>0 && Date().timeIntervalSince(before)<1,"Incremental bytes before full block")
     slow.changeGeneration(2)

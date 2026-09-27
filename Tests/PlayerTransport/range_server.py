@@ -23,7 +23,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(302)
             self.send_header("Location", f"http://localhost:{self.server.server_port}/credential-check")
             self.send_header("Content-Length", "0"); self.end_headers(); return
-        if path == "/credential-check" and any(self.headers.get(k) for k in ("Authorization", "Cookie", "X-Private")):
+        if path == "/credential-check" and (self.headers.get("User-Agent") != "Cineva-iOS/2.0" or any(self.headers.get(k) for k in ("Authorization", "Cookie", "X-Private", "Referer", "Origin"))):
             self.send_response(400); self.send_header("Content-Length", "0"); self.end_headers(); return
         first, last = self.headers.get("Range", "bytes=0-").removeprefix("bytes=").split("-")
         start = int(first); total = 131072 if path == "/small200" else SIZE
@@ -31,6 +31,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/416" or start >= total:
             self.send_response(416); self.send_header("Content-Range", f"bytes */{total}")
             self.send_header("Content-Length", "0"); self.end_headers(); return
+        if path in ("/short64", "/short10"):
+            end = min(end, start + (65536 if path == "/short64" else 10000) - 1)
         status = 200 if path in ("/bad200", "/small200") else 206
         if status == 200: start, end = 0, total - 1
         self.send_response(status); self.send_header("Content-Length", str(end - start + 1))
