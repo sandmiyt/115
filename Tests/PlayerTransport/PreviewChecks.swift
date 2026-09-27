@@ -79,6 +79,41 @@ import CoreImage
       }
       expect(video && (audio || file=="noaudio.mp4"),"Primary demux/video/PCM preserved; this does NOT prove audible iPhone output")
       if file=="subtitles.mkv" { expect(CinevaFFmpegSessionSubtitleTrackCount(primary.pointer)>0,"Subtitle enumeration survives preview isolation") }
+      if file=="bframes.mp4" {
+        let localRoot=FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at:localRoot) }
+        let disk=SegmentDiskCache(root:localRoot)
+        let identity=RangeCacheIdentity(account:"offline-fixture",fileID:file,size:io.fileSize,
+          validator:"sha1:"+String(repeating:"c",count:40))
+        let fill=RangeCoordinator(source:source,identity:identity,disk:disk)
+        var probe=[UInt8](repeating:0,count:4096)
+        expect(fill.read(offset:0,buffer:&probe,count:probe.count,generation:1)>0,"Offline fixture begins incrementally")
+        fill.allowPrefetch(true)
+        for _ in 0..<300 where !fill.mediaCacheProgress.complete { try? await Task.sleep(for:.milliseconds(50)) }
+        expect(fill.mediaCacheProgress.complete,"Independent fixture fill reaches all media bytes")
+        fill.close(); disk.flush()
+        for target in [0.0,3.0,5.3] {
+          let offlineSource=VideoSource(id:file,title:file,definition:0,
+            url:URL(string:"cineva-cache://media/offline")!,kind:.original,headers:[:])
+          let local=RangeCoordinator(source:offlineSource,identity:identity,disk:SegmentDiskCache(root:localRoot))
+          var localOptions=CinevaFFmpegSessionOptions(); localOptions.outputAudio=1; localOptions.attach(local)
+          let localPointer=offlineSource.url.absoluteString.withCString { CinevaFFmpegSessionCreate($0,"",target,localOptions) }!
+          let localHandle=FFmpegSessionHandle(localPointer,io:local)
+          var gotVideo=false,gotPCM=false
+          let limit=ProcessInfo.processInfo.systemUptime+10
+          while ProcessInfo.processInfo.systemUptime<limit && (!gotVideo || !gotPCM) {
+            var pts=0.0,frameDuration=0.0,serial:Int32=0
+            if CinevaFFmpegSessionCopyFrame(localHandle.pointer,&pts,&frameDuration,&serial) != nil { gotVideo=true }
+            var pcm=[Float](repeating:0,count:131072)
+            let count=CinevaFFmpegSessionCopyAudio(localHandle.pointer,&pcm,65536,&pts,&serial)
+            if count>0 { gotPCM = gotPCM || pcm.prefix(Int(count)*2).contains { abs($0)>0.00001 } }
+            try? await Task.sleep(for:.milliseconds(10))
+          }
+          expect(gotVideo && gotPCM,"Offline FFmpeg head/middle/tail video and non-silent PCM at \(target)")
+          expect(local.statistics.requests==0,"Offline native session makes zero HTTP requests")
+          local.close()
+        }
+      }
       io.close()
     }
     print("Native FFmpeg preview checks passed: \(checks); simulator fixture decoding only, NOT physical-device performance")

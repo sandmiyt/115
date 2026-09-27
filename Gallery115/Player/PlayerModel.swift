@@ -283,6 +283,11 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
     defer { isPreparing = false }
 
     do {
+      if external, let local=await FFmpegPlayerEngine.cachedSource(for:item) {
+        try Task.checkCancellation()
+        sources=[local]; await play(local,allowFallback:false)
+        return
+      }
       let initial = try await api.initialVideoSources(for: item, preferOriginal: defaultQuality == .original)
       try Task.checkCancellation()
       sources = initial.sources
@@ -306,6 +311,21 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
     } catch {
       guard !Task.isCancelled else { return }
       errorMessage = error.localizedDescription
+    }
+  }
+
+  func resolveCachedSourceForExternalEngine() async -> Bool {
+    guard selectedSource?.url.scheme=="cineva-cache" else { return true }
+    do {
+      let response=try await api.initialVideoSources(for:item,preferOriginal:true)
+      try Task.checkCancellation()
+      guard let original=response.sources.first(where: \.isOriginal) else { return false }
+      sources=response.sources
+      await play(original,allowFallback:false,autoplay:false,resumeAt:currentTime)
+      return true
+    } catch {
+      if !Task.isCancelled { errorMessage="该播放方式需要在线获取地址："+error.localizedDescription }
+      return false
     }
   }
 

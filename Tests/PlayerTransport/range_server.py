@@ -51,7 +51,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/credential-check" and (self.headers.get("User-Agent") != "Cineva-iOS/2.0" or any(self.headers.get(k) for k in ("Authorization", "Cookie", "X-Private", "Referer", "Origin"))):
             self.send_response(400); self.send_header("Content-Length", "0"); self.end_headers(); return
         first, last = self.headers.get("Range", "bytes=0-").removeprefix("bytes=").split("-")
-        start = int(first); total = 131072 if path == "/small200" else SIZE
+        start = int(first); total = 131072 if path == "/small200" else (576 * 1048576 + 97 if path == "/large" else SIZE)
         end = min(int(last) if last else total - 1, total - 1)
         if path.startswith("/retry-"):
             key = (self.path, start)
@@ -103,7 +103,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("ETag", '"v2"' if changed else '"v1"')
         self.end_headers()
         for pos in range(start, end + 1, 16384):
-            self.wfile.write(bytes(i % 251 for i in range(pos, min(pos + 16384, end + 1))))
+            count = min(16384, end + 1 - pos)
+            pattern = bytes(range(251)) * 67
+            self.wfile.write(pattern[pos % 251:pos % 251 + count])
             self.wfile.flush()
             if path == "/cut":
                 self.connection.shutdown(socket.SHUT_RDWR); self.connection.close(); return

@@ -276,6 +276,94 @@ private final class PendingRangeRead: @unchecked Sendable {
     expect(RangeCoordinator.contentRange("bytes 0-9/9")==nil,"End outside total")
     expect(RangeCoordinator.contentRange("bytes -1-5/9")==nil,"Negative syntax is not silently stripped")
     expect(RangeCoordinator.contentRange("bytes +0-5/9")==nil,"Range requires decimal digits")
+    let priority=client("/slow?priority")
+    expect(read(priority,0)>0,"Prime foreground before prefetch priority check")
+    for _ in 0..<400 where priority.statistics.memoryBytes<1048576 { Thread.sleep(forTimeInterval:0.01) }
+    priority.allowPrefetch(true)
+    for _ in 0..<400 where priority.statistics.requests<2 { Thread.sleep(forTimeInterval:0.01) }
+    expect(priority.statistics.requests==2,"Independent prefetch begins without decoder reads")
+    let priorityAt=ProcessInfo.processInfo.systemUptime
+    priority.changeGeneration(2)
+    expect(read(priority,2*1048576,4096,2)>0,"Final seek preempts unrelated slow prefetch")
+    expect(ProcessInfo.processInfo.systemUptime-priorityAt<1,"Speculative range cannot occupy foreground seek slot")
+    expect(read(priority,0,4096,2)>0,"Seek retains completed head bytes")
+    priority.close()
+    let resumeRoot=root.appendingPathComponent("resume")
+    let resumeDisk=SegmentDiskCache(root:resumeRoot)
+    let resumeIdentity=RangeCacheIdentity(account:"resume",fileID:"movie",size:size,
+      validator:"sha1:"+String(repeating:"b",count:40))
+    let partial=RangeCoordinator(source:source("/ok"),identity:resumeIdentity,disk:resumeDisk)
+    expect(read(partial,0)>0,"Prime persistent partial media")
+    for _ in 0..<200 where partial.statistics.memoryBytes<1048576 { Thread.sleep(forTimeInterval:0.01) }
+    partial.close(); resumeDisk.flush()
+    let resumedDisk=SegmentDiskCache(root:resumeRoot)
+    expect(resumedDisk.restored(identity:resumeIdentity.key)?.complete==false,"Partial manifest is not complete")
+    let resumed=RangeCoordinator(source:source("/ok"),identity:resumeIdentity,disk:resumedDisk)
+    expect(read(resumed,0)>0 && resumed.statistics.requests==0,"Partial reopen serves verified old head without redownload")
+    resumed.allowPrefetch(true)
+    for _ in 0..<200 where !resumed.mediaCacheProgress.complete { Thread.sleep(forTimeInterval:0.05) }
+    expect(resumed.mediaCacheProgress.complete && resumed.statistics.networkBytes==size-1048576,"Resume fills only persistent gaps")
+    resumed.close()
+    // Real disk and local HTTP, >512 MiB. No playback reads are used to drive
+    // completion after the initial/seek windows: this models same-page pause.
+    let largeSize:Int64=576*1048576+97
+    let largeRoot=root.appendingPathComponent("large")
+    let largeDisk=SegmentDiskCache(root:largeRoot,capacity:{ 2*1073741824 },freeSpace:{ 8*1073741824 })
+    let identity=RangeCacheIdentity(account:"large-test",fileID:"movie",size:largeSize,
+      validator:"sha1:"+String(repeating:"a",count:40))
+    let large=RangeCoordinator(source:source("/large"),identity:identity,disk:largeDisk)
+    let coldAt=ProcessInfo.processInfo.systemUptime
+    expect(read(large,0)>0,"Large file starts incrementally")
+    let coldMS=(ProcessInfo.processInfo.systemUptime-coldAt)*1000
+    for _ in 0..<200 where large.statistics.memoryBytes<1048576 { Thread.sleep(forTimeInterval:0.01) }
+    let warmAt=ProcessInfo.processInfo.systemUptime
+    expect(read(large,12345)>0,"Seek cached head")
+    let warmMS=(ProcessInfo.processInfo.systemUptime-warmAt)*1000
+    large.changeGeneration(2)
+    let seekAt=ProcessInfo.processInfo.systemUptime
+    expect(read(large,350*1048576+123,4096,2)>0,"Uncached final seek gets foreground request")
+    let seekMS=(ProcessInfo.processInfo.systemUptime-seekAt)*1000
+    for _ in 0..<200 where large.statistics.memoryBytes<2*1048576 { Thread.sleep(forTimeInterval:0.01) }
+    large.allowPrefetch(true)
+    let completionDeadline=ProcessInfo.processInfo.systemUptime+240
+    var previous:Int64=0
+    while !large.mediaCacheProgress.complete && ProcessInfo.processInfo.systemUptime<completionDeadline {
+      Thread.sleep(forTimeInterval:0.2)
+      let progress=large.mediaCacheProgress
+      expect(progress.bytes>=previous,"Active file cannot self-evict earlier pages")
+      previous=progress.bytes
+      expect(large.statistics.memoryBytes<=32*1048576,"Whole-file fill has bounded memory")
+      if let problem=progress.limitation { preconditionFailure(problem) }
+    }
+    expect(large.mediaCacheProgress.complete && large.mediaCacheProgress.bytes==largeSize,"Paused prefetch passes 512 MiB and completes every byte")
+    expect(large.statistics.networkBytes<=largeSize+2*1048576,"Gap fill does not redownload cached ranges")
+    large.close(); largeDisk.flush()
+    let reopenedDisk=SegmentDiskCache(root:largeRoot,capacity:{ 2*1073741824 },freeSpace:{ 8*1073741824 })
+    expect(reopenedDisk.restored(identity:identity.key)?.complete==true,"Persisted identity, length and complete coverage survive reopening")
+    // An unreachable URL proves neither URL refresh nor remote I/O is required.
+    let offline=RangeCoordinator(source:source("/expired"),identity:identity,disk:reopenedDisk)
+    for offset in [Int64(0),largeSize/2,largeSize-4096] { expect(read(offline,offset)>0,"Offline head/middle/tail bytes") }
+    expect(offline.statistics.requests==0 && offline.statistics.diskHitBytes>0,"Fully cached AVIO never opens network")
+    offline.close()
+    let block=largeRoot.appendingPathComponent("\(identity.key)-0.block")
+    var corrupt=try Data(contentsOf:block); corrupt[40] ^= 0xff; try corrupt.write(to:block,options:.atomic)
+    let checkedDisk=SegmentDiskCache(root:largeRoot)
+    expect(checkedDisk.restored(identity:identity.key)?.complete==false,"Corruption invalidates complete coverage, no historical maximum")
+    expect(checkedDisk.read(key:identity.key,offset:0,length:65536)==nil,"Corrupt page is never served")
+    for lowSpace in [false,true] {
+      let limitedDisk=SegmentDiskCache(root:root.appendingPathComponent(UUID().uuidString),
+        capacity:{ lowSpace ? 2*1073741824 : 8*1048576 },freeSpace:{ lowSpace ? 1073741824+2*1048576 : 8*1073741824 })
+      let limited=RangeCoordinator(source:source("/large"),identity:identity,disk:limitedDisk)
+      expect(read(limited,0)>0,"Limited capacity still streams normally")
+      limited.allowPrefetch(true)
+      for _ in 0..<100 where limited.mediaCacheProgress.limitation==nil { Thread.sleep(forTimeInterval:0.05) }
+      expect(limited.mediaCacheProgress.limitation != nil,"Insufficient quota/free space is visible")
+      let count=limited.statistics.requests; Thread.sleep(forTimeInterval:0.5)
+      expect(limited.statistics.requests==count,"No speculative download when whole file cannot fit")
+      expect(read(limited,10*1048576)>0,"Foreground seek survives insufficient cache capacity")
+      limited.close()
+    }
+    print(String(format:"Local HTTP byte-read timing only: cold %.2f ms; cached seek %.2f ms; uncached seek %.2f ms",coldMS,warmMS,seekMS))
     let epoch=disk.epoch
     disk.clear()
     disk.write(Data([1,2,3]),key:"old",offset:0,epoch:epoch)

@@ -108,11 +108,43 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   @ObservationIgnored private let toneMapper = FFmpegSDRToneMapper()
   private(set) var toneMappedSDR = false
 
+  static func cacheIdentity(for item:CloudItem)->RangeCacheIdentity {
+    let scope: String
+    if MediaSourceSelectionStore.shared.resolvedSource == .cloud115 {
+      // Account API has no stable user identifier in the current auth model.
+      // Hash the authenticated session, sacrificing reuse after rotation rather
+      // than sharing cached private bytes between accounts.
+      let token=Cloud115SessionStore.shared.session?.refreshToken ?? UUID().uuidString
+      scope="115-session:"+SHA256.hash(data:Data(token.utf8)).map { String(format:"%02x",$0) }.joined()
+    } else { scope=ThumbnailService.currentNamespace() }
+    return RangeCacheIdentity(account:scope,fileID:item.id,size:item.size,
+      validator:item.sha1.isEmpty ? "" : "sha1:"+item.sha1.lowercased())
+  }
+  static func cachedSource(for item:CloudItem) async -> VideoSource? {
+    let identity=cacheIdentity(for:item)
+    guard identity.isPersistent else { return nil }
+    let complete=await Task.detached(priority:.userInitiated) {
+      SegmentDiskCache.shared.restored(identity:identity.key)?.complete == true
+    }.value
+    guard complete,!Task.isCancelled else { return nil }
+    return VideoSource(id:"offline-"+identity.key,title:"原画 · 本地缓存",definition:0,
+      url:URL(string:"cineva-cache://media/"+identity.key)!,kind:.original,headers:[:])
+  }
+  private(set) var mediaCacheProgress=MediaCacheProgress()
+  var mediaCacheText:String {
+    let p=mediaCacheProgress
+    if let message=p.limitation { return message+" · 已缓存 \(ByteCountFormatter.string(fromByteCount:p.bytes,countStyle:.file))" }
+    guard p.total>0 else { return "正在确认视频缓存" }
+    let size=ByteCountFormatter.string(fromByteCount:p.bytes,countStyle:.file)
+    let total=ByteCountFormatter.string(fromByteCount:p.total,countStyle:.file)
+    return p.complete ? (p.persistent ? "整片已缓存 · \(total)" : "本次播放已全部落盘 · \(total)")
+      : "已缓存 \(size) / \(total) · \(Int(Double(p.bytes)/Double(p.total)*100))%"+(p.persistent ? "" : " · 重开需在线验证")
+  }
   func start(source: VideoSource, item: CloudItem, api: APIClient, library: LibraryStore,
              at position: Double, playing: Bool = true, useCache: Bool = true, preferHardware: Bool = true,
              recordsHistory: Bool = true, inputBackend: FFmpegInputBackend? = nil, startupOrigin:Double? = nil) {
     stop()
-    sessionID=UUID()
+    sessionID=UUID(); mediaCacheProgress=MediaCacheProgress()
     self.inputBackend=inputBackend ?? PlaybackPolicy.input(for:source)
     self.recordsHistory=recordsHistory
     currentSource=source; sourceItem=item; self.api=api; self.library=library
@@ -139,16 +171,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     var options = CinevaFFmpegSessionOptions()
     options.preferHardware=preferHardware ? 1 : 0; options.videoOnly=0; options.outputAudio=1
     if self.inputBackend != .ffmpegHTTP {
-      let scope: String
-      if MediaSourceSelectionStore.shared.resolvedSource == .cloud115 {
-        // Account API has no stable user identifier in the current auth model.
-        // Hash the authenticated session, sacrificing reuse after rotation rather
-        // than sharing cached private bytes between accounts.
-        let token=Cloud115SessionStore.shared.session?.refreshToken ?? UUID().uuidString
-        scope="115-session:"+SHA256.hash(data:Data(token.utf8)).map { String(format:"%02x",$0) }.joined()
-      } else { scope=ThumbnailService.currentNamespace() }
-      let identity=RangeCacheIdentity(account:scope,fileID:item.id,size:item.size,
-        validator:item.sha1.isEmpty ? "" : "sha1:"+item.sha1.lowercased())
+      let identity=Self.cacheIdentity(for:item)
       audioPreferenceKey="cineva.ffmpeg.audio."+identity.key
       let coordinator=RangeCoordinator(source:source,identity:identity,cacheEnabled:self.inputBackend == .customAVIOCached,refresh:{
         let response=try await api.initialVideoSources(for:item,preferOriginal:true)
@@ -183,6 +206,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     audio.stop(); renderer.reset(to:currentTime); pending=nil
     handle=nil; cache?.close(); cache=nil
     observers.forEach(NotificationCenter.default.removeObserver); observers.removeAll()
+    mediaCacheProgress=MediaCacheProgress()
     playbackState = .stopped
   }
   func pause() {
@@ -218,6 +242,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     resetSubtitleImage()
     toneMapTask?.cancel(); toneMapTask=nil; pendingToneMapped=false
     guard let handle, seconds.isFinite else { return }
+    cache?.allowPrefetch(false)
     target=min(max(0,seconds),duration>0 ? max(0,duration-0.01) : max(0,seconds))
     // Stop already scheduled old audio before publishing a new generation.
     audio.pause(); renderer.setPlaying(false)
@@ -230,6 +255,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   func replayFromStart() { wantsPlayback=true; seek(to:0) }
   func beginInteractiveScrub() -> Bool {
     guard !scrubbing else { return scrubIntent }
+    cache?.allowPrefetch(false)
     scrubIntent=wantsPlayback; scrubbing=true
     audio.pause(); renderer.setPlaying(false) // Keep PCM, frame queues and real position.
     wantsPlayback=false; isInteractiveScrubLoading=false
@@ -333,6 +359,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     if lastFailure?.session != sessionID {
       var snapshot=CinevaFFmpegSnapshot()
       if let handle { CinevaFFmpegSessionSnapshot(handle.pointer,&snapshot) }
+      if let cache { mediaCacheProgress=cache.mediaCacheProgress }
       let io=cache?.statistics
       let function=withUnsafeBytes(of:snapshot.failureFunction) { String(decoding:$0.prefix { $0 != 0 },as:UTF8.self) }
       let build="\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"))"
@@ -538,7 +565,11 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     if isPlaying, let began=uninterruptedAt, now-began>=1, !hasAudio || audioRenderedAt != nil,
       displayReadyAt != nil, stableAt==nil { stableAt=now }
 
-    if now-lastPublished>=0.25 {
+    // Playback gating always uses decoded A/V continuity. UI only uses durable
+    // file coverage, coalesced independently of packet -> frame/PCM handoffs.
+    cache?.allowPrefetch(!scrubbing && ((!waiting && bufferedDuration>=2 && stableAt != nil)
+      || (!wantsPlayback && renderer.anchored && playbackState != .seeking)))
+    if now-lastPublished>=0.2 {
       lastPublished=now
       if hasAudio, !waiting, wantsPlayback, !backgroundAudioOnly { renderer.disciplineClock(to:audio.audibleTime,rate:Double(rate)) }
       rotation=snapshot.rotation; videoSize=CGSize(width:Int(snapshot.width),height:Int(snapshot.height))
@@ -567,6 +598,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
         if let saved=UserDefaults.standard.string(forKey:key), saved != selectedAudioOptionID,
           tracks.contains(where: { $0.id==saved }) { selectAudio(saved); return }
       }
+      if let cache { mediaCacheProgress=cache.mediaCacheProgress }
       let io=cache?.statistics
       hasAtmosMetadata=snapshot.atmosMetadataDetected != 0
       let bytes=io?.networkBytes ?? 0
@@ -575,7 +607,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
       statistics=PlayerStatistics(backend:.ffmpeg,codec:String(cString:CinevaFFmpegCodecName(snapshot.videoCodec)),
         videoSize:videoSize,fps:snapshot.fps,hdrFormat:snapshot.colorTransfer==16 ? "PQ 标记" : snapshot.colorTransfer==18 ? "HLG 标记" : "SDR",
         networkMbps:io == nil ? nil : speed,downloadedBytes:io?.networkBytes,bufferedSeconds:bufferedDuration,
-        cachedBytes:io.map { Int64($0.memoryBytes) },decoder:snapshot.decoderType==2 ? "VideoToolbox" : "FFmpeg 软件解码",
+        cachedBytes:mediaCacheProgress.bytes,decoder:snapshot.decoderType==2 ? "VideoToolbox" : "FFmpeg 软件解码",
         renderer:"Apple Native + AVAudioEngine PCM",droppedFrames:renderer.droppedFrames,
         avSyncOffset:hasAudio ? renderer.time-audio.audibleTime : nil)
       func elapsed(_ time:Double?) -> String { time.map { String(format:"%.3f s",$0-clickAt) } ?? "尚未发生 / 不可获得" }

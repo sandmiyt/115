@@ -483,6 +483,7 @@ private struct PrivacySettingsView: View {
 }
 
 private struct CacheSettingsView: View {
+  @AppStorage("cineva.videoCache.capacityGiB") private var videoCacheGiB=0
   @Environment(AppState.self) private var appState
   @State private var statusMessage: String?
   @State private var showClearRecentsConfirmation = false
@@ -490,6 +491,14 @@ private struct CacheSettingsView: View {
 
   var body: some View {
     Form {
+      Section("视频缓存") {
+        Picker("容量上限",selection:$videoCacheGiB) {
+          Text("自动（保留 1 GB 可用空间）").tag(0)
+          ForEach([2,5,10,20,50,100],id:\.self) { Text("\($0) GB").tag($0) }
+        }
+        Text("空间和额度允许时，播放稳定或暂停后继续缓存当前整部原画视频。空间不足会停止额外下载，保留正常播放及已有区间。")
+          .font(.footnote).foregroundStyle(.secondary)
+      }
       Section("缓存") {
         if let artworkBytes {
           LabeledContent("本地封面", value: ByteCountFormatter.string(fromByteCount: artworkBytes, countStyle: .file))

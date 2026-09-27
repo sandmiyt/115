@@ -6,6 +6,10 @@ struct RangeCacheIdentity: Sendable {
   let fileID: String
   let size: Int64
   let validator: String
+  var isPersistent: Bool {
+    let hash=validator.lowercased()
+    return size>0 && hash.hasPrefix("sha1:") && hash.count==45 && hash.dropFirst(5).allSatisfy { $0.isHexDigit }
+  }
   var key: String {
     let fields = [account, fileID, String(size), validator]
     let encoded = fields.map { "\($0.utf8.count):\($0)" }.joined()
@@ -82,69 +86,223 @@ struct RangeStatistics: Sendable {
   }
 }
 
-/// Disk operations are serialized independently of network callbacks and never
-/// hold the coordinator condition. Only verified complete pages are persisted.
+/// Durable byte coverage, never inferred media-time coverage. All mutation is on
+/// the utility queue; admission is bounded before any Data is retained by it.
+struct MediaCacheProgress: Sendable, Equatable {
+  var bytes: Int64 = 0
+  var total: Int64 = 0
+  var complete = false
+  var persistent = false
+  var limitation: String?
+}
 final class SegmentDiskCache: @unchecked Sendable {
   static let shared = SegmentDiskCache()
-  private let queue = DispatchQueue(label: "cineva.segment.disk", qos: .utility)
-  private let limit: Int64 = 512 * 1024 * 1024
+  static let capacityPreference = "cineva.videoCache.capacityGiB"
+  private let queue = DispatchQueue(label:"cineva.segment.disk",qos:.utility)
+  private let admission = NSLock()
+  private var pendingBytes = 0
+  private let pendingLimit = 4*1048576
   private let root: URL
+  private let capacity: @Sendable () -> Int64
+  private let freeSpace: (@Sendable () -> Int64)?
+  private var revision: UInt64 = 0
+  private var leases: [String:Int] = [:]
+  private var records: [String:Record] = [:]
   private var entries: [URL:(Int64,Date)] = [:]
   private var indexed = false
-  private var revision: UInt64 = 0
+  private var invalidKeys:Set<String>=[]
+  private var writeFailures:[String:String]=[:]
+  private struct Record: Codable {
+    var identity: String
+    var total: Int64
+    var validator: String
+    var pages: Set<Int64> = []
+    var stamps:[Int64:TimeInterval] = [:]
+  }
   var epoch: UInt64 { queue.sync { revision } }
-  private func indexIfNeeded() {
+  init(root:URL? = nil, capacity:@escaping @Sendable () -> Int64 = {
+    Int64(UserDefaults.standard.integer(forKey:SegmentDiskCache.capacityPreference))*1073741824
+  }, freeSpace:(@Sendable () -> Int64)? = nil) {
+    self.root=root ?? FileManager.default.urls(for:.cachesDirectory,in:.userDomainMask)[0]
+      .appendingPathComponent("CinevaSegments-v2",isDirectory:true)
+    self.capacity=capacity; self.freeSpace=freeSpace
+  }
+  private func path(_ key:String,_ offset:Int64)->URL { root.appendingPathComponent("\(key)-\(offset).block") }
+  private func manifest(_ key:String)->URL { root.appendingPathComponent(key+".index") }
+  private func index() {
     guard !indexed else { return }; indexed=true
-    let files=(try? FileManager.default.contentsOfDirectory(at:root,includingPropertiesForKeys:[.fileSizeKey,.contentModificationDateKey])) ?? []
-    for file in files {
-      if let v=try? file.resourceValues(forKeys:[.fileSizeKey,.contentModificationDateKey]) {
-        entries[file]=(Int64(v.fileSize ?? 0),v.contentModificationDate ?? .distantPast)
+    for url in (try? FileManager.default.contentsOfDirectory(at:root,includingPropertiesForKeys:[.fileSizeKey,.contentModificationDateKey])) ?? [] {
+      if let v=try? url.resourceValues(forKeys:[.fileSizeKey,.contentModificationDateKey]) {
+        entries[url]=(Int64(v.fileSize ?? 0),v.contentModificationDate ?? .distantPast)
       }
     }
   }
-  init(root: URL? = nil) {
-    self.root = root ?? FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-      .appendingPathComponent("CinevaSegments-v1", isDirectory: true)
+  private func available() -> Int64 {
+    if let freeSpace { return freeSpace() }
+    let volume=(try? root.resourceValues(forKeys:[.volumeAvailableCapacityForImportantUsageKey]))?.volumeAvailableCapacityForImportantUsage
+    return volume ?? ((try? FileManager.default.attributesOfFileSystem(forPath:root.path)[.systemFreeSize]) as? NSNumber)?.int64Value ?? 0
   }
-  private func path(_ key: String, _ offset: Int64) -> URL { root.appendingPathComponent("\(key)-\(offset).block") }
-  func read(key: String, offset: Int64, length: Int) -> Data? {
-    queue.sync {
-      indexIfNeeded()
-      let file = path(key, offset)
-      guard let stored = try? Data(contentsOf: file), stored.count == length+32 else { return nil }
-      let data=stored.dropFirst(32)
-      guard Data(SHA256.hash(data:data))==stored.prefix(32) else {
-        try? FileManager.default.removeItem(at:file); entries.removeValue(forKey:file); return nil
+  private func load(_ key:String)->Record? {
+    guard !invalidKeys.contains(key) else { return nil }
+    if let record=records[key] { return record }
+    guard let data=try? Data(contentsOf:manifest(key)), data.count>32,
+      Data(SHA256.hash(data:data.dropFirst(32)))==data.prefix(32),
+      var record=try? JSONDecoder().decode(Record.self,from:data.dropFirst(32)), record.total>0 else { return nil }
+    // Atomic manifests may survive system cache purging; missing/short blocks
+    // are holes, never a complete file. Each read additionally checks its hash.
+    let oldPages=record.pages
+    record.pages=[]
+    for offset in oldPages {
+      guard offset>=0,offset%65536==0,offset<record.total else { continue }
+      let url=path(key,offset)
+      guard let info=try? url.resourceValues(forKeys:[.fileSizeKey,.contentModificationDateKey]),
+        info.fileSize==Int(min(65536,record.total-offset))+32 else { continue }
+      let stamp=info.contentModificationDate?.timeIntervalSince1970
+      if stamp != record.stamps[offset] {
+        guard let stored=try? Data(contentsOf:url),
+          Data(SHA256.hash(data:stored.dropFirst(32)))==stored.prefix(32) else { continue }
       }
-      try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: file.path)
-      entries[file]=(Int64(stored.count),Date())
-      return Data(data)
+      record.pages.insert(offset); record.stamps[offset]=stamp
+    }
+    records[key]=record; return record
+  }
+  private func save(_ record:Record,key:String) throws {
+    let data=try JSONEncoder().encode(record), stored=Data(SHA256.hash(data:data))+data
+    try stored.write(to:manifest(key),options:.atomic)
+    entries[manifest(key)]=(Int64(stored.count),Date()); records[key]=record
+  }
+  func invalidate(_ key:String) {
+    queue.async {
+      self.invalidKeys.insert(key); self.records.removeValue(forKey:key)
+      self.index()
+      for file in self.entries.keys where file.lastPathComponent.hasPrefix(key) {
+        try? FileManager.default.removeItem(at:file); self.entries.removeValue(forKey:file)
+      }
     }
   }
-  func write(_ data: Data, key: String, offset: Int64, epoch: UInt64) {
-    // Serial backpressure prevents unlimited pending page copies in the disk queue.
+  func acquire(_ key:String) { queue.async { self.leases[key,default:0]+=1 } }
+  func release(_ key:String) { queue.async { self.leases[key]=max(0,(self.leases[key] ?? 1)-1) } }
+  private func progress(_ record:Record?, persistent:Bool, limitation:String? = nil)->MediaCacheProgress {
+    guard let record else { return MediaCacheProgress(persistent:persistent,limitation:limitation) }
+    let bytes=record.pages.reduce(Int64(0)) { $0+min(65536,record.total-$1) }
+    return MediaCacheProgress(bytes:bytes,total:record.total,complete:bytes==record.total,
+      persistent:persistent,limitation:limitation)
+  }
+  // Evict other, inactive media only. The active file never evicts its own head.
+  private func room(for bytes:Int64, key:String)->Bool {
+    index()
+    let limit=capacity(), reserve:Int64=1073741824
+    let protected=entries.filter { entry in
+      let owner=String(entry.key.lastPathComponent.prefix(64))
+      return owner==key || (leases[owner] ?? 0)>0
+    }.values.reduce(Int64(0)) { $0+$1.0 }
+    if limit>0,protected+bytes>limit { return false }
+    func enough()->Bool {
+      let used=entries.values.reduce(Int64(0)) { $0+$1.0 }
+      return available()>=bytes+reserve && (limit<=0 || used+bytes<=limit)
+    }
+    if enough() { return true }
+    for entry in entries.filter({ entry in
+      let owner=String(entry.key.lastPathComponent.prefix(64))
+      return owner != key && (leases[owner] ?? 0)==0
+    }).sorted(by: { $0.value.1<$1.value.1 }).prefix(64) {
+      let owner=String(entry.key.lastPathComponent.prefix(64))
+      guard owner != key, (leases[owner] ?? 0)==0 else { continue }
+      if (try? FileManager.default.removeItem(at:entry.key)) != nil {
+        entries.removeValue(forKey:entry.key); records.removeValue(forKey:owner)
+      }
+      if enough() { return true }
+    }
+    return enough()
+  }
+  func inspect(key:String,identity:String,total:Int64,validator:String,persistent:Bool,
+               reserveWhole:Bool = false)->(MediaCacheProgress,Set<Int64>) {
     queue.sync {
-      guard epoch == revision else { return }
-      let fm = FileManager.default
-      indexIfNeeded()
-      try? fm.createDirectory(at: root, withIntermediateDirectories: true)
-      var excluded = root
-      var values = URLResourceValues(); values.isExcludedFromBackup = true
-      try? excluded.setResourceValues(values)
-      let file=path(key,offset), stored=Data(SHA256.hash(data:data))+data
-      guard (try? stored.write(to:file,options:.atomic)) != nil else { return }
-      entries[file]=(Int64(stored.count),Date())
-      var total=entries.values.reduce(Int64(0)) { $0+$1.0 }
-      if total>limit {
-        for entry in entries.sorted(by: { $0.value.1<$1.value.1 }) where total>limit {
-          if (try? fm.removeItem(at:entry.key)) != nil { total-=entry.value.0; entries.removeValue(forKey:entry.key) }
+      try? FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
+      let record=load(key) ?? Record(identity:identity,total:total,validator:validator)
+      guard record.identity==identity,record.total==total,record.validator==validator else {
+        return (MediaCacheProgress(limitation:"媒体身份不匹配，停止额外下载"),[])
+      }
+      records[key]=record
+      let bytes=record.pages.reduce(Int64(0)) { $0+min(65536,total-$1) }
+      let missing=max(0,total-bytes), overhead=(missing/65536+1)*128+1048576
+      let limited=reserveWhole && !room(for:missing+overhead,key:key)
+      let message=limited ? "空间或视频缓存额度不足，已暂停整片下载；正常播放不受影响" : writeFailures[key]
+      // Record is intentionally created before the first async page batch.
+      if !FileManager.default.fileExists(atPath:manifest(key).path) { try? save(record,key:key) }
+      return (progress(record,persistent:persistent,limitation:message),record.pages)
+    }
+  }
+  func restored(identity:String,recheck:Bool = true)->(key:String,total:Int64,validator:String,complete:Bool)? {
+    queue.sync {
+      // A provider content hash + account/file/size identity is required by caller.
+      let key=identity
+      if recheck { records.removeValue(forKey:key) }
+      guard let record=load(key),record.identity==identity else { return nil }
+      return (key,record.total,record.validator,progress(record,persistent:true).complete)
+    }
+  }
+  func read(key:String,offset:Int64,length:Int)->Data? {
+    queue.sync {
+      let file=path(key,offset)
+      guard let stored=try? Data(contentsOf:file),stored.count==length+32,
+        Data(SHA256.hash(data:stored.dropFirst(32)))==stored.prefix(32) else {
+        if var record=load(key),record.pages.remove(offset) != nil { try? save(record,key:key) }
+        try? FileManager.default.removeItem(at:file); entries.removeValue(forKey:file)
+        return nil
+      }
+      return Data(stored.dropFirst(32))
+    }
+  }
+  @discardableResult func enqueue(_ pages:[(Int64,Data)],key:String,epoch:UInt64,
+                                  identity:String? = nil,total:Int64 = 0,validator:String = "",
+                                  completion:@escaping @Sendable ()->Void)->Bool {
+    let cost=pages.reduce(0) { $0+$1.1.count }
+    guard cost>0,cost<=pendingLimit else { return false }
+    admission.lock()
+    guard pendingBytes+cost<=pendingLimit else { admission.unlock(); return false }
+    pendingBytes+=cost; admission.unlock()
+    queue.async {
+      defer {
+        self.admission.lock(); self.pendingBytes-=cost; self.admission.unlock(); completion()
+      }
+      guard epoch==self.revision,!self.invalidKeys.contains(key) else { return }
+      try? FileManager.default.createDirectory(at:self.root,withIntermediateDirectories:true)
+      var excluded=self.root, attributes=URLResourceValues(); attributes.isExcludedFromBackup=true
+      try? excluded.setResourceValues(attributes)
+      guard var record=self.load(key) ?? identity.map({ Record(identity:$0,total:total,validator:validator) }),record.total>0 else { return }
+      let fresh=pages.filter { !record.pages.contains($0.0) }
+      guard self.room(for:Int64(fresh.reduce(0) { $0+$1.1.count+32 })+1048576,key:key) else {
+        self.writeFailures[key]="空间或视频缓存额度不足，已暂停写入；正常播放不受影响"; return
+      }
+      do {
+        for (offset,data) in fresh {
+          guard offset>=0,offset%65536==0,offset<record.total,
+            data.count==Int(min(65536,record.total-offset)) else { continue }
+          let stored=Data(SHA256.hash(data:data))+data, file=self.path(key,offset)
+          try stored.write(to:file,options:.atomic)
+          self.entries[file]=(Int64(stored.count),Date()); record.pages.insert(offset)
+          record.stamps[offset]=(try? file.resourceValues(forKeys:[.contentModificationDateKey]))?.contentModificationDate?.timeIntervalSince1970
         }
+        try self.save(record,key:key); self.writeFailures.removeValue(forKey:key)
+      } catch {
+        self.writeFailures[key]="无法完成磁盘写入，已暂停整片下载；正常播放不受影响"
       }
     }
+    return true
   }
+  // Test/maintenance compatibility. Production callbacks only use bounded enqueue.
+  func write(_ data:Data,key:String,offset:Int64,epoch:UInt64) {
+    queue.sync {
+      guard epoch==revision else { return }
+      try? FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
+      try? (Data(SHA256.hash(data:data))+data).write(to:path(key,offset),options:.atomic)
+    }
+  }
+  func flush() { queue.sync {} }
   func clear() { queue.sync {
-    revision &+= 1
-    try? FileManager.default.removeItem(at: root); entries.removeAll(); indexed=false
+    revision &+= 1; try? FileManager.default.removeItem(at:root)
+    entries.removeAll(); records.removeAll(); invalidKeys.removeAll(); writeFailures.removeAll(); indexed=false
   } }
 }
 
@@ -233,16 +391,118 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
   private var issueOwner:UUID?
   private var refreshTask:Task<Void,Never>?
   private var refreshOwner:Int32?
-  // A new schema prevents reuse of v53 pages whose HTTP representation was not checked.
+  private let sessionKey=UUID().uuidString
+  private let maintenance=DispatchQueue(label:"cineva.range.prefetch",qos:.utility)
+  private var maintenanceTimer:DispatchSourceTimer?
+  private var prefetchAllowed=false
+  private var prefetchToken:Int32?
+  private var prefetchRetryAt=0.0
+  private var durablePages:Set<Int64>=[]
+  private var diskProgress=MediaCacheProgress()
+  private var acquiredKey:String?
+  private var lastForegroundMiss=ProcessInfo.processInfo.systemUptime
   private var diskKey:String? {
-    guard cacheEnabled, length>0, !identity.validator.isEmpty, let responseValidator else { return nil }
+    guard cacheEnabled,length>0,responseValidator != nil else { return nil }
+    if identity.isPersistent { return identity.key }
+    // A strong HTTP validator permits merging within this session, but without
+    // provider content identity it must not silently promise reuse after reopen.
     return RangeCacheIdentity(account:identity.account,fileID:identity.fileID,size:length,
-      validator:"http-v2:"+identity.validator+":"+responseValidator).key
+      validator:identity.validator.isEmpty ? "session:"+sessionKey : "http-v3:"+identity.validator+":"+(responseValidator ?? "")).key
+  }
+  var mediaCacheProgress:MediaCacheProgress {
+    condition.lock(); defer { condition.unlock() }; return diskProgress
+  }
+  func allowPrefetch(_ allowed:Bool) {
+    condition.lock(); defer { condition.broadcast(); condition.unlock() }
+    prefetchAllowed=allowed
+    if !allowed { yieldPrefetch() }
+  }
+  private func yieldPrefetch() {
+    guard let token=prefetchToken else { return }
+    previewTokens.remove(token); readerErrors.removeValue(forKey:token)
+    cancelFlights(for:token); prefetchToken=nil
+  }
+  private func maintain() {
+    condition.lock()
+    guard !closed, fatalError==nil else { condition.unlock(); return }
+    guard let key=diskKey,let validator=responseValidator else {
+      diskProgress=MediaCacheProgress(total:max(0,length),limitation:cacheEnabled
+        ? "尚无可靠的媒体响应标识，仅在线播放，未写入磁盘" : "此媒体使用在线播放")
+      condition.unlock(); return
+    }
+    let total=length, enabled=prefetchAllowed && ProcessInfo.processInfo.systemUptime>=prefetchRetryAt
+    if acquiredKey==nil { acquiredKey=key; disk.acquire(key) }
+    condition.unlock()
+    // All filesystem work runs here/on the disk utility queue, never on the
+    // serial URLSession delegate or main actor. inspect also drains prior writes.
+    let (progress,pages)=disk.inspect(key:key,identity:identity.isPersistent ? identity.key : key,
+      total:total,validator:validator,persistent:identity.isPersistent,reserveWhole:enabled)
+    condition.lock()
+    guard !closed,diskKey==key else { condition.unlock(); return }
+    diskProgress=progress; durablePages=pages
+    if ProcessInfo.processInfo.systemUptime<prefetchRetryAt {
+      diskProgress.limitation="整片下载暂时中断，稍后重试；正常播放仍可继续"
+    }
+    var batch:[(Int64,Data)]=[]
+    for offset in order where !pages.contains(offset) {
+      let count=Int(min(page,total-offset))
+      if count>0,let block=memory[offset],block.available(at:0)>=count {
+        batch.append((offset,Data(block.data.prefix(count))))
+        if batch.count>=64 { break }
+      }
+    }
+    let mayDownload=enabled && prefetchAllowed && progress.limitation==nil && !progress.complete
+      && primaryReaders==0 && ProcessInfo.processInfo.systemUptime-lastForegroundMiss>=1
+      && !flights.values.contains(where: { !$0.finished })
+    condition.unlock()
+    if !batch.isEmpty {
+      _=disk.enqueue(batch,key:key,epoch:diskEpoch,completion:{})
+      return // Drain persistence before requesting more bytes; bounded backpressure.
+    }
+    guard mayDownload else { return }
+    condition.lock()
+    guard !closed,prefetchAllowed,primaryReaders==0 else { condition.unlock(); return }
+    // First exact uncovered byte. Complete disk pages and partial memory spans
+    // both count, so a short 206 never causes a restart at page/file zero.
+    var offset:Int64=0
+    while offset<total {
+      let base=offset/page*page
+      if durablePages.contains(base) { offset=min(total,base+page); continue }
+      if let block=memory[base],block.available(at:Int(offset-base))>0 {
+        offset+=Int64(block.available(at:Int(offset-base))); continue
+      }
+      break
+    }
+    guard offset<total else { condition.unlock(); return }
+    nextPreviewToken+=1; let token=nextPreviewToken
+    previewTokens.insert(token); prefetchToken=token
+    condition.unlock()
+    var bytes=[UInt8](repeating:0,count:65536)
+    let end=min(total,offset+window)
+    while offset<end {
+      let n=read(offset:offset,buffer:&bytes,count:Int(min(65536,end-offset)),generation:token)
+      if n<=0 {
+        condition.lock()
+        if n != -3 { prefetchRetryAt=ProcessInfo.processInfo.systemUptime+30; diskProgress.limitation="整片下载暂时中断，正常播放仍可继续" }
+        condition.unlock(); break
+      }
+      offset+=Int64(n)
+    }
+    // The accepted response can finish after its incremental read returned.
+    condition.lock()
+    while valid(token),flights.values.contains(where: { $0.readers.contains(token) && !$0.finished }) {
+      _=condition.wait(until:Date(timeIntervalSinceNow:0.05))
+    }
+    if prefetchToken==token { yieldPrefetch() }
+    condition.broadcast(); condition.unlock()
   }
   init(source: VideoSource, identity: RangeCacheIdentity, disk: SegmentDiskCache = .shared,
        cacheEnabled: Bool = true, refresh: Refresh? = nil) {
     self.source=source; self.identity=identity; self.disk=disk; self.refresh=refresh
     self.cacheEnabled=cacheEnabled; diskEpoch=disk.epoch; stats.hintedLength=identity.size
+    if cacheEnabled,identity.isPersistent,let restored=disk.restored(identity:identity.key,recheck:false) {
+      length=restored.total; responseValidator=restored.validator; stats.verifiedLength=length
+    }
     super.init()
     let config=URLSessionConfiguration.ephemeral
     config.urlCache=nil; config.requestCachePolicy = .reloadIgnoringLocalCacheData
@@ -251,6 +511,10 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     config.httpMaximumConnectionsPerHost=2
     let queue=OperationQueue(); queue.maxConcurrentOperationCount=1; queue.qualityOfService = .userInitiated
     session=URLSession(configuration:config,delegate:self,delegateQueue:queue)
+    let timer=DispatchSource.makeTimerSource(queue:maintenance)
+    timer.schedule(deadline:.now(),repeating:.milliseconds(200))
+    timer.setEventHandler { [weak self] in self?.maintain() }
+    maintenanceTimer=timer; timer.resume()
   }
   var statistics:RangeStatistics { condition.lock(); defer { condition.unlock() }; return stats }
   var fileSize:Int64 { condition.lock(); defer { condition.unlock() }; return length }
@@ -278,6 +542,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
   }
   func changeGeneration(_ value:Int32) {
     condition.lock()
+    yieldPrefetch(); prefetchAllowed=false
     let previous=generation; generation=value; readerErrors.removeValue(forKey:previous)
     cancelFlights(for:previous)
     if value<0 {
@@ -290,7 +555,10 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     if refreshing { refreshing=false; refreshed=false }
     if stats.terminalFailure != nil, stats.clues.count<4 { stats.clues.append("subsequent cancellation generation=\(value)") }
     condition.broadcast(); condition.unlock()
-    if value<0 { session.invalidateAndCancel() }
+    if value<0 {
+      maintenanceTimer?.cancel(); maintenanceTimer=nil; session.invalidateAndCancel()
+      if let key=acquiredKey { disk.release(key) }
+    }
   }
   func close() { changeGeneration(-1) }
   private func issue(_ kind:RangeFailureKind, flight f:Flight, code:Int32, native:NSError? = nil) {
@@ -303,6 +571,11 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
       applicationUAPreserved:f.uaPreserved,networkDomain:domain,networkCode:native?.code ?? 0)
     if stats.terminalFailure != nil, stats.clues.count<4 { stats.clues.append("subsequent transport=\(kind.rawValue)") }
     f.issue=evidence
+    if [.resourceChanged,.metadataConflict].contains(kind) {
+      if let key=diskKey { disk.invalidate(key) }
+      diskProgress=MediaCacheProgress(limitation:"媒体内容已变化，旧缓存已失效")
+      durablePages.removeAll(); memory.removeAll(); order.removeAll(); stats.memoryBytes=0
+    }
     if f.readers.contains(generation) { stats.lastIssue=evidence; stats.lastError=kind.rawValue; issueOwner=f.recovery.id }
     if [.malformedResponse,.metadataConflict,.resourceChanged,.unsupportedBackend,.redirectPolicy].contains(kind) {
       for token in f.readers { readerErrors[token]=code }
@@ -387,6 +660,16 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
           let start=Int(offset-base), n=min(count,bytes.count-start)
           bytes.copyBytes(to:buffer,from:start..<(start+n)); stats.diskHitBytes+=Int64(n)
           result=Int32(n); return result
+        }
+      }
+      if primary {
+        lastForegroundMiss=ProcessInfo.processInfo.systemUptime
+        // Coalesce an exact active range; unrelated speculative work yields now.
+        if let token=prefetchToken,let f=flight(at:offset,reader:wanted),f.readers.contains(token) {
+          f.readers.insert(wanted); f.task?.priority=URLSessionTask.highPriority
+        } else { yieldPrefetch() }
+        for (id,f) in flights where !f.finished && !f.readers.contains(generation) {
+          f.task?.cancel(); flights.removeValue(forKey:id)
         }
       }
       let active=flight(at:offset,reader:wanted)
@@ -493,7 +776,16 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
   }
   private func startFlight(at start:Int64,generation:Int32,recovery:Recovery? = nil) -> Int {
     let span=cacheEnabled ? window : page
-    let end=min(start+min(span-1,Int64.max-start),length>0 ? length-1 : Int64.max)
+    var end=min(start+min(span-1,Int64.max-start),length>0 ? length-1 : Int64.max)
+    // Stop at the next actual cached span instead of re-downloading its bytes.
+    if cacheEnabled {
+      for base in stride(from:start/page*page,through:end,by:page) {
+        if durablePages.contains(base),base>start { end=min(end,base-1); break }
+        if let block=memory[base],let next=block.coverage.first(where: { base+Int64($0.lowerBound)>start }) {
+          end=min(end,base+Int64(next.lowerBound)-1); break
+        }
+      }
+    }
     let f=Flight(start:start,end:end,generation:generation,recovery:recovery)
     var request=URLRequest(url:source.url)
     if let recovery { request.timeoutInterval=max(0.01,min(5,recovery.started+9-ProcessInfo.processInfo.systemUptime)) }
@@ -502,6 +794,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     request.setValue("identity",forHTTPHeaderField:"Accept-Encoding")
     if let responseValidator { request.setValue(responseValidator,forHTTPHeaderField:"If-Range") }
     let task=session.dataTask(with:request); f.task=task; flights[task.taskIdentifier]=f
+    task.priority=generation==self.generation ? URLSessionTask.highPriority : URLSessionTask.lowPriority
     stats.requests+=1; stats.misses+=1; task.resume(); return task.taskIdentifier
   }
   private func didRefresh(_ value:VideoSource?,generation wanted:Int32) {
@@ -577,6 +870,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
       }
       f.finished=true
     }
+    if valid { refreshed=false }
     f.accepted=valid; condition.broadcast(); condition.unlock(); completionHandler(valid ? .allow : .cancel)
   }
   /// RFC 9110 delay-seconds or HTTP-date. Never shorten a valid server delay;
@@ -626,9 +920,17 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     }
     if f.error==0, f.accepted { recovered(f) }
     let pages=f.error==0 && f.accepted ? storeVerified(f.data,at:f.start) : []
-    let key=diskKey
+    let key=diskKey, total=length, validator=responseValidator ?? ""
+    if let key, acquiredKey==nil { acquiredKey=key; disk.acquire(key) }
     condition.broadcast(); condition.unlock()
-    if let key { for (offset,data) in pages { disk.write(data,key:key,offset:offset,epoch:diskEpoch) } }
+    if let key {
+      // Admission only takes a small lock; hashing, filesystem I/O, manifests
+      // and eviction happen after playback readers have been signalled.
+      _=disk.enqueue(pages,key:key,epoch:diskEpoch,
+        identity:identity.isPersistent ? identity.key : key,total:total,validator:validator,completion:{})
+    }
+    // Rejected batches stay in bounded memory and are retried by maintenance.
+
   }
   func urlSession(_ session:URLSession,task:URLSessionTask,willPerformHTTPRedirection response:HTTPURLResponse,
                   newRequest request:URLRequest,completionHandler:@escaping(URLRequest?)->Void) {

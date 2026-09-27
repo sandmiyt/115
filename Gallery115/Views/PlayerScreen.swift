@@ -1851,6 +1851,13 @@ struct PlayerScreen: View {
         .accessibilityLabel("当前位置 \(formatTime(scrubValue))，剩余 \(formatTime(remaining))")
       }
 
+      if useFFmpeg {
+        Text(ffmpegEngine.mediaCacheText)
+          .font(.caption2.monospacedDigit()).foregroundStyle(.white.opacity(0.75))
+          .lineLimit(2).padding(.horizontal,42)
+          .transaction { $0.animation=nil }
+      }
+
       GeometryReader { proxy in
         let width = max(proxy.size.width, 1)
         let duration = max(activeDuration, 1)
@@ -1868,11 +1875,12 @@ struct PlayerScreen: View {
             .offset(x: trackInset)
 
           if useFFmpeg {
-            let start=min(max(activeCurrentTime/duration,0),1)
-            let end=min(max(ffmpegEngine.bufferedUntil/duration,start),1)
-            Capsule().fill(.white.opacity(0.48))
-              .frame(width:trackWidth*CGFloat(end-start),height:trackHeight)
-              .offset(x:trackInset+trackWidth*CGFloat(start))
+            // No byte-percentage timeline: arbitrary partial container coverage
+            // has no reliable time mapping. A complete file covers all tracks.
+            if ffmpegEngine.mediaCacheProgress.complete {
+              Capsule().fill(.white.opacity(0.48))
+                .frame(width:trackWidth,height:trackHeight).offset(x:trackInset)
+            }
           } else if !useVLC {
             ForEach(model.bufferedRanges, id: \.start) { range in
               let start = min(max(range.start / duration, 0), 1)
@@ -2200,6 +2208,14 @@ struct PlayerScreen: View {
   @MainActor
   private func switchPlaybackBackend(_ backend: PlayerBackend) {
     guard let model, let source=model.selectedSource else { return }
+    if source.url.scheme=="cineva-cache", backend != .ffmpeg {
+      backendSwitchTask?.cancel()
+      backendSwitchTask=Task { @MainActor in
+        guard await model.resolveCachedSourceForExternalEngine(),!Task.isCancelled,self.model === model else { return }
+        switchPlaybackBackend(backend)
+      }
+      return
+    }
     backendSwitchTask?.cancel()
     let generation=UUID(); backendSwitchGeneration=generation
     pendingAudioPreference=activeTrackSelector?.audioTracks.first { $0.id==activeTrackSelector?.selectedAudioOptionID }
