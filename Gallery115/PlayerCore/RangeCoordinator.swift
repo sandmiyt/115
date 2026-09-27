@@ -181,6 +181,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     let recovery: Recovery
     let attemptIndex: Int
     var retryAfter: Double?
+    var retryPending=false
     init(start: Int64, end: Int64, generation: Int32, recovery: Recovery? = nil) {
       self.start=start; self.end=end; self.generation=generation; consumedThrough=start
       self.recovery=recovery ?? Recovery(generation:generation)
@@ -353,7 +354,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
         }
         if let id=f.task?.taskIdentifier, observed.insert(id).inserted { stats.coalesced+=1 }
         // Errors win over buffered prefixes after a failed response has completed.
-        if f.finished, f.error != 0 {
+        if f.finished, f.error != 0, !f.retryPending {
           if f.error == -5, !refreshed, let refresh {
             f.recovery.hadFailure=true
             if f.recovery.attempts.count>=3 { f.recovery.reason="attempt-limit"; result=terminate(f); return result }
@@ -374,6 +375,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
               cycle.reason=cycle.attempts.count>=3 ? "attempt-limit" : "retry-after-exceeds-budget"
               result=terminate(f); return result
             }
+            f.retryPending=true // One waiter owns the retry; other readers coalesce.
             cycle.attempts[f.attemptIndex].plannedWait=delay
             let waitStart=ProcessInfo.processInfo.systemUptime, until=waitStart+delay
             publishRecovery(cycle)
@@ -385,8 +387,9 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
             publishRecovery(cycle)
             if closed || wanted != generation { publishRecovery(cycle,outcome:"cancelled"); result = -3; return result }
             if let fatalError { result=fatalError; return result }
-            if ProcessInfo.processInfo.systemUptime>=budget { result=terminate(f); return result }
-            if let id=f.task?.taskIdentifier { flights.removeValue(forKey:id) }
+            if ProcessInfo.processInfo.systemUptime>=budget { cycle.reason="total-budget"; result=terminate(f); return result }
+            guard let id=f.task?.taskIdentifier, flights[id] === f else { continue }
+            flights.removeValue(forKey:id)
             observed.insert(startFlight(at:offset,generation:wanted,recovery:cycle))
           } else { result=terminate(f); return result }
           continue
@@ -397,13 +400,13 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
           f.data.copyBytes(to:buffer,from:start..<(start+n)); f.consumedThrough=offset+Int64(n)
           recovered(f); result=Int32(n); return result
         }
-        if f.finished {
+        if f.finished && !f.retryPending {
           // A valid short prefix is complete, not a failed whole-window transfer.
           // The next request starts at the exact uncovered byte, never at page zero.
           if let id=f.task?.taskIdentifier { flights.removeValue(forKey:id) }; continue
         }
       } else if !refreshing {
-        if flights.count>=2, let old=flights.values.first(where:{ $0.finished }), let id=old.task?.taskIdentifier { flights.removeValue(forKey:id) }
+        if flights.count>=2, let old=flights.values.first(where:{ $0.finished && !$0.retryPending }), let id=old.task?.taskIdentifier { flights.removeValue(forKey:id) }
         if flights.count<2 {
           observed.insert(startFlight(at:offset,generation:wanted,recovery:continuation)); continuation=nil
         }

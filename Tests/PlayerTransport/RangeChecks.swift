@@ -91,6 +91,15 @@ private final class PendingRangeRead: @unchecked Sendable {
       if !stopping { expect(read(c,0,4096,2)>0,"New generation proceeds immediately") }
       c.close()
     }
+    let coalescedRetry=client("/retry-503?case="+UUID().uuidString)
+    let firstWaiter=PendingRangeRead(), secondWaiter=PendingRangeRead()
+    firstWaiter.start(coalescedRetry,at:22222)
+    for _ in 0..<200 where (coalescedRetry.statistics.recovery?.attempts.first?.plannedWait ?? 0)==0 { Thread.sleep(forTimeInterval:0.01) }
+    secondWaiter.start(coalescedRetry,at:22222)
+    expect(firstWaiter.done.wait(timeout:.now()+3) == .success && secondWaiter.done.wait(timeout:.now()+3) == .success,"Concurrent readers share recovery")
+    expect((firstWaiter.result ?? -1)>0 && (secondWaiter.result ?? -1)>0 && firstWaiter.validBytes && secondWaiter.validBytes,"Coalesced retry returns validated bytes to both readers")
+    expect(coalescedRetry.statistics.requests==2,"Only one retry owner sends a request")
+    coalescedRetry.close()
     let cacheRecovery=client("/retry-cache"), cachePending=PendingRangeRead()
     expect(read(cacheRecovery,0)>0,"Seed validated cache")
     for _ in 0..<200 where cacheRecovery.statistics.memoryBytes<1048576 { Thread.sleep(forTimeInterval:0.01) }
