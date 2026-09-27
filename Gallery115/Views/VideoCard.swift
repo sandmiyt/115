@@ -564,6 +564,8 @@ struct PhotoLibraryGrid<FolderCell: View, MediaCell: View, Footer: View>: UIView
     var anchorID: String?
     var anchorFraction = CGPoint(x: 0.5, y: 0.5)
     var anchorScreen = CGPoint.zero
+    private let interactionOwner = UUID()
+    private var interactionTask: Task<Void, Never>?
     var zoomWarmIDs = Set<String>()
     var lastWarmSignature = ""
     var lastItems: [CloudItem] = []
@@ -876,6 +878,15 @@ struct PhotoLibraryGrid<FolderCell: View, MediaCell: View, Footer: View>: UIView
       zoomLink = link
     }
 
+    func setGridInteraction(_ interacting: Bool) {
+      let previous = interactionTask
+      let service = parent.appState.thumbnailService, owner = interactionOwner
+      interactionTask = Task {
+        await previous?.value
+        await service.setGridInteraction(interacting, owner: owner)
+      }
+    }
+
     func cancelZoom() {
       zoom.generation &+= 1
       zoom.phase = .idle
@@ -884,9 +895,7 @@ struct PhotoLibraryGrid<FolderCell: View, MediaCell: View, Footer: View>: UIView
       anchorID = nil
       lastWarmSignature = ""
       cancelPrefetches()
-      let service = parent.appState.thumbnailService
-      let owner = ObjectIdentifier(self).hashValue
-      Task { await service.setGridInteraction(false, owner: owner) }
+      setGridInteraction(false)
       view?.panGestureRecognizer.isEnabled = true
     }
 
@@ -912,9 +921,7 @@ struct PhotoLibraryGrid<FolderCell: View, MediaCell: View, Footer: View>: UIView
         zoom.begin(widths: layout.geometry.widths)
         lastWidth = view.bounds.width
         lastWarmSignature = ""
-        let service = parent.appState.thumbnailService
-        let owner = ObjectIdentifier(self).hashValue
-        Task { await service.setGridInteraction(true, owner: owner) }
+        setGridInteraction(true)
         startZoomClock()
       case .changed, .ended:
         pendingPinch = (Double(recognizer.scale), Double(recognizer.velocity), recognizer.location(in: view))

@@ -38,7 +38,7 @@ actor ThumbnailService {
   private var writeOrder: [String] = []
   private var persistenceTask: Task<Void, Never>?
   private var persistenceID: UUID?
-  private var gridOwners = Set<Int>()
+  private var gridOwners = Set<UUID>()
   private var activePrefetchSlots = Set<UUID>()
   private var activePrefetchFrameSlots = Set<UUID>()
   private var badURLs: [URL: Date] = [:]
@@ -76,7 +76,7 @@ actor ThumbnailService {
 
   init(
     disk: ArtworkDiskStore = ArtworkDiskStore(),
-    namespace: @escaping @Sendable () -> String = ThumbnailService.currentNamespace,
+    namespace: @escaping @Sendable () -> String = { ThumbnailService.currentNamespace() },
     loader: Loader? = nil,
     frameLoader: Loader? = nil
   ) {
@@ -359,7 +359,7 @@ actor ThumbnailService {
     return await imageWorker.persist(image: image, data: nil, identity: identity, generation: generation)
   }
 
-  func setGridInteraction(_ interacting: Bool, owner: Int) {
+  func setGridInteraction(_ interacting: Bool, owner: UUID) {
     if interacting {
       gridOwners.insert(owner)
       for work in inFlight.values where work.isPrefetch && activeFrameSlots.contains(work.id) { work.task.cancel() }
@@ -961,7 +961,8 @@ enum GridArtworkTrace {
       }
     }
     let resident = status == KERN_SUCCESS ? info.resident_size : 0
-    log.debug("stage=\(stage, privacy: .public) id=\(key, privacy: .public) t=\(now) ms=\(elapsed) resident=\(resident) \(detail(), privacy: .public)")
+    let message = detail()
+    log.debug("stage=\(stage, privacy: .public) id=\(key, privacy: .public) t=\(now) ms=\(elapsed) resident=\(resident) \(message, privacy: .public)")
     #endif
   }
 }
