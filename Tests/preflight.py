@@ -97,7 +97,7 @@ card_identity = card.split("private var itemThumbnailIdentity", 1)[1].split("@Vi
 check("item.id" in card_identity and "item.size" in card_identity
       and "modifiedAt" in card_identity,
       "Artwork identity tracks content version independently of signed URLs")
-check("if renderedItemIdentity != itemThumbnailIdentity" in card
+check("if renderedItemIdentity != itemMediaIdentity" in card
       and "guard let image else { return }" in card,
       "Artwork refresh keeps the existing image until a replacement is ready")
 check("activeRequestIdentity == identity" in card,

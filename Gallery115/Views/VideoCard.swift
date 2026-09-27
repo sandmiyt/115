@@ -184,7 +184,7 @@ struct VideoArtwork: View {
         artworkBackground
           .frame(width: proxy.size.width, height: proxy.size.height)
 
-        if let image = (renderedItemIdentity == itemThumbnailIdentity ? cachedImage : nil)
+        if let image = (renderedItemIdentity == itemMediaIdentity ? cachedImage : nil)
           ?? appState.thumbnailService.cachedThumbnail(for: item) {
           artwork(Image(uiImage: image), in: proxy.size)
         } else {
@@ -210,66 +210,70 @@ struct VideoArtwork: View {
 
   @MainActor
   private func loadArtwork(pixels: Int) async {
-      guard scenePhase == .active else { return }
-      let identity = "\(itemThumbnailIdentity)|\(pixels)"
-      if renderedItemIdentity != itemThumbnailIdentity {
-        cachedImage = nil
-        renderedItemIdentity = itemThumbnailIdentity
-      }
-      if loadedIdentity == identity, cachedImage != nil { return }
-      activeRequestIdentity = identity
-      isLoading = false
-      // Keep already-rendered artwork visible during a directory refresh. A
-      // changed/revalidated thumbnail replaces it only after the new image is
-      // ready, so existing cards never fall back to placeholders together.
-      let spinner = Task { @MainActor in
-        do { try await Task.sleep(nanoseconds: 180_000_000) }
-        catch { return }
-        guard !Task.isCancelled, cachedImage == nil else { return }
-        isLoading = true
-      }
-      defer {
-        spinner.cancel()
-        if activeRequestIdentity == identity {
-          isLoading = false
-        }
-      }
-      let service = appState.thumbnailService
-      let api = appState.api
-      let requestedItem = item
-      let image = await withTaskCancellationHandler {
-        var result: UIImage?
-        // Queue time is not a download failure. Each active network/frame stage
-        // has its own deadline; a busy directory must not expire queued cards.
-        var attempt = 0
-        while !Task.isCancelled {
-          let delay = [0, 6, 15, 30, 60][min(attempt, 4)]
-          if delay > 0 {
-            spinner.cancel()
-            isLoading = false
-            do { try await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000_000) }
-            catch { return nil as UIImage? }
-          }
-          guard !Task.isCancelled else { return nil as UIImage? }
-          result = await service.thumbnail(for: requestedItem, api: api, targetPixels: pixels)
-          if result != nil { break }
-          attempt = min(attempt + 1, 4)
-        }
-        return result
-      } onCancel: {
-        spinner.cancel()
-      }
-      guard !Task.isCancelled else { return }
-      guard let image else { return }
-      var transaction = Transaction(animation: nil)
-      transaction.disablesAnimations = true
-      withTransaction(transaction) {
-        GridArtworkTrace.event("cell-image", id: appState.thumbnailService.traceKey(for: item), detail: "pixels=\(pixels)")
-        cachedImage = image
-        loadedIdentity = identity
+    guard scenePhase == .active else { return }
+    let identity = "\(itemThumbnailIdentity)|\(pixels)"
+    if renderedItemIdentity != itemMediaIdentity {
+      cachedImage = nil
+      renderedItemIdentity = itemMediaIdentity
+    }
+    if loadedIdentity == identity, cachedImage != nil { return }
+    activeRequestIdentity = identity
+    isLoading = false
+    // Keep already-rendered artwork visible during a directory refresh. A
+    // changed/revalidated thumbnail replaces it only after the new image is
+    // ready, so existing cards never fall back to placeholders together.
+    let spinner = Task { @MainActor in
+      do { try await Task.sleep(nanoseconds: 180_000_000) }
+      catch { return }
+      guard !Task.isCancelled, cachedImage == nil else { return }
+      isLoading = true
+    }
+    defer {
+      spinner.cancel()
+      if activeRequestIdentity == identity {
         isLoading = false
       }
+    }
+    let service = appState.thumbnailService
+    let api = appState.api
+    let requestedItem = item
+    let image = await withTaskCancellationHandler {
+      var result: UIImage?
+      // Queue time is not a download failure. Each active network/frame stage
+      // has its own deadline; a busy directory must not expire queued cards.
+      var attempt = 0
+      while !Task.isCancelled {
+        let delay = [0, 6, 15, 30, 60][min(attempt, 4)]
+        if delay > 0 {
+          spinner.cancel()
+          isLoading = false
+          do { try await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000_000) }
+          catch { return nil as UIImage? }
+        }
+        guard !Task.isCancelled else { return nil as UIImage? }
+        result = await service.thumbnail(for: requestedItem, api: api, targetPixels: pixels)
+        if result != nil { break }
+        attempt = min(attempt + 1, 4)
+      }
+      return result
+    } onCancel: {
+      spinner.cancel()
+    }
+    guard !Task.isCancelled else { return }
+    guard let image else { return }
+    var transaction = Transaction(animation: nil)
+    transaction.disablesAnimations = true
+    withTransaction(transaction) {
+      GridArtworkTrace.event("cell-image", id: appState.thumbnailService.traceKey(for: item), detail: "pixels=\(pixels)")
+      cachedImage = image
+      loadedIdentity = identity
+      isLoading = false
+    }
 
+  }
+
+  private var itemMediaIdentity: String {
+    "\(appState.mediaSourceRevision)|\(item.id)"
   }
 
   private var itemThumbnailIdentity: String {
