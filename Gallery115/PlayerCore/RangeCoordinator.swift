@@ -766,6 +766,10 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
         }
         let start=Int(offset-f.start)
         if f.accepted, start<f.data.count {
+          // A retained completed flight can outlive its partial memory pages.
+          // Reinsert its VERIFIED bytes when read again, otherwise gap filling
+          // can repeatedly read a fragment that never joins the durable page.
+          if f.finished && f.error==0 { storeVerified(f.data,at:f.start) }
           let n=min(count,f.data.count-start)
           f.data.copyBytes(to:buffer,from:start..<(start+n)); f.consumedThrough=offset+Int64(n)
           recovered(f); result=Int32(n); return result

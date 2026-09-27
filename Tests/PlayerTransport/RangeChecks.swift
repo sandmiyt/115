@@ -331,6 +331,18 @@ private final class SlowDiskGate: @unchecked Sendable {
     for _ in 0..<200 where !resumed.mediaCacheProgress.complete { Thread.sleep(forTimeInterval:0.05) }
     expect(resumed.mediaCacheProgress.complete && resumed.statistics.networkBytes==size-1048576,"Resume fills only persistent gaps")
     resumed.close()
+    // Retain a completed unaligned seek flight while its partial memory pages
+    // age out of the 32 MiB LRU. Gap fill must reassemble the old flight's tail.
+    let fragmentSize:Int64=40*1048576+97
+    let fragment=client("/fragment",size:fragmentSize)
+    expect(read(fragment,34*1048576+123)>0,"Unaligned seek seeds partial page boundaries")
+    for _ in 0..<200 where fragment.statistics.memoryBytes<1048576 { Thread.sleep(forTimeInterval:0.01) }
+    fragment.allowPrefetch(true)
+    for _ in 0..<900 where !fragment.mediaCacheProgress.complete { Thread.sleep(forTimeInterval:0.05) }
+    print("FRAGMENT_CACHE bytes=\(fragment.mediaCacheProgress.bytes) network=\(fragment.statistics.networkBytes)"); fflush(stdout)
+    expect(fragment.mediaCacheProgress.complete,"Evicted partial flight fragments must join durable coverage, not loop forever")
+    expect(fragment.statistics.networkBytes<=fragmentSize+131072,"Retained/durable spans are not downloaded repeatedly")
+    fragment.close()
     // Real disk and local HTTP, >512 MiB. No playback reads are used to drive
     // completion after the initial/seek windows: this models same-page pause.
     let largeSize:Int64=576*1048576+97
