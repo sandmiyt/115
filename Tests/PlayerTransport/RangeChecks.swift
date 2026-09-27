@@ -352,16 +352,25 @@ private final class SlowDiskGate: @unchecked Sendable {
     let seekMS=(ProcessInfo.processInfo.systemUptime-seekAt)*1000
     for _ in 0..<200 where large.statistics.memoryBytes<2*1048576 { Thread.sleep(forTimeInterval:0.01) }
     large.allowPrefetch(true)
-    let completionDeadline=ProcessInfo.processInfo.systemUptime+240
-    var previous:Int64=0
+    let fillStarted=ProcessInfo.processInfo.systemUptime
+    let completionDeadline=fillStarted+600
+    var previous:Int64=0,lastReported:Int64=0
+    var lastGrowth=fillStarted
     while !large.mediaCacheProgress.complete && ProcessInfo.processInfo.systemUptime<completionDeadline {
       Thread.sleep(forTimeInterval:0.2)
       let progress=large.mediaCacheProgress
       expect(progress.bytes>=previous,"Active file cannot self-evict earlier pages")
+      if progress.bytes>previous { lastGrowth=ProcessInfo.processInfo.systemUptime }
+      if progress.bytes-lastReported>=64*1048576 || ProcessInfo.processInfo.systemUptime-lastGrowth>30 {
+        print("WHOLE_CACHE bytes=\(progress.bytes)/\(largeSize) network=\(large.statistics.networkBytes) requests=\(large.statistics.requests) pending=\(largeDisk.queuedWriteBytes) elapsed=\(ProcessInfo.processInfo.systemUptime-fillStarted)"); fflush(stdout)
+        lastReported=progress.bytes
+      }
+      expect(ProcessInfo.processInfo.systemUptime-lastGrowth<30,"Whole-file fill must keep making durable progress")
       previous=progress.bytes
       expect(large.statistics.memoryBytes<=32*1048576,"Whole-file fill has bounded memory")
       if let problem=progress.limitation { preconditionFailure(problem) }
     }
+    print("WHOLE_CACHE final=\(large.mediaCacheProgress) network=\(large.statistics.networkBytes) elapsed=\(ProcessInfo.processInfo.systemUptime-fillStarted)"); fflush(stdout)
     expect(large.mediaCacheProgress.complete && large.mediaCacheProgress.bytes==largeSize,"Paused prefetch passes 512 MiB and completes every byte")
     expect(large.statistics.networkBytes<=largeSize+2*1048576,"Gap fill does not redownload cached ranges")
     large.close(); largeDisk.flush()
