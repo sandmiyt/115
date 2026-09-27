@@ -134,12 +134,13 @@ actor ThumbnailService {
 
   func thumbnail(for item: CloudItem, api: APIClient, isPrefetch: Bool = false, targetPixels: Int = 640) async -> UIImage? {
     guard item.isVideo || item.isPhoto else { return nil }
+    let requestedAt = ProcessInfo.processInfo.systemUptime
     let pixels = ArtworkSizeTier.pixels(for: targetPixels)
     let identity = identity(for: item)
     let generation = cacheGeneration
     while !Task.isCancelled, generation == cacheGeneration, identity.namespace == namespace() {
       if let image = memoryCache.suitable(forKey: identity.key as NSString, pixels: pixels) {
-        GridArtworkTrace.event("memory-hit", id: identity.key)
+        GridArtworkTrace.event("memory-hit", id: identity.key, since: requestedAt)
         return image
       }
       if let retry = failedUntil[identity.key], retry > Date() { return nil }
@@ -191,7 +192,7 @@ actor ThumbnailService {
       // the closed gate and resume when the player closes.
       if work.task.isCancelled { continue }
       if result != nil, work.pixels < pixels { continue }
-      GridArtworkTrace.event("delivery", id: identity.key, detail: "pixels=\(pixels) prefetch=\(isPrefetch)")
+      GridArtworkTrace.event("delivery", id: identity.key, detail: "pixels=\(pixels) prefetch=\(isPrefetch)", since: requestedAt)
       return result
     }
     return nil
@@ -865,9 +866,10 @@ private actor ArtworkImageWorker {
     guard let data = try? disk.read(identity), let source = CGImageSourceCreateWithData(data as CFData, nil) else { return false }
     return CGImageSourceGetCount(source) > 0
   }
-  func local(_ identity: ArtworkIdentity, pixels: Int, generation: UUID) -> UIImage? {
+  func local(_ identity: ArtworkIdentity, pixels: Int, generation: UUID, queuedAt: Double = ProcessInfo.processInfo.systemUptime) -> UIImage? {
     guard self.generation == generation, !Task.isCancelled else { return nil }
     let started = ProcessInfo.processInfo.systemUptime
+    GridArtworkTrace.event("disk-queue", id: identity.key, since: queuedAt)
     if let data = recentSources.object(forKey: identity.key as NSString) {
       return decode(data as Data, identity: identity, pixels: pixels, generation: generation)
     }
@@ -880,9 +882,10 @@ private actor ArtworkImageWorker {
     GridArtworkTrace.event("disk-hit", id: identity.key)
     return image
   }
-  func decode(_ data: Data, identity: ArtworkIdentity, pixels: Int, generation: UUID) -> UIImage? {
+  func decode(_ data: Data, identity: ArtworkIdentity, pixels: Int, generation: UUID, queuedAt: Double = ProcessInfo.processInfo.systemUptime) -> UIImage? {
     guard self.generation == generation, !Task.isCancelled else { return nil }
     let started = ProcessInfo.processInfo.systemUptime
+    GridArtworkTrace.event("decode-queue", id: identity.key, since: queuedAt)
     guard let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary) else { return nil }
     let options: [CFString: Any] = [
       kCGImageSourceCreateThumbnailFromImageAlways: true,
