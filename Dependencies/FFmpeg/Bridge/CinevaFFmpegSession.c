@@ -188,6 +188,7 @@ static int putPacket(CinevaFFmpegSession *s, Packet entry) {
         while (!atomic_load(&s->cancelled) && entry.serial == atomic_load(&s->generation) &&
             (s->audioCount >= PACKETS || s->audioBytes + bytes > 4*1024*1024 || s->audioSeconds >= 8))
         {
+            s->snapshot.readerBackpressured=1;
             if (!atomic_load(&s->videoSuppressed) && !s->packetCount && !s->frameCount && av_gettime_relative()-blockedAt>8000000) {
                 pthread_mutex_unlock(&s->mutex); av_packet_free(&entry.packet);
                 fail(s,AVERROR(ENOBUFS),CinevaStageRead); return 0;
@@ -195,6 +196,7 @@ static int putPacket(CinevaFFmpegSession *s, Packet entry) {
             struct timespec ts; clock_gettime(CLOCK_REALTIME,&ts); ts.tv_sec++;
             pthread_cond_timedwait(&s->changed,&s->mutex,&ts);
         }
+        s->snapshot.readerBackpressured=0;
         int ok = !atomic_load(&s->cancelled) && entry.serial == atomic_load(&s->generation);
         if (ok) {
             s->audioPackets[(s->audioHead+s->audioCount++)%PACKETS] = entry;
@@ -1027,11 +1029,16 @@ static void queueRange(CinevaFFmpegSession *s, int audio, double *start, double 
     int count=audio?s->audioCount:s->packetCount,head=audio?s->audioHead:s->packetHead;
     for (int i=0;i<count;i++) {
         Packet p=packets[(head+i)%PACKETS];
-        if (!p.packet || p.packet->pts==AV_NOPTS_VALUE || p.duration<=0) continue;
+        if (!p.packet || p.packet->pts==AV_NOPTS_VALUE) continue;
         AVRational base=s->videoTimeBase;
         if (audio) for (int t=0;t<s->trackCount;t++) if (s->audioTracks[t].index==p.packet->stream_index) base=s->audioBases[t];
         double pts=p.packet->pts*av_q2d(base)-s->origin;
-        ranges[n++]=(TimeRange){fmax(pts,p.target),pts+p.packet->duration*av_q2d(base)};
+        double finish=pts+fmax(0,p.packet->duration*av_q2d(base));
+        if(finish<p.target) continue;
+        // A timestamp without duration is still a known presentation point.
+        // Adjacent packet points establish a span; do not invent a tail duration
+        // or erase every compressed packet in containers with duration == 0.
+        ranges[n++]=(TimeRange){fmax(pts,p.target),finish};
     }
     if (audio) for (int i=0;i<s->pcmCount;i++) {
         PCM p=s->pcm[(s->pcmHead+i)%PCM_LIMIT]; ranges[n++]=(TimeRange){p.pts,p.pts+p.count/48000.0};
@@ -1042,8 +1049,10 @@ static void queueRange(CinevaFFmpegSession *s, int audio, double *start, double 
     if (!n) return;
     qsort(ranges,n,sizeof(TimeRange),compareRange);
     *start=ranges[0].start; *end=ranges[0].end;
+    double tolerance=!audio && isfinite(s->snapshot.fps) && s->snapshot.fps>0 ?
+        fmax(0.05,1.25/s->snapshot.fps):0.05;
     for (int i=1;i<n;i++) {
-        if (ranges[i].start>*end+0.05) break;
+        if (ranges[i].start>*end+tolerance) break;
         *end=fmax(*end,ranges[i].end);
     }
 }
