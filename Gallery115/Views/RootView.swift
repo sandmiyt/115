@@ -326,7 +326,7 @@ private struct HomeView: View {
               LazyHStack(spacing: 11) {
                 ForEach(appState.libraryStore.recents.prefix(12)) { entry in
                   ContinueWatchingCard(entry: entry, transitionNamespace: playerTransition) {
-                    selectedVideo = entry.item
+                    PlaybackLaunchClock.mark(entry.item.id); selectedVideo = entry.item
                   }
                 }
               }

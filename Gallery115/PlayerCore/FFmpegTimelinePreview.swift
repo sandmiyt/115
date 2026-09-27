@@ -20,7 +20,7 @@ actor FFmpegPreviewWorker {
   private let source:VideoSource
   private let coordinator:RangeCoordinator?
   private var reader:FFmpegPreviewReader?
-  private let context=CIContext(options:[.cacheIntermediates:false])
+  private lazy var context=CIContext(options:[.cacheIntermediates:false])
   private var handle:FFmpegSessionHandle?
   private var serial:Int32=1
   private var cursor = -1.0
@@ -31,7 +31,11 @@ actor FFmpegPreviewWorker {
   }
   // Can be called during an awaited read: native cancellation wakes its scoped
   // condition. Destruction/join is dispatched off MainActor by the handle.
-  func close() { ended=true; handle=nil; reader?.cancel(-1); frames=[]; context.clearCaches() }
+  func suspend() {
+    if let handle { CinevaFFmpegSessionCancel(handle.pointer) }
+    handle=nil; reader?.cancel(-1); reader=nil
+  }
+  func close() { ended=true; suspend(); frames=[]; context.clearCaches() }
 
   func frame(at target:Double) async -> Result {
     let began=ProcessInfo.processInfo.systemUptime
@@ -58,6 +62,7 @@ actor FFmpegPreviewWorker {
       serial=CinevaFFmpegSessionSeek(handle!.pointer,target); cursor=target
     }
     guard let handle else { return result(nil,"已取消") }
+    var tailFallback=false
     // Reuse queued frames and decode forward for nearby targets. A long GOP may
     // need more work, but never monopolizes the worker or resets the main engine.
     while !ended && !Task.isCancelled && ProcessInfo.processInfo.systemUptime-began<5 {
@@ -67,7 +72,7 @@ actor FFmpegPreviewWorker {
       if let pixel=CinevaFFmpegSessionCopyFrame(handle.pointer,&pts,&duration,&generation) {
         guard generation==serial else { continue }
         cursor=pts+abs(duration)
-        if cursor<=target { continue }
+        if cursor<=target && !tailFallback { continue }
         var image=CIImage(cvPixelBuffer:pixel)
         if [16,18].contains(snapshot.colorTransfer) {
           if #available(iOS 18.0,*), image.contentHeadroom>1,
@@ -86,13 +91,21 @@ actor FFmpegPreviewWorker {
         while frames.count>64 || frames.reduce(0,{ $0+$1.bytes })>12*1024*1024 { frames.removeFirst() }
         return result(frame,duration>0 && pts<=target && target<pts+duration ? "帧区间" : "近似帧（duration 缺失或目标间隙；实际 PTS）")
       }
-      if snapshot.status==2 { return result(frames.last,"片尾最近帧") }
+      if snapshot.status==2 {
+        if !tailFallback, target>0 {
+          // Some containers end audio after the final video interval. One
+          // bounded nearby keyframe lookup, never a rewind/download from zero.
+          tailFallback=true; serial=CinevaFFmpegSessionSeek(handle.pointer,max(0,target-0.1)); continue
+        }
+        return result(frames.min(by:{ abs($0.pts-target)<abs($1.pts-target) }),"片尾最近帧（非精确区间）")
+      }
       do { try await Task.sleep(for:.milliseconds(8)) } catch { return result(nil,"已取消") }
     }
     return result(nil,"预览暂未就绪")
   }
 }
 
+#if !PREVIEW_WORKER_TEST
 /// MainActor merges the latest target while one worker request progresses. It
 /// does not repeatedly cancel a cold read, which would starve first preview.
 @MainActor
@@ -102,6 +115,7 @@ final class FFmpegTimelinePreview {
   private var task:Task<Void,Never>?
   private var epoch=UUID()
   private var latest=0.0
+  private var requestedAt=0.0
   private var source:VideoSource?
   private var coordinator:RangeCoordinator?
   private(set) var diagnostic="预览尚未请求"
@@ -115,7 +129,7 @@ final class FFmpegTimelinePreview {
   }
   func update(_ time:Double) {
     guard time.isFinite, display.isActive else { return }
-    latest=max(0,time); display.targetExternal(latest)
+    latest=max(0,time); requestedAt=ProcessInfo.processInfo.systemUptime; display.targetExternal(latest)
     guard task==nil, let worker else { return }
     let expected=epoch
     task=Task { [weak self] in
@@ -125,8 +139,8 @@ final class FFmpegTimelinePreview {
         guard !Task.isCancelled, self.epoch==expected else { return }
         if self.latest==target {
           self.display.displayExternal(result.image,pts:result.pts,note:result.note)
-          self.diagnostic=String(format:"预览响应 %.1f ms · 目标 %@ · 实际 PTS %@ · 误差 %.3f s · %@",
-            result.milliseconds,PlaybackPolicy.timestamp(target),PlaybackPolicy.timestamp(result.pts),
+          self.diagnostic=String(format:"目标更新→预览结果 %.1f ms · 目标 %@ · 实际 PTS %@ · 误差 %.3f s · %@",
+            (ProcessInfo.processInfo.systemUptime-self.requestedAt)*1000,PlaybackPolicy.timestamp(target),PlaybackPolicy.timestamp(result.pts),
             result.pts-target,result.note)
           self.task=nil; return
         }
@@ -136,9 +150,15 @@ final class FFmpegTimelinePreview {
   }
   func finish(keepOverlay:Bool) {
     epoch=UUID(); task?.cancel(); task=nil
-    let previous=worker; worker=nil
-    Task { await previous?.close() }
+    let previous=worker
+    Task { await previous?.suspend() }
     display.end(keepImageUntilSeekCompletes:keepOverlay)
   }
-  func stop() { finish(keepOverlay:false); source=nil; coordinator=nil; display.reset() }
+  func stop() {
+    finish(keepOverlay:false)
+    let previous=worker; worker=nil; Task { await previous?.close() }
+    source=nil; coordinator=nil; display.reset()
+  }
 }
+
+#endif

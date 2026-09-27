@@ -60,6 +60,17 @@ for name in sources:
     for kind, snippet in errors:
         print(f"  {kind}: {snippet[:150]!r}")
 
+# Shipping entry/target gates. Runtime decoding is exercised separately on CI.
+player_source=(ROOT / "Gallery115/Views/PlayerScreen.swift").read_text(encoding="utf-8")
+settings_source=(ROOT / "Gallery115/Views/SettingsView.swift").read_text(encoding="utf-8")
+project_source=(ROOT / "Gallery115.xcodeproj/project.pbxproj").read_text(encoding="utf-8")
+check("@State private var useFFmpeg = true" in player_source and "prepareAndPlay(external:true)" in player_source,
+      "Normal playback resolves externally before creating the default FFmpeg session")
+check(all(token not in player_source+settings_source for token in ['settingsChip("FFmpeg"', 'settingsChip("AVPlayer"', 'settingsChip("VLC"', 'Picker("原画播放内核"', 'FFmpegDecodeValidationView', 'isValidatingFFmpeg']),
+      "Shipping UI has no manual engine or validation route")
+check("FFmpegDecodeSession.swift" not in project_source and "FFmpegDecodeValidationView.swift" not in project_source,
+      "Deleted diagnostic pages have no shipping target references")
+
 disk = (ROOT / sources[0]).read_text(encoding="utf-8")
 service = (ROOT / sources[1]).read_text(encoding="utf-8")
 card = (ROOT / sources[2]).read_text(encoding="utf-8")

@@ -48,3 +48,13 @@ struct FFmpegFailureSnapshot: Sendable {
     }
   }
 }
+
+/// Entry timestamp only; no persistent media or credential data.
+@MainActor enum PlaybackLaunchClock {
+  private static var pending:(String,Double)?
+  static func mark(_ id:String) { pending=(id,ProcessInfo.processInfo.systemUptime) }
+  static func take(_ id:String) -> Double? {
+    guard let value=pending, value.0==id else { return nil }
+    pending=nil; return value.1
+  }
+}

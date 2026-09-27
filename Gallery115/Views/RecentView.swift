@@ -20,7 +20,7 @@ struct RecentView: View {
           ForEach(appState.libraryStore.recents) { entry in
             Button {
               UIImpactFeedbackGenerator(style: .soft).impactOccurred(intensity: 0.65)
-              selectedVideo = entry.item
+              PlaybackLaunchClock.mark(entry.item.id); selectedVideo = entry.item
             } label: {
               HStack(spacing: 13) {
                 RecentThumbnail(entry: entry)

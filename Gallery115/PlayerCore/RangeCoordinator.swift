@@ -271,7 +271,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     for (id,f) in flights {
       f.readers.remove(token)
       if f.readers.isEmpty {
-        if f.recovery.hadFailure { publishRecovery(f.recovery,outcome:"cancelled") }
+        if f.recovery.hadFailure && f.recovery.outcome=="recovering" { publishRecovery(f.recovery,outcome:"cancelled") }
         f.task?.cancel(); flights.removeValue(forKey:id); stats.cancelled+=1
       }
     }
@@ -306,7 +306,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     if f.readers.contains(generation) { stats.lastIssue=evidence; stats.lastError=kind.rawValue; issueOwner=f.recovery.id }
     if [.malformedResponse,.metadataConflict,.resourceChanged,.unsupportedBackend,.redirectPolicy].contains(kind) {
       for token in f.readers { readerErrors[token]=code }
-      if f.readers.contains(generation) {
+      if f.readers.contains(generation) || [.resourceChanged,.metadataConflict].contains(kind) {
         if stats.terminalFailure==nil { stats.terminalFailure=evidence }
         if fatalError==nil { fatalError=code }
       }

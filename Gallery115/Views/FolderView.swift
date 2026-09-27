@@ -368,7 +368,7 @@ struct FolderView: View {
                   onLocate: query.isEmpty ? nil : { locate(item) }) {
           if isSelecting { toggleSelection(item); return }
           if item.isPhoto { selectedPhoto = item }
-          else { selectedVideo = item }
+          else { PlaybackLaunchClock.mark(item.id); selectedVideo = item }
         }
       } footer: {
         paginationFooter.padding(.vertical, 20)
@@ -392,7 +392,7 @@ struct FolderView: View {
           } else {
             Button {
               if isSelecting { toggleSelection(item); return }
-              selectedVideo = item
+              PlaybackLaunchClock.mark(item.id); selectedVideo = item
             } label: {
               HStack {
                 if isSelecting {

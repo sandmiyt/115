@@ -4,6 +4,7 @@ import CryptoKit
 import CoreImage
 import Observation
 import UIKit
+import Darwin
 
 /// The normal screen's FFmpeg backend. It owns C workers, real PCM output and
 /// an audio-render-clock-driven native video surface; AVPlayer is not wrapped.
@@ -22,9 +23,12 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   @ObservationIgnored private var playbackBeganAt:Double?
   @ObservationIgnored private var audioRenderedAt:Double?
   @ObservationIgnored private var displayReadyAt:Double?
+  @ObservationIgnored private var uninterruptedAt:Double?
   @ObservationIgnored private var stableAt:Double?
   @ObservationIgnored private var sourceResolvedAt=0.0
   @ObservationIgnored private var clickAt=0.0
+  @ObservationIgnored private var cpuSeconds=0.0
+  @ObservationIgnored private var usageAt=0.0
   @ObservationIgnored private var commitAt:Double?
   private(set) var finalSeekCount=0
   private(set) var seekFrameMilliseconds:Double?
@@ -115,7 +119,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     target=max(0,position.isFinite ? position : 0); currentTime=target
     self.preferHardware=preferHardware
     sourceResolvedAt=CACurrentMediaTime(); clickAt=startupOrigin ?? sourceResolvedAt
-    playbackBeganAt=nil; audioRenderedAt=nil; displayReadyAt=nil; stableAt=nil
+    playbackBeganAt=nil; audioRenderedAt=nil; displayReadyAt=nil; stableAt=nil; uninterruptedAt=nil
     finalSeekCount=0; seekFrameMilliseconds=nil; commitAt=nil
     wantsPlayback=playing; waiting=true; resumeTarget=0.75; serial=1
     backgroundAudioOnly=false
@@ -525,7 +529,8 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
       }
     }
     if hasAudio, audio.playing, audio.renderedTime>target+0.01, audioRenderedAt==nil { audioRenderedAt=now }
-    if isPlaying, let began=playbackBeganAt, now-began>=1, !hasAudio || audioRenderedAt != nil,
+    if !isPlaying { uninterruptedAt=nil } else if uninterruptedAt==nil { uninterruptedAt=now }
+    if isPlaying, let began=uninterruptedAt, now-began>=1, !hasAudio || audioRenderedAt != nil,
       displayReadyAt != nil, stableAt==nil { stableAt=now }
 
     if now-lastPublished>=0.25 {
@@ -569,12 +574,17 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
         renderer:"Apple Native + AVAudioEngine PCM",droppedFrames:renderer.droppedFrames,
         avSyncOffset:hasAudio ? renderer.time-audio.audibleTime : nil)
       func elapsed(_ time:Double?) -> String { time.map { String(format:"%.3f s",$0-clickAt) } ?? "尚未发生 / 不可获得" }
-      let stages="session=\(sessionID.uuidString) · 点击→地址 \(elapsed(sourceResolvedAt)) · 首有效字节 \(snapshot.firstByteSeconds>0 ? elapsed(startAt+snapshot.firstByteSeconds) : "原生 HTTP 不可获得")\n"
+      let stages="session=\(sessionID.uuidString) · 播放请求→地址 \(elapsed(sourceResolvedAt)) · 首有效字节 \(snapshot.firstByteSeconds>0 ? elapsed(startAt+snapshot.firstByteSeconds) : "原生 HTTP 不可获得")\n"
         + "容器打开 \(snapshot.openSeconds>0 ? elapsed(startAt+snapshot.openSeconds) : "尚未发生") · 流信息 \(snapshot.probeSeconds>0 ? elapsed(startAt+snapshot.probeSeconds) : "尚未发生")\n"
         + "首解码 \(snapshot.firstDecodedSeconds>0 ? elapsed(startAt+snapshot.firstDecodedSeconds) : "尚未发生") · 首提交 \(elapsed(firstFrameAt)) · 显示就绪代理 \(elapsed(displayReadyAt))（非屏幕呈现测量）\n"
         + "音频 render 时钟开始 \(elapsed(audioRenderedAt))（非实际扬声器首声测量） · 连续运行 1 秒代理 \(elapsed(stableAt))\n"
         + "拖动最终 seek \(finalSeekCount) 次 · 松手→目标帧就绪代理 \(seekFrameMilliseconds.map { String(format:"%.1f ms",$0) } ?? "尚未发生")\n\(preview.diagnostic)\n"
-      diagnostics=stages+"FFmpeg · \(inputBackend.rawValue) · \(playbackState.title)\n"
+      var usage=rusage(); getrusage(RUSAGE_SELF,&usage)
+      let cpu=Double(usage.ru_utime.tv_sec+usage.ru_stime.tv_sec)+Double(usage.ru_utime.tv_usec+usage.ru_stime.tv_usec)/1_000_000
+      let percent=usageAt>0 ? max(0,(cpu-cpuSeconds)/(now-usageAt)*100) : 0
+      cpuSeconds=cpu; usageAt=now
+      let resources=String(format:"App 峰值 RSS %.1f MiB · 区间 CPU %.1f%%（单核=100%%，含整个进程）\n",Double(usage.ru_maxrss)/1048576,percent)
+      diagnostics=stages+resources+"FFmpeg · \(inputBackend.rawValue) · \(playbackState.title)\n"
         + "色彩：\(statistics.hdrFormat ?? "未知") · 系统 HDR 资格 \(AVPlayer.eligibleForHDRPlayback ? "有" : "无") · 已请求 EDR；实际屏幕输出待设备确认\n"
         + "SDR 映射：\(toneMappedSDR ? "Core Image Reference White → sRGB" : "未启用；原生像素路径")\n"
         + "当前音轨：\(String(cString:CinevaFFmpegCodecName(snapshot.audioCodec))) · 切轨警告 \(snapshot.audioWarningCode) · 输出 PCM 非 Atmos\n"

@@ -1,4 +1,5 @@
 """Deterministic HTTP adversary; never accesses cloud credentials."""
+from pathlib import Path
 import argparse
 import socket
 import time
@@ -20,6 +21,25 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args): pass
     def do_GET(self):
         path = self.path.split("?")[0]
+        if path.startswith("/media/"):
+            media = Path(self.server.media_dir) / Path(path).name
+            if not media.is_file(): self.send_error(404); return
+            size = media.stat().st_size
+            raw = self.headers.get("Range", f"bytes=0-{size-1}")[6:].split("-")
+            start, end = int(raw[0]), min(int(raw[1]) if len(raw)>1 and raw[1] else size-1, size-1)
+            if start >= size:
+                self.send_response(416); self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0"); self.end_headers(); return
+            self.send_response(206); self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.send_header("Content-Length", str(end-start+1)); self.send_header("ETag", f'"fixture-{media.name}-{size}"')
+            self.end_headers()
+            try:
+                with media.open("rb") as data:
+                    data.seek(start); remaining=end-start+1
+                    while remaining:
+                        chunk=data.read(min(65536, remaining)); self.wfile.write(chunk); remaining-=len(chunk)
+            except (BrokenPipeError, ConnectionResetError): pass
+            return
         if path == "/timeout": time.sleep(14)
         if path == "/expired":
             self.send_response(403); self.send_header("Content-Length", "0"); self.end_headers(); return
@@ -90,6 +110,8 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(); parser.add_argument("--port-file", required=True)
+    parser.add_argument("--media-dir", default="")
     args = parser.parse_args(); server = Server(("127.0.0.1", 0), Handler)
+    server.media_dir=args.media_dir
     with open(args.port_file, "w", encoding="ascii") as file: file.write(str(server.server_port))
     server.serve_forever()

@@ -34,7 +34,7 @@ struct FavoritesView: View {
               return
             }
             if item.isPhoto { selectedPhoto = item }
-            else { selectedVideo = item }
+            else { PlaybackLaunchClock.mark(item.id); selectedVideo = item }
           }
         } footer: {
           Text("\(appState.libraryStore.favorites.count) 个项目")

@@ -141,6 +141,9 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             build
 
+      - name: Exercise native preview on generated simulator media
+        run: bash Tests/PlayerTransport/preview-checks.sh
+
       - name: Package unsigned IPA
         run: |
           set -euo pipefail

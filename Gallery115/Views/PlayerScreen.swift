@@ -16,6 +16,9 @@ private enum PlayerDragIntent {
 
 struct PlayerScreen: View {
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
+  @Environment(\.scenePhase) private var scenePhase
+  @GestureState private var timelineTouchActive=false
+  @State private var timelineLastTranslation:CGFloat=0
   @Environment(\.dismiss) private var dismiss
   @Environment(AppState.self) private var appState
 
@@ -332,6 +335,20 @@ struct PlayerScreen: View {
 
   private var playbackObservedView: some View {
     playerPresentationView
+    .onChange(of:scenePhase) { _, phase in
+      if phase != .active, isScrubbing, useFFmpeg { cancelTimelineScrub() }
+    }
+    .onChange(of:timelineTouchActive) { _, active in
+      if !active {
+        Task { @MainActor in
+          await Task.yield()
+          if !timelineTouchActive, isScrubbing, useFFmpeg { cancelTimelineScrub() }
+        }
+      }
+    }
+    .onReceive(NotificationCenter.default.publisher(for:UIDevice.orientationDidChangeNotification)) { _ in
+      if isScrubbing, useFFmpeg { cancelTimelineScrub() }
+    }
     .onChange(of:appState.subtitleDelaySeconds) { _, value in ffmpegEngine.subtitleDelay=value }
     .onChange(of:activeTrackSelector?.audioTracks ?? []) { _, tracks in
       guard let preference=pendingAudioPreference, !tracks.isEmpty else { return }
@@ -1828,6 +1845,12 @@ struct PlayerScreen: View {
     .accessibilityLabel(isPlayerMuted ? "恢复声音" : "静音")
   }
 
+  private func cancelTimelineScrub() {
+    ffmpegEngine.cancelInteractiveScrub()
+    isScrubbing=false; scrubWasPlaying=false
+    scrubValue=activeCurrentTime; scrubStartValue=scrubValue
+  }
+
   private func timeline(model: PlayerModel) -> some View {
     let remaining = max(activeDuration - scrubValue, 0)
     let scrubTrackInset: CGFloat = 2
@@ -1902,12 +1925,14 @@ struct PlayerScreen: View {
         .contentShape(Rectangle())
         .gesture(
           DragGesture(minimumDistance: 0)
+            .updating($timelineTouchActive) { _, active, _ in active=true }
             .onChanged { value in
               let startValue: Double
               if !isScrubbing {
                 startValue = min(max(activeCurrentTime, 0), duration)
                 scrubStartValue = startValue
                 scrubValue = startValue
+                timelineLastTranslation=0
                 isScrubbing = true
                 controlsTask?.cancel()
                 scrubWasPlaying = activeEngine?.beginInteractiveScrub() ?? false
@@ -1915,14 +1940,16 @@ struct PlayerScreen: View {
                 startValue = scrubStartValue
               }
               let sensitivity = pow(0.1,Double(min(3,abs(value.translation.height)/60)))
-              let delta = Double(value.translation.width / width) * duration * sensitivity
-              scrubValue = min(max(startValue + delta, 0), duration)
+              let delta = Double((value.translation.width-timelineLastTranslation) / width) * duration * sensitivity
+              timelineLastTranslation=value.translation.width
+              scrubValue = min(max(scrubValue + delta, 0), duration)
 
               // Cached previews follow the finger; AVPlayer commits a single
               // seek on release instead of restarting its network read here.
               activeEngine?.interactiveScrub(to: scrubValue)
             }
             .onEnded { value in
+              guard isScrubbing else { return }
               activeEngine?.endInteractiveScrub(to: scrubValue, resumeAfter: scrubWasPlaying)
               scrubWasPlaying = false
               scrubStartValue = scrubValue
@@ -2073,7 +2100,7 @@ struct PlayerScreen: View {
       thumbnailPlaybackOwner = UUID()
       thumbnailOwnerActive = true
     }
-    let startupBeganAt = ProcessInfo.processInfo.systemUptime
+    let startupBeganAt = PlaybackLaunchClock.take(currentItem.id) ?? ProcessInfo.processInfo.systemUptime
     // Cached artwork stays available, but remote covers must yield the network
     // before AVPlayer/VLC opens the existing, unchanged WebDAV source.
     await appState.thumbnailService.suspendNetwork(for: thumbnailPlaybackOwner)
