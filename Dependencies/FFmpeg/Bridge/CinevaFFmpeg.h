@@ -30,6 +30,7 @@ typedef struct {
     int videoOnly; // Validation defaults true; false retains audio decode capability.
     int sequentialVideoOnly; // Applies only to video-only MOV, never audio playback.
     int outputAudio;
+    int preview; // Independent video-only context; one retained full-resolution frame.
     void * _Nullable ioContext;
     CinevaFFmpegRead _Nullable read;
     CinevaFFmpegSize _Nullable size;
@@ -75,6 +76,7 @@ typedef struct {
     double audioDecodedTime, audioStart, audioEnd, videoStart, videoEnd;
     int selectedAudioIndex;
     int audioProfile, atmosMetadataDetected;
+    double firstByteSeconds, openSeconds, probeSeconds, firstDecodedSeconds;
 } CinevaFFmpegSnapshot;
 typedef struct { int index, codec, channels, sampleRate; char language[32], title[128]; } CinevaFFmpegAudioTrack;
 typedef struct { int index, codec; char language[32], title[128]; } CinevaFFmpegSubtitleTrack;

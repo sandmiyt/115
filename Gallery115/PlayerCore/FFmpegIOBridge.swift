@@ -14,3 +14,34 @@ extension CinevaFFmpegSessionOptions {
     }
   }
 }
+
+/// One AVIO cursor's cancellation scope. Never calls coordinator.close().
+final class FFmpegPreviewReader: @unchecked Sendable {
+  let coordinator:RangeCoordinator
+  private let lock=NSLock()
+  private var token:Int32
+  private var generation:Int32=1
+  init(_ coordinator:RangeCoordinator) { self.coordinator=coordinator; token=coordinator.makePreviewToken() }
+  func read(offset:Int64,buffer:UnsafeMutablePointer<UInt8>,count:Int,generation wanted:Int32) -> Int32 {
+    lock.lock(); let current=token, valid=generation==wanted; lock.unlock()
+    guard valid else { return -3 }
+    return coordinator.read(offset:offset,buffer:buffer,count:count,generation:current)
+  }
+  func cancel(_ next:Int32) {
+    lock.lock(); let old=token
+    generation=next; token=next<0 ? -1 : coordinator.makePreviewToken(); lock.unlock()
+    coordinator.cancelPreview(old)
+  }
+  deinit { coordinator.cancelPreview(token) }
+}
+extension CinevaFFmpegSessionOptions {
+  mutating func attachPreview(_ reader:FFmpegPreviewReader) {
+    ioContext=Unmanaged.passUnretained(reader).toOpaque()
+    read={ context,offset,buffer,count,generation in
+      Unmanaged<FFmpegPreviewReader>.fromOpaque(context).takeUnretainedValue()
+        .read(offset:offset,buffer:buffer,count:Int(count),generation:generation)
+    }
+    size={ context in Unmanaged<FFmpegPreviewReader>.fromOpaque(context).takeUnretainedValue().coordinator.fileSize }
+    cancelIO={ context,generation in Unmanaged<FFmpegPreviewReader>.fromOpaque(context).takeUnretainedValue().cancel(generation) }
+  }
+}

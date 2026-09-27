@@ -18,9 +18,20 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   private(set) var wantsPlayback = true
   private(set) var statistics = PlayerStatistics(backend:.ffmpeg)
   private(set) var diagnostics = "FFmpeg 正在准备"
-  private(set) var trial = FFmpegDiagnosticTrial(mode:.cachedAudio,position:0,hardware:true)
-  @ObservationIgnored private var trialPlaybackAt: Double?
-  @ObservationIgnored private var trialFrozen = false
+  @ObservationIgnored private var preferHardware=true
+  @ObservationIgnored private var playbackBeganAt:Double?
+  @ObservationIgnored private var audioRenderedAt:Double?
+  @ObservationIgnored private var displayReadyAt:Double?
+  @ObservationIgnored private var stableAt:Double?
+  @ObservationIgnored private var sourceResolvedAt=0.0
+  @ObservationIgnored private var clickAt=0.0
+  @ObservationIgnored private var commitAt:Double?
+  private(set) var finalSeekCount=0
+  private(set) var seekFrameMilliseconds:Double?
+  @ObservationIgnored private var scrubbing=false
+  @ObservationIgnored private var scrubIntent=false
+  @ObservationIgnored private let preview=FFmpegTimelinePreview()
+  var timelinePreview:TimelinePreviewController { preview.display }
   private(set) var errorMessage: String?
   private(set) var lastFailure: FFmpegFailureSnapshot?
   @ObservationIgnored private var sessionID=UUID()
@@ -81,7 +92,6 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   @ObservationIgnored private var cache: RangeCoordinator?
   @ObservationIgnored private var lastNetworkBytes: Int64 = 0
   @ObservationIgnored private var lastNetworkAt = 0.0
-  @ObservationIgnored private var scrubTask: Task<Void,Never>?
   @ObservationIgnored private var audioTail = false
   @ObservationIgnored private var backgroundAudioOnly = false
   @ObservationIgnored private var restoredAudioPreference = false
@@ -96,15 +106,17 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
 
   func start(source: VideoSource, item: CloudItem, api: APIClient, library: LibraryStore,
              at position: Double, playing: Bool = true, useCache: Bool = true, preferHardware: Bool = true,
-             recordsHistory: Bool = true, inputBackend: FFmpegInputBackend? = nil) {
+             recordsHistory: Bool = true, inputBackend: FFmpegInputBackend? = nil, startupOrigin:Double? = nil) {
     stop()
     sessionID=UUID()
-    self.inputBackend=inputBackend ?? (useCache ? .customAVIOCached : .ffmpegHTTP)
+    self.inputBackend=inputBackend ?? PlaybackPolicy.input(for:source)
     self.recordsHistory=recordsHistory
     currentSource=source; sourceItem=item; self.api=api; self.library=library
     target=max(0,position.isFinite ? position : 0); currentTime=target
-    trial=FFmpegDiagnosticTrial(mode:self.inputBackend.trialMode,position:target,hardware:preferHardware)
-    trialPlaybackAt=nil; trialFrozen=false
+    self.preferHardware=preferHardware
+    sourceResolvedAt=CACurrentMediaTime(); clickAt=startupOrigin ?? sourceResolvedAt
+    playbackBeganAt=nil; audioRenderedAt=nil; displayReadyAt=nil; stableAt=nil
+    finalSeekCount=0; seekFrameMilliseconds=nil; commitAt=nil
     wantsPlayback=playing; waiting=true; resumeTarget=0.75; serial=1
     backgroundAudioOnly=false
     rebufferCount=0; audioUnderruns=0; firstFrameAt=nil
@@ -117,7 +129,6 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     lastPublished=0; lastNetworkAt=startAt; lastNetworkBytes=0
     duration=item.duration; playbackState = .preparing
     renderer.reset(to:target,newSession:true); audio.reset(to:target,generation:serial)
-    guard source.isOriginal else { fail("FFmpeg 分段缓存目前要求原文件；转码清单请使用兼容内核。"); return }
     guard source.headers.allSatisfy({ !$0.key.contains(where: \.isNewline) && !$0.value.contains(where: \.isNewline) && !$0.key.contains(":") }) else {
       fail("媒体请求头格式无效"); return
     }
@@ -148,6 +159,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     }
     guard let pointer else { fail("无法创建 FFmpeg 会话"); return }
     handle=FFmpegSessionHandle(pointer,io:cache)
+    preview.configure(source:source,coordinator:cache)
     audio.setRate(rate); audio.setVolume(volume)
     installObservers()
     let timer=Timer(timeInterval:1.0/60,repeats:true) { [weak self] _ in
@@ -160,9 +172,8 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     toneMapTask?.cancel(); toneMapTask=nil; pendingToneMapped=false
     toneMapper.reset()
     resetSubtitleImage()
-    interruptTrial("提前停止 / 切换模式")
     pip?.stop()
-    scrubTask?.cancel(); scrubTask=nil
+    scrubbing=false; preview.stop()
     saveProgress(force:true)
     ticker?.invalidate(); ticker=nil
     audio.stop(); renderer.reset(to:currentTime); pending=nil
@@ -171,7 +182,6 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     playbackState = .stopped
   }
   func pause() {
-    interruptTrial("暂停或播放结束，观察窗口未完成")
     wantsPlayback=false; audio.pause(); renderer.setPlaying(false)
     playbackState = .paused; saveProgress(force:true)
   }
@@ -186,7 +196,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   func clearSegmentCache() async {
     guard let source=currentSource, let item=sourceItem, let api, let library else { return }
     let position=currentTime, playing=wantsPlayback, record=recordsHistory
-    let backend=inputBackend, hardware=trial.hardware
+    let backend=inputBackend, hardware=preferHardware
     stop()
     let epoch=lifecycleEpoch
     await Task.detached(priority:.utility) { SegmentDiskCache.shared.clear() }.value
@@ -201,7 +211,6 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   func seek(to seconds: Double) {
     resetSubtitleImage()
     toneMapTask?.cancel(); toneMapTask=nil; pendingToneMapped=false
-    interruptTrial("含手动定位，观察窗口未完成")
     guard let handle, seconds.isFinite else { return }
     target=min(max(0,seconds),duration>0 ? max(0,duration-0.01) : max(0,seconds))
     // Stop already scheduled old audio before publishing a new generation.
@@ -213,20 +222,31 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     waitStarted=CACurrentMediaTime(); playbackState = .seeking
   }
   func replayFromStart() { wantsPlayback=true; seek(to:0) }
-  func beginInteractiveScrub() -> Bool { let intent=wantsPlayback; pause(); isInteractiveScrubLoading=true; return intent }
-  func interactiveScrub(to seconds: Double) {
-    scrubTask?.cancel()
-    scrubTask=Task { @MainActor [weak self] in
-      do { try await Task.sleep(for:.milliseconds(120)) } catch { return }
-      self?.seek(to:seconds)
-    }
+  func beginInteractiveScrub() -> Bool {
+    guard !scrubbing else { return scrubIntent }
+    scrubIntent=wantsPlayback; scrubbing=true
+    audio.pause(); renderer.setPlaying(false) // Keep PCM, frame queues and real position.
+    wantsPlayback=false; isInteractiveScrubLoading=false
+    preview.begin(at:currentTime)
+    return scrubIntent
   }
-  func endInteractiveScrub(to seconds: Double, resumeAfter: Bool) {
-    wantsPlayback=resumeAfter; isInteractiveScrubLoading=false; seek(to:seconds)
-    scrubTask?.cancel(); scrubTask=nil
+  func interactiveScrub(to seconds:Double) {
+    guard scrubbing else { return }
+    preview.update(min(max(0,seconds),duration>0 ? max(0,duration-0.001) : max(0,seconds)))
+  }
+  func endInteractiveScrub(to seconds:Double,resumeAfter:Bool) {
+    guard scrubbing else { return }
+    preview.finish(keepOverlay:true); scrubbing=false
+    wantsPlayback=resumeAfter; commitAt=CACurrentMediaTime(); finalSeekCount += 1
+    seek(to:seconds) // The only primary seek in a drag lifecycle.
+  }
+  func cancelInteractiveScrub() {
+    guard scrubbing else { return }
+    preview.finish(keepOverlay:false); scrubbing=false
+    wantsPlayback=scrubIntent
+    if scrubIntent { resume() } else { playbackState = .paused }
   }
   func selectAudio(_ id: String?) {
-    interruptTrial("切换音轨，观察窗口未完成")
     guard let selected=id ?? defaultAudioID, let index=Int32(selected), let handle else { return }
     if selected==selectedAudioOptionID { return }
     resetSubtitleImage()
@@ -318,17 +338,13 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
           + "hint=\(io?.hintedLength ?? -1) verified=\(io?.verifiedLength ?? -1) · subsequent clues=\(io?.clues.joined(separator: "; ") ?? "none")")
       diagnostics=lastFailure!.text
     }
-    interruptTrial("播放失败，观察窗口未完成")
     errorMessage=message
     audio.stop(); renderer.setPlaying(false)
     handle=nil; cache?.close(); cache=nil; ticker?.invalidate(); ticker=nil
     playbackState = .failed(message)
   }
-  private func interruptTrial(_ reason: String) {
-    if !trialFrozen { trial.interruption=reason; trialFrozen=true }
-  }
   private func saveProgress(force: Bool = false) {
-    guard recordsHistory, let sourceItem, let library, duration>0 else { return }
+    guard !scrubbing, recordsHistory, let sourceItem, let library, duration>0 else { return }
     let second=Int(currentTime)
     if force || second/5 != savedSecond/5 {
       library.recordPlayback(sourceItem,position:currentTime,duration:duration); savedSecond=second
@@ -347,6 +363,9 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
         else if self.interruptedIntent, let options=note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt,
           AVAudioSession.InterruptionOptions(rawValue:options).contains(.shouldResume) { self.resume() }
       }
+    })
+    observers.append(center.addObserver(forName:UIApplication.didEnterBackgroundNotification,object:nil,queue:.main) { [weak self] _ in
+      MainActor.assumeIsolated { self?.cancelInteractiveScrub() }
     })
     for name in [AVAudioSession.routeChangeNotification, AVAudioSession.mediaServicesWereResetNotification, Notification.Name.AVAudioEngineConfigurationChange] {
       observers.append(center.addObserver(forName:name,object:nil,queue:.main) { [weak self] note in
@@ -374,6 +393,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   private func pump() {
     guard let handle else { return }
     let now=CACurrentMediaTime()
+    if scrubbing { return }
     if backgroundAudioOnly, UIApplication.shared.applicationState == .background,
       pip?.requiresVideo != true, now-lastPump<0.04 { return }
     lastPump=now
@@ -487,7 +507,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
             renderer.alignClock(to:hasAudio ? audio.audibleTime : currentTime,rate:Double(rate),running:true)
           }
           waiting=false; playbackState = .playing
-          if trialPlaybackAt==nil { trialPlaybackAt=now }
+          if playbackBeganAt==nil { playbackBeganAt=now }
         } catch { fail("音频输出失败：\(error.localizedDescription)"); return }
       }
     }
@@ -497,6 +517,17 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     }
     if !wantsPlayback, renderer.anchored { playbackState = .paused }
     if !backgroundAudioOnly { renderSubtitle(now:now) }
+    if renderer.layer.isReadyForDisplay, renderer.anchored {
+      if displayReadyAt==nil { displayReadyAt=now }
+      if let began=commitAt {
+        seekFrameMilliseconds=(now-began)*1000; commitAt=nil
+        preview.display.end() // Readiness proxy, never claim physical presentation.
+      }
+    }
+    if hasAudio, audio.playing, audio.renderedTime>target+0.01, audioRenderedAt==nil { audioRenderedAt=now }
+    if isPlaying, let began=playbackBeganAt, now-began>=1, !hasAudio || audioRenderedAt != nil,
+      displayReadyAt != nil, stableAt==nil { stableAt=now }
+
     if now-lastPublished>=0.25 {
       lastPublished=now
       if hasAudio, !waiting, wantsPlayback, !backgroundAudioOnly { renderer.disciplineClock(to:audio.audibleTime,rate:Double(rate)) }
@@ -528,17 +559,6 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
       }
       let io=cache?.statistics
       hasAtmosMetadata=snapshot.atmosMetadataDetected != 0
-      if !trialFrozen {
-        trial.firstFrame=firstFrameAt.map { $0-startAt }
-        trial.firstPlayback=trialPlaybackAt.map { $0-startAt }
-        trial.elapsed=trialPlaybackAt.map { min(10,now-$0) } ?? 0
-        trial.stalls=rebufferCount; trial.bytes=snapshot.ioBytesRead
-        trial.backwards=Int(snapshot.backwardPacketJumps); trial.forwards=Int(snapshot.largeForwardPacketJumps)
-        trial.averageRead=snapshot.averageReadFrameDuration; trial.maximumRead=snapshot.maximumReadFrameDuration
-        trial.compressed=snapshot.queuedSeconds; trial.httpRequests=io?.requests; trial.networkBytes=io?.networkBytes
-        trial.cacheHitBytes=io.map { $0.memoryHitBytes+$0.diskHitBytes }
-        if trial.elapsed>=10 { trial.complete=true; trialFrozen=true }
-      }
       let bytes=io?.networkBytes ?? 0
       let speed=now>lastNetworkAt ? Double(bytes-lastNetworkBytes)*8/(now-lastNetworkAt)/1_000_000 : 0
       lastNetworkAt=now; lastNetworkBytes=bytes
@@ -548,7 +568,13 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
         cachedBytes:io.map { Int64($0.memoryBytes) },decoder:snapshot.decoderType==2 ? "VideoToolbox" : "FFmpeg 软件解码",
         renderer:"Apple Native + AVAudioEngine PCM",droppedFrames:renderer.droppedFrames,
         avSyncOffset:hasAudio ? renderer.time-audio.audibleTime : nil)
-      diagnostics="FFmpeg · \(inputBackend.rawValue) · \(playbackState.title)\n"
+      func elapsed(_ time:Double?) -> String { time.map { String(format:"%.3f s",$0-clickAt) } ?? "尚未发生 / 不可获得" }
+      let stages="session=\(sessionID.uuidString) · 点击→地址 \(elapsed(sourceResolvedAt)) · 首有效字节 \(snapshot.firstByteSeconds>0 ? elapsed(startAt+snapshot.firstByteSeconds) : "原生 HTTP 不可获得")\n"
+        + "容器打开 \(snapshot.openSeconds>0 ? elapsed(startAt+snapshot.openSeconds) : "尚未发生") · 流信息 \(snapshot.probeSeconds>0 ? elapsed(startAt+snapshot.probeSeconds) : "尚未发生")\n"
+        + "首解码 \(snapshot.firstDecodedSeconds>0 ? elapsed(startAt+snapshot.firstDecodedSeconds) : "尚未发生") · 首提交 \(elapsed(firstFrameAt)) · 显示就绪代理 \(elapsed(displayReadyAt))（非屏幕呈现测量）\n"
+        + "音频 render 时钟开始 \(elapsed(audioRenderedAt))（非实际扬声器首声测量） · 连续运行 1 秒代理 \(elapsed(stableAt))\n"
+        + "拖动最终 seek \(finalSeekCount) 次 · 松手→目标帧就绪代理 \(seekFrameMilliseconds.map { String(format:"%.1f ms",$0) } ?? "尚未发生")\n\(preview.diagnostic)\n"
+      diagnostics=stages+"FFmpeg · \(inputBackend.rawValue) · \(playbackState.title)\n"
         + "色彩：\(statistics.hdrFormat ?? "未知") · 系统 HDR 资格 \(AVPlayer.eligibleForHDRPlayback ? "有" : "无") · 已请求 EDR；实际屏幕输出待设备确认\n"
         + "SDR 映射：\(toneMappedSDR ? "Core Image Reference White → sRGB" : "未启用；原生像素路径")\n"
         + "当前音轨：\(String(cString:CinevaFFmpegCodecName(snapshot.audioCodec))) · 切轨警告 \(snapshot.audioWarningCode) · 输出 PCM 非 Atmos\n"

@@ -39,6 +39,37 @@ private final class PendingRangeRead: @unchecked Sendable {
       if n>0 { expect((0..<Int(n)).allSatisfy { bytes[$0]==UInt8((offset+Int64($0))%251) },"Byte integrity at \(offset)") }
       return n
     }
+    // Independent preview cursors share bytes and request capacity, not stop/seek.
+    let scoped=client("/retry-stop?scope-test")
+    expect(read(scoped,0)>0,"Prime verified primary cache")
+    let previewToken=scoped.makePreviewToken(), previewWait=PendingRangeRead()
+    previewWait.start(scoped,at:1048576,generation:previewToken)
+    for _ in 0..<100 where scoped.statistics.recovery?.attempts.first?.plannedWait == nil || scoped.statistics.recovery?.attempts.first?.plannedWait == 0 { Thread.sleep(forTimeInterval:0.01) }
+    scoped.cancelPreview(previewToken)
+    expect(previewWait.done.wait(timeout:.now()+1) == .success && previewWait.result == -3,"Preview cancellation wakes only its backoff")
+    expect(read(scoped,0)>0 && scoped.statistics.terminalFailure==nil,"Preview cancellation preserves primary and verified bytes")
+    let exhaustedPreview=scoped.makePreviewToken()
+    expect(read(scoped,2097152,4096,exhaustedPreview)<0,"Preview has bounded terminal recovery")
+    expect(scoped.statistics.terminalFailure==nil && read(scoped,0)>0,"Preview exhaustion never fails primary")
+    scoped.cancelPreview(exhaustedPreview); scoped.close()
+    let scopes=client("/slow?scopes")
+    let token=scopes.makePreviewToken()
+    expect(read(scopes,0,4096,token)>0,"Preview owns independent cursor")
+    scopes.changeGeneration(2)
+    expect(read(scopes,16384,4096,token)>0,"Primary seek cannot cancel preview scope")
+    expect(read(scopes,2097152,4096,2)>0,"Primary reads while preview is active")
+    scopes.cancelPreview(token)
+    expect(read(scopes,2097152,4096,2)>0,"Preview close leaves primary request intact")
+    expect(read(scopes,0,4096,token)==(-3),"Closed preview scope cannot rejoin")
+    scopes.close()
+    let coalesced=client("/slow?shared")
+    let sharing=coalesced.makePreviewToken()
+    expect(read(coalesced,0,4096,sharing)>0,"Preview begins shared range")
+    expect(read(coalesced,0)>0,"Primary joins same range")
+    let requests=coalesced.statistics.requests
+    coalesced.cancelPreview(sharing)
+    expect(read(coalesced,16384)>0 && coalesced.statistics.requests==requests,"Cancellation retains coalesced primary flight")
+    coalesced.close()
     for (path,requests) in [("/retry-once",2),("/retry-twice",3),("/retry-502",2),("/retry-504",2)] {
       let c=client(path)
       expect(read(c,12345)>0,"Transient status must recover inside custom AVIO")

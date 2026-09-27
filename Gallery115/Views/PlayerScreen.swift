@@ -27,7 +27,7 @@ struct PlayerScreen: View {
   @State private var systemPresentationController = SystemPlayerPresentationController()
   @State private var useVLC = false
   @State private var ffmpegEngine = FFmpegPlayerEngine()
-  @State private var useFFmpeg = false
+  @State private var useFFmpeg = true
   @State private var ffmpegReason: String?
   @State private var didFFmpegFallback = false
   @State private var lastFFmpegFailure: FFmpegFailureSnapshot?
@@ -38,7 +38,6 @@ struct PlayerScreen: View {
   @State private var didLoadPreferredRate = false
   @State private var localMetadata: LocalMediaMetadata?
   @State private var showInfo = false
-  @State private var isValidatingFFmpeg = false
   @State private var videoLayout: PlayerVideoLayout = .fit
   @State private var playbackRate: Float = 1.0
   @State private var isLocked = false
@@ -276,20 +275,9 @@ struct PlayerScreen: View {
         statistics: activeStatistics,
         state: activeState,
         audioTrackCount: activeTrackSelector?.audioTracks.count,
-        subtitleTrackCount: activeTrackSelector?.subtitleTracks.count,
-        decodeStartTime: activeCurrentTime,
-        beginDecodeValidation: {
-          pauseActivePlayer()
-          isValidatingFFmpeg = true
-          RemotePlaybackCoordinator.shared.deactivate()
-        },
-        endDecodeValidation: {
-          isValidatingFFmpeg = false
-          configureRemotePlayback()
-          updateRemotePlaybackInfo()
-        }
+        subtitleTrackCount: activeTrackSelector?.subtitleTracks.count
       )
-      .presentationDetents(isValidatingFFmpeg ? [.large] : [.medium, .large])
+      .presentationDetents([.medium, .large])
       .presentationDragIndicator(.visible)
     }
     .onChange(of: showInfo) { _, presented in
@@ -454,6 +442,7 @@ struct PlayerScreen: View {
     if let model {
       if useFFmpeg {
         FFmpegPlayerSurface(engine:ffmpegEngine,layout:videoLayout)
+          .overlay { TimelinePreviewOverlay(previews:ffmpegEngine.timelinePreview,layout:videoLayout) }
       } else if useVLC, model.selectedSource?.isOriginal == true, VLCAvailability.isAvailable {
         VLCPlayerView(controller: vlcController)
       } else {
@@ -1319,14 +1308,7 @@ struct PlayerScreen: View {
         LazyVStack(alignment: .leading, spacing: 12) {
           if let model {
             VStack(alignment:.leading,spacing:8) {
-              settingsSectionTitle("播放内核")
-              HStack {
-                settingsChip("FFmpeg",selected:useFFmpeg) { switchPlaybackBackend(.ffmpeg) }
-                settingsChip("AVPlayer",selected:!useFFmpeg && !useVLC) { switchPlaybackBackend(.apple) }
-                if VLCAvailability.isAvailable {
-                  settingsChip("VLC",selected:useVLC) { switchPlaybackBackend(.vlc) }
-                }
-              }
+              Text("播放内核：\(activeStatistics.backend?.rawValue ?? "准备中")").font(.caption)
               if let reason=ffmpegReason { Text(reason).font(.caption).foregroundStyle(.orange) }
               if let failure=lastFFmpegFailure {
                 DisclosureGroup("上次 FFmpeg 失败快照") {
@@ -1335,15 +1317,16 @@ struct PlayerScreen: View {
                 }
               }
               if useFFmpeg {
-                Text("AirPlay 可选择系统音频路由；远端视频播放请尝试 AVPlayer，实际可用性取决于文件与鉴权。")
+                Text("AirPlay 可选择系统音频路由；远端视频输出取决于当前内核、文件与鉴权。")
                   .font(.caption).foregroundStyle(.secondary)
-                Text(ffmpegEngine.diagnostics).font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
-                Button("复制 FFmpeg 播放诊断") { UIPasteboard.general.string=ffmpegEngine.diagnostics }
+                DisclosureGroup("播放详情") {
+                  Text(ffmpegEngine.diagnostics).font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
+                  Button("复制播放诊断") { UIPasteboard.general.string=ffmpegEngine.diagnostics }
+                }
                 Button("清空 FFmpeg 分段缓存并重新读取") { Task { await ffmpegEngine.clearSegmentCache() } }
                 if let failure=ffmpegEngine.pip?.failure { Text(failure).font(.caption).foregroundStyle(.orange) }
                 if let warning=ffmpegEngine.subtitleWarning { Text(warning).font(.caption).foregroundStyle(.orange) }
                 if ffmpegEngine.hasAtmosMetadata {
-                  Button("尝试系统音频输出") { switchPlaybackBackend(.apple) }
                   Text("当前为立体声；系统能否输出空间音频取决于文件和音频设备。")
                     .font(.caption).foregroundStyle(.secondary)
                 }
@@ -1410,8 +1393,15 @@ struct PlayerScreen: View {
           ) {
             keepControlsDuringInteraction()
             Task { @MainActor in
-              await model.select(source,external:useFFmpeg)
-              activatePlaybackEngine(for: model)
+              let itemID=currentItem.id
+              let position=activeCurrentTime, playing=useFFmpeg ? ffmpegEngine.wantsPlayback : activeIsPlaying
+              let volume=activeVolume
+              ffmpegEngine.stop(); vlcController.stop(saveProgress:false); model.suspendForExternalEngine()
+              useFFmpeg=true; useVLC=false; didFFmpegFallback=false
+              await model.select(source,external:true)
+              guard !Task.isCancelled, currentItem.id==itemID else { return }
+              ffmpegEngine.start(source:source,item:currentItem,api:appState.api,library:appState.libraryStore,at:position,playing:playing)
+              ffmpegEngine.setVolume(volume)
               applyPlaybackRate(playbackRate, persist: false)
               applyAutomaticOrientation(for: model.videoDisplaySize)
               configureRemotePlayback()
@@ -1845,9 +1835,9 @@ struct PlayerScreen: View {
     return VStack(spacing: isScrubbing ? 3 : 0) {
       if isScrubbing {
         HStack(spacing: 8) {
-          Text(formatTime(scrubValue))
+          Text(PlaybackPolicy.timestamp(scrubValue))
           Spacer(minLength: 8)
-          Text("−\(formatTime(remaining))")
+          Text("−\(PlaybackPolicy.timestamp(remaining))")
         }
         .font(.caption2.monospacedDigit().weight(.semibold))
         .foregroundStyle(.white.opacity(0.78))
@@ -1924,7 +1914,8 @@ struct PlayerScreen: View {
               } else {
                 startValue = scrubStartValue
               }
-              let delta = Double(value.translation.width / width) * duration
+              let sensitivity = pow(0.1,Double(min(3,abs(value.translation.height)/60)))
+              let delta = Double(value.translation.width / width) * duration * sensitivity
               scrubValue = min(max(startValue + delta, 0), duration)
 
               // Cached previews follow the finger; AVPlayer commits a single
@@ -1932,9 +1923,6 @@ struct PlayerScreen: View {
               activeEngine?.interactiveScrub(to: scrubValue)
             }
             .onEnded { value in
-              let startValue = isScrubbing ? scrubStartValue : min(max(activeCurrentTime, 0), duration)
-              let delta = Double(value.translation.width / width) * duration
-              scrubValue = min(max(startValue + delta, 0), duration)
               activeEngine?.endInteractiveScrub(to: scrubValue, resumeAfter: scrubWasPlaying)
               scrubWasPlaying = false
               scrubStartValue = scrubValue
@@ -2115,12 +2103,13 @@ struct PlayerScreen: View {
       vlcController.stop()
     }
 
+    useFFmpeg=true; useVLC=false; didFFmpegFallback=false; ffmpegReason=nil
     let newModel = PlayerModel(
       item: expectedItem,
       api: appState.api,
       libraryStore: appState.libraryStore,
       defaultQuality: appState.defaultQuality,
-      originalPlaybackEngine: appState.originalPlaybackEngine,
+      originalPlaybackEngine: .system,
       fastStartEnabled: appState.fastStartEnabled,
       networkAutoRecoveryEnabled: appState.networkAutoRecoveryEnabled
     )
@@ -2130,7 +2119,7 @@ struct PlayerScreen: View {
     // The first frame has strict priority. Do not even START NFO/poster,
     // subtitle, chapter, or full-playlist requests until the playback engine has
     // received its URL and begun opening the media connection.
-    await newModel.prepareAndPlay(external:useFFmpeg)
+    await newModel.prepareAndPlay(external:true)
     guard !Task.isCancelled, currentItem.id == expectedID, model === newModel else {
       newModel.pause()
       return
@@ -2139,7 +2128,7 @@ struct PlayerScreen: View {
     Logger(subsystem: "com.xiaocai.gallery115", category: "PlaybackStartup")
       .info("Source handed to engine after \(ProcessInfo.processInfo.systemUptime - startupBeganAt, privacy: .public)s")
 
-    activatePlaybackEngine(for: newModel)
+    activatePlaybackEngine(for: newModel,startupOrigin:startupBeganAt)
     applyPlaybackRate(playbackRate, persist: false)
     applyAutomaticOrientation(for: newModel.videoDisplaySize)
     configureRemotePlayback()
@@ -2244,11 +2233,11 @@ struct PlayerScreen: View {
   }
 
   @MainActor
-  private func activatePlaybackEngine(for playerModel: PlayerModel) {
+  private func activatePlaybackEngine(for playerModel: PlayerModel,startupOrigin:Double? = nil) {
     if useFFmpeg, let source=playerModel.selectedSource {
       playerModel.suspendForExternalEngine()
       ffmpegEngine.start(source:source,item:currentItem,api:appState.api,library:appState.libraryStore,
-        at:appState.libraryStore.resumePosition(for:currentItem))
+        at:appState.libraryStore.resumePosition(for:currentItem),startupOrigin:startupOrigin)
       ffmpegEngine.setPlaybackRate(playbackRate)
       ffmpegEngine.subtitleDelay=appState.subtitleDelaySeconds
       return
@@ -2368,7 +2357,6 @@ struct PlayerScreen: View {
   }
 
   private var activeEngine: (any PlayerEngine)? {
-    if isValidatingFFmpeg { return nil }
     if useFFmpeg { return ffmpegEngine }
     if useVLC { return vlcController }
     return model
@@ -2598,7 +2586,6 @@ struct PlayerScreen: View {
 
   @MainActor
   private func configureRemotePlayback() {
-    guard !isValidatingFFmpeg else { return }
     RemotePlaybackCoordinator.shared.activate(
       skipSeconds: appState.doubleTapSeekSeconds,
       onPlay: { resumeActivePlayer() },
@@ -2619,7 +2606,6 @@ struct PlayerScreen: View {
 
   @MainActor
   private func updateRemotePlaybackInfo() {
-    guard !isValidatingFFmpeg else { return }
     RemotePlaybackCoordinator.shared.updatePlayback(
       elapsed: activeCurrentTime,
       duration: activeDuration,
@@ -3065,10 +3051,6 @@ private struct PlayerInfoSheet: View {
   let state: PlayerState
   let audioTrackCount: Int?
   let subtitleTrackCount: Int?
-  let decodeStartTime: Double
-  let beginDecodeValidation: () -> Void
-  let endDecodeValidation: () -> Void
-
   var body: some View {
     NavigationStack {
       List {
@@ -3151,13 +3133,6 @@ private struct PlayerInfoSheet: View {
         }
 
         Section("内核诊断") {
-          if let source = model?.selectedSource {
-            NavigationLink("FFmpeg 读取与音视频对照") {
-              FFmpegDecodeValidationView(item:item,source: source, startTime: decodeStartTime)
-                .onAppear(perform: beginDecodeValidation)
-                .onDisappear(perform: endDecodeValidation)
-            }
-          }
           LabeledContent("统一状态", value: state.title)
           LabeledContent("解码方式", value: statistics.decoder ?? "当前内核未提供")
           LabeledContent("画面输出", value: statistics.renderer ?? "未提供")

@@ -293,13 +293,10 @@ final class AppState {
       defaultQuality = .original
       defaults.set(DefaultQuality.original.rawValue, forKey: Keys.defaultQuality)
     } else {
-      defaultQuality = DefaultQuality(rawValue: savedQuality) ?? .highestTranscode
+      defaultQuality = DefaultQuality(rawValue: savedQuality) ?? .original
     }
-    let savedEngine = defaults.string(forKey: Keys.originalPlaybackEngine) ?? ""
-    originalPlaybackEngine = OriginalPlaybackEngine(rawValue: savedEngine) ?? .automatic
-    if savedEngine == "mpv" {
-      defaults.set(OriginalPlaybackEngine.automatic.rawValue, forKey: Keys.originalPlaybackEngine)
-    }
+    PlaybackPolicy.migrateEnginePreference(defaults)
+    originalPlaybackEngine = .automatic
     colorSchemePreference =
       ColorSchemePreference(rawValue: defaults.string(forKey: Keys.colorScheme) ?? "") ?? .system
     let sourceStore = MediaSourceSelectionStore.shared

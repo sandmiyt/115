@@ -27,7 +27,7 @@
 #define FRAMES 6
 #define BYTE_LIMIT (16 * 1024 * 1024)
 typedef struct { AVPacket *packet; int serial, eof; double duration, target; } Packet;
-typedef struct { CVPixelBufferRef buffer; double pts, duration; int serial; } Frame;
+typedef struct { CVPixelBufferRef buffer; double pts, duration; int serial, estimated; } Frame;
 typedef struct { float *samples; double pts; int count, serial; } PCM;
 #define PCM_LIMIT 96
 struct CinevaFFmpegSession {
@@ -43,6 +43,7 @@ struct CinevaFFmpegSession {
     atomic_llong deadline;
     char *url, *headers;
     double target, origin;
+    int64_t createdUs;
     AVFormatContext *format;
     AVIOContext *customIO;
     int64_t customOffset;
@@ -95,6 +96,7 @@ static int customRead(void *opaque, uint8_t *buffer, int capacity) {
     int n = interrupted(s) ? -3 : s->options.read(s->options.ioContext, offset, buffer, capacity, atomic_load(&s->ioGeneration));
     int result = n > 0 ? n : n == 0 ? AVERROR_EOF : n == -3 ? AVERROR_EXIT : n == -2 ? AVERROR(ETIMEDOUT) : AVERROR(EIO);
     pthread_mutex_lock(&s->mutex);
+    if (n > 0 && s->snapshot.firstByteSeconds <= 0) s->snapshot.firstByteSeconds = (av_gettime_relative()-s->createdUs)/1000000.0;
     s->snapshot.lastReadOffset = offset; s->snapshot.lastReadCapacity = capacity; s->snapshot.lastReadResult = result;
     pthread_mutex_unlock(&s->mutex);
     if (n > 0) s->customOffset += n;
@@ -311,11 +313,12 @@ static int emitVideo(CinevaFFmpegSession *s, AVFrame *frame, int serial, double 
     AVRational durationBase = frame->time_base.num > 0 && frame->time_base.den > 0 ?
         frame->time_base : s->videoTimeBase;
     double step = frame->duration > 0 ? frame->duration * av_q2d(durationBase) : 0;
-    if (!isfinite(step) || step <= 0)
+    int estimated = !isfinite(step) || step <= 0;
+    if (estimated)
         step = 1.0 / (isfinite(s->snapshot.fps) && s->snapshot.fps > 0 ? s->snapshot.fps : 30);
     *nextPTS = pts + step;
     if (serial != atomic_load(&s->generation)) return 0;
-    if (pts + 0.001 < target) {
+    if (s->options.preview ? pts + step <= target : pts + 0.001 < target) {
         pthread_mutex_lock(&s->mutex); s->snapshot.prerollFrames++; pthread_mutex_unlock(&s->mutex);
         return 0;
     }
@@ -324,13 +327,13 @@ static int emitVideo(CinevaFFmpegSession *s, AVFrame *frame, int serial, double 
     int error = cineva_copy_video_surface(frame, s->videoParameters, &s->scale, &pixel, &output);
     if (error < 0) return error;
     pthread_mutex_lock(&s->mutex);
-    int frameLimit = output.outputWidth * output.outputHeight > 1920 * 1080 ? 3 : FRAMES;
+    int frameLimit = s->options.preview ? 1 : output.outputWidth * output.outputHeight > 1920 * 1080 ? 3 : FRAMES;
     while (s->frameCount >= frameLimit && !atomic_load(&s->cancelled) &&
            serial == atomic_load(&s->generation)) pthread_cond_wait(&s->changed, &s->mutex);
     if (atomic_load(&s->cancelled) || serial != atomic_load(&s->generation) || atomic_load(&s->videoSuppressed)) {
         CVPixelBufferRelease(pixel);
     } else {
-        s->frames[(s->frameHead + s->frameCount++) % FRAMES] = (Frame){pixel, fmax(0, pts), step, serial};
+        s->frames[(s->frameHead + s->frameCount++) % FRAMES] = (Frame){pixel, fmax(0, pts), step, serial, estimated};
         s->frameSeconds += step;
         s->snapshot.videoFrames++;
         s->snapshot.decoderType = output.decoderType;
@@ -356,7 +359,8 @@ static int receiveFrames(CinevaFFmpegSession *s, AVCodecContext *codec, AVFrame 
         }
         int error = 0;
         if (video) {
-            pthread_mutex_lock(&s->mutex); s->snapshot.decodedVideoFrames++; pthread_mutex_unlock(&s->mutex);
+            pthread_mutex_lock(&s->mutex); s->snapshot.decodedVideoFrames++;
+            if (s->snapshot.firstDecodedSeconds <= 0) s->snapshot.firstDecodedSeconds=(av_gettime_relative()-s->createdUs)/1000000.0; pthread_mutex_unlock(&s->mutex);
             decoderStage(s, CinevaStageVideoSurface);
             error = emitVideo(s, frame, entry.serial, entry.target, nextPTS);
             if (error < 0) *failureStage = CinevaStageVideoSurface;
@@ -682,6 +686,7 @@ static void *readLoop(void *opaque) {
         result = openInput(s, attempt);
         readerFinished(s, 0);
         if (result < 0) goto done;
+        pthread_mutex_lock(&s->mutex); s->snapshot.openSeconds=(av_gettime_relative()-s->createdUs)/1000000.0; pthread_mutex_unlock(&s->mutex);
         // Detect the actual demuxer, never a filename suffix or URL. Set before
         // stream probing too, so audio-only verification cannot cause MP4 seeks.
         int mov = s->format->iformat == av_find_input_format("mov");
@@ -720,6 +725,7 @@ static void *readLoop(void *opaque) {
         s->readerFunction = "avformat_find_stream_info";
         result = avformat_find_stream_info(s->format, NULL);
         readerFinished(s, 0);
+        pthread_mutex_lock(&s->mutex); s->snapshot.probeSeconds=(av_gettime_relative()-s->createdUs)/1000000.0; pthread_mutex_unlock(&s->mutex);
         s->videoIndex = selectVideo(s->format);
         s->audioSourceIndex = av_find_best_stream(s->format, AVMEDIA_TYPE_AUDIO, -1, s->videoIndex, NULL, 0);
         s->audioIndex = s->videoOnly ? -1 : s->audioSourceIndex;
@@ -961,6 +967,7 @@ CinevaFFmpegSession *CinevaFFmpegSessionCreate(const char *url, const char *head
     atomic_init(&s->interruptSeek, 0); atomic_init(&s->ioGeneration, 1);
     atomic_init(&s->deadline, 0);
     s->url = strdup(url); s->headers = strdup(headers);
+    s->createdUs=av_gettime_relative();
     s->target = isfinite(startTime) ? fmax(0, startTime) : 0;
     s->playbackPosition = s->target;
     s->snapshot.recoveryTarget = s->target;
@@ -1095,7 +1102,7 @@ CVPixelBufferRef CinevaFFmpegSessionCopyFrame(CinevaFFmpegSession *s, double *pt
     CVPixelBufferRef result = NULL;
     if (s->frameCount) {
         Frame frame = s->frames[s->frameHead]; s->frameHead = (s->frameHead + 1) % FRAMES;
-        s->frameCount--; *pts = frame.pts; *duration = frame.duration; *serial = frame.serial; result = frame.buffer;
+        s->frameCount--; *pts = frame.pts; *duration = s->options.preview && frame.estimated ? -frame.duration : frame.duration; *serial = frame.serial; result = frame.buffer;
         s->frameSeconds = fmax(0, s->frameSeconds - frame.duration);
     }
     pthread_cond_broadcast(&s->changed); pthread_mutex_unlock(&s->mutex);

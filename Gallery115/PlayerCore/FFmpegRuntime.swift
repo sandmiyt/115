@@ -2,7 +2,7 @@ import Foundation
 import CinevaFFmpeg
 
 /// Dependency capabilities only. Actual Phase 3 demux/decode is implemented in
-/// FFmpegDecodeSession, independently of AVPlayer and VLC.
+/// FFmpegPlayerEngine, independently of AVPlayer and VLC.
 enum FFmpegRuntime {
   struct BuildInfo {
     let version: String

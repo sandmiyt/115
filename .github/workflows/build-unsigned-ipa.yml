@@ -113,6 +113,9 @@ jobs:
           print("Buffer policy checks passed: \(checks)")
           SWIFT
           swift "$RUNNER_TEMP/buffer-policy.swift"
+          swiftc Gallery115/Models/VideoSource.swift Gallery115/PlayerCore/PlaybackPolicy.swift \
+            Tests/PlayerTransport/PlaybackChecks.swift -o "$RUNNER_TEMP/playback-checks"
+          "$RUNNER_TEMP/playback-checks"
           swiftc Gallery115/Models/VideoSource.swift Gallery115/PlayerCore/RangeCoordinator.swift \
             Tests/PlayerTransport/RangeChecks.swift -o "$RUNNER_TEMP/range-checks"
           python3 Tests/PlayerTransport/range_server.py --port-file "$RUNNER_TEMP/range-port" &

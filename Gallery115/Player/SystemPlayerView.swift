@@ -158,6 +158,16 @@ final class TimelinePreviewController {
     let bytes: Int
   }
 
+  private(set) var requestedPreviewTime=0.0
+  private(set) var previewNote:String?
+  func beginExternal(at seconds:Double) {
+    cancelRequest(); isActive=true; requestedPreviewTime=seconds; previewNote="正在读取预览"
+  }
+  func targetExternal(_ seconds:Double) { requestedPreviewTime=seconds }
+  func displayExternal(_ image:UIImage?,pts:Double,note:String) {
+    self.image=image; imageTime=pts; previewNote=note
+  }
+
   func configure(asset: AVAsset, identity: String, allowsWarmup: Bool, fallbackAsset: AVAsset? = nil) {
     guard sourceIdentity != identity else { return }
     cancelRequest()
@@ -353,8 +363,7 @@ struct TimelinePreviewOverlay: View {
         .background(.black)
         .clipped()
         .overlay(alignment: .topLeading) {
-          let seconds = max(Int(previews.imageTime), 0)
-          Text(String(format: "预览 %02d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60))
+          Text("预览 \(PlaybackPolicy.timestamp(previews.imageTime))" + (previews.previewNote.map { " · " + $0 } ?? ""))
             .font(.caption.monospacedDigit())
             .padding(6)
             .background(.black.opacity(0.55), in: Capsule())
@@ -365,7 +374,7 @@ struct TimelinePreviewOverlay: View {
     } else if previews.isActive {
       VStack {
         Spacer()
-        Text("正在读取预览…")
+        Text("\(PlaybackPolicy.timestamp(previews.requestedPreviewTime)) · \(previews.previewNote ?? "正在读取预览…")")
           .font(.caption)
           .padding(8)
           .background(.black.opacity(0.55), in: Capsule())

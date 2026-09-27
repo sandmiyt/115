@@ -182,8 +182,9 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     let attemptIndex: Int
     var retryAfter: Double?
     var retryPending=false
+    var readers:Set<Int32>=[]
     init(start: Int64, end: Int64, generation: Int32, recovery: Recovery? = nil) {
-      self.start=start; self.end=end; self.generation=generation; consumedThrough=start
+      self.start=start; self.end=end; self.generation=generation; consumedThrough=start; readers=[generation]
       self.recovery=recovery ?? Recovery(generation:generation)
       attemptIndex=self.recovery.attempts.count
       self.recovery.attempts.append(RangeAttempt(number:attemptIndex+1,offset:start))
@@ -217,6 +218,10 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
   private var source: VideoSource
   private var length:Int64 = -1 // HTTP-confirmed only, never the listing hint.
   private var generation:Int32 = 1
+  private var previewTokens:Set<Int32>=[]
+  private var nextPreviewToken:Int32=1_000_000
+  private var readerErrors:[Int32:Int32]=[:]
+  private var primaryReaders=0
   private var closed=false, refreshing=false, refreshed=false
   private var fatalError:Int32?
   private var responseValidator:String?
@@ -227,6 +232,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
   private var session:URLSession!
   private var issueOwner:UUID?
   private var refreshTask:Task<Void,Never>?
+  private var refreshOwner:Int32?
   // A new schema prevents reuse of v53 pages whose HTTP representation was not checked.
   private var diskKey:String? {
     guard cacheEnabled, length>0, !identity.validator.isEmpty, let responseValidator else { return nil }
@@ -248,19 +254,43 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
   }
   var statistics:RangeStatistics { condition.lock(); defer { condition.unlock() }; return stats }
   var fileSize:Int64 { condition.lock(); defer { condition.unlock() }; return length }
+  // Preview scopes share verified pages, validators, URL refresh and the same
+  // two-request budget, but never the primary cursor or cancellation lifetime.
+  func makePreviewToken() -> Int32 {
+    condition.lock(); defer { condition.unlock() }
+    nextPreviewToken += 1; previewTokens.insert(nextPreviewToken); return nextPreviewToken
+  }
+  private func valid(_ token:Int32) -> Bool { !closed && (token==generation || previewTokens.contains(token)) }
+  func cancelPreview(_ token:Int32) {
+    condition.lock(); previewTokens.remove(token); readerErrors.removeValue(forKey:token)
+    cancelFlights(for:token)
+    if refreshOwner==token { refreshTask?.cancel(); refreshTask=nil; refreshing=false; refreshed=false; refreshOwner=nil }
+    condition.broadcast(); condition.unlock()
+  }
+  private func cancelFlights(for token:Int32) {
+    for (id,f) in flights {
+      f.readers.remove(token)
+      if f.readers.isEmpty {
+        if f.recovery.hadFailure { publishRecovery(f.recovery,outcome:"cancelled") }
+        f.task?.cancel(); flights.removeValue(forKey:id); stats.cancelled+=1
+      }
+    }
+  }
   func changeGeneration(_ value:Int32) {
-    condition.lock(); generation=value
-    if value<0 { closed=true }
-    let tasks=flights.values.compactMap(\.task); stats.cancelled+=tasks.count
-    for f in flights.values where f.recovery.hadFailure && f.recovery.outcome=="recovering" {
-      publishRecovery(f.recovery,outcome:"cancelled")
+    condition.lock()
+    let previous=generation; generation=value; readerErrors.removeValue(forKey:previous)
+    cancelFlights(for:previous)
+    if value<0 {
+      closed=true; previewTokens.removeAll()
+      for f in flights.values { f.task?.cancel() }
+      flights.removeAll()
     }
     if stats.terminalFailure==nil { stats.lastIssue=nil; stats.lastError=nil; issueOwner=nil }
     refreshTask?.cancel(); refreshTask=nil
     if refreshing { refreshing=false; refreshed=false }
     if stats.terminalFailure != nil, stats.clues.count<4 { stats.clues.append("subsequent cancellation generation=\(value)") }
-    flights.removeAll(); condition.broadcast(); condition.unlock()
-    tasks.forEach { $0.cancel() }; if value<0 { session.invalidateAndCancel() }
+    condition.broadcast(); condition.unlock()
+    if value<0 { session.invalidateAndCancel() }
   }
   func close() { changeGeneration(-1) }
   private func issue(_ kind:RangeFailureKind, flight f:Flight, code:Int32, native:NSError? = nil) {
@@ -272,10 +302,14 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
       verifiedLength:length,observedLength:f.observedLength,redirects:f.redirects,
       applicationUAPreserved:f.uaPreserved,networkDomain:domain,networkCode:native?.code ?? 0)
     if stats.terminalFailure != nil, stats.clues.count<4 { stats.clues.append("subsequent transport=\(kind.rawValue)") }
-    f.issue=evidence; stats.lastIssue=evidence; stats.lastError=kind.rawValue; issueOwner=f.recovery.id
+    f.issue=evidence
+    if f.readers.contains(generation) { stats.lastIssue=evidence; stats.lastError=kind.rawValue; issueOwner=f.recovery.id }
     if [.malformedResponse,.metadataConflict,.resourceChanged,.unsupportedBackend,.redirectPolicy].contains(kind) {
-      if stats.terminalFailure==nil { stats.terminalFailure=evidence }
-      if fatalError==nil { fatalError=code }
+      for token in f.readers { readerErrors[token]=code }
+      if f.readers.contains(generation) {
+        if stats.terminalFailure==nil { stats.terminalFailure=evidence }
+        if fatalError==nil { fatalError=code }
+      }
       f.recovery.reason=kind.rawValue; publishRecovery(f.recovery,outcome:"rejected")
     }
   }
@@ -295,30 +329,38 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     publishRecovery(f.recovery,outcome:"recovered")
     if stats.terminalFailure==nil, issueOwner==f.recovery.id { stats.lastIssue=nil; stats.lastError=nil; issueOwner=nil }
   }
-  private func terminate(_ f:Flight) -> Int32 {
+  private func terminate(_ f:Flight, reader:Int32) -> Int32 {
     publishRecovery(f.recovery,outcome:"exhausted")
     f.finished=true; f.task?.cancel()
-    if stats.terminalFailure==nil { stats.terminalFailure=f.issue }
-    // Resource/protocol failures invalidate this session; never serve its stale pages afterwards.
-    if fatalError==nil { fatalError=f.error == 0 ? -1 : f.error }
-    return fatalError!
+    let error:Int32=f.error == 0 ? -1 : f.error
+    readerErrors[reader]=error
+    if reader==generation {
+      if stats.terminalFailure==nil { stats.terminalFailure=f.issue }
+      if fatalError==nil { fatalError=error }
+    }
+    return error
   }
   /// Returns 0 only after HTTP confirms EOF. Negative outcomes retain typed evidence.
   func read(offset:Int64, buffer:UnsafeMutablePointer<UInt8>, count:Int, generation wanted:Int32) -> Int32 {
     condition.lock()
+    let primary=wanted==generation
+    if primary { primaryReaders+=1 }
     var result:Int32 = -1
     stats.lastReadOffset=offset; stats.lastReadCount=count
-    defer { stats.lastReadResult=result; condition.unlock() }
+    defer {
+      if primary { primaryReaders-=1; stats.lastReadResult=result }
+      condition.broadcast(); condition.unlock()
+    }
     guard offset>=0, count>0 else { return result }
     let base=offset/page*page, deadline=ProcessInfo.processInfo.systemUptime+9
     var observed=Set<Int>(), checkedDisk=false
     var continuation:Recovery?
     while true {
-      if closed || wanted != generation {
+      if !valid(wanted) {
         if let continuation { publishRecovery(continuation,outcome:"cancelled") }
         result = -3; return result
       }
-      if let fatalError {
+      if let fatalError=readerErrors[wanted] ?? fatalError {
         if let continuation { publishRecovery(continuation,outcome:"exhausted") }
         result=fatalError; return result
       }
@@ -332,8 +374,8 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
       if !checkedDisk, let key=diskKey, length>base {
         checkedDisk=true; let expected=Int(min(page,length-base))
         condition.unlock(); let bytes=disk.read(key:key,offset:base,length:expected); condition.lock()
-        if closed || wanted != generation { result = -3; return result }
-        if let fatalError { result=fatalError; return result }
+        if !valid(wanted) { result = -3; return result }
+        if let fatalError=readerErrors[wanted] ?? fatalError { result=fatalError; return result }
         if let bytes {
           storeVerified(bytes,at:base)
           let start=Int(offset-base), n=min(count,bytes.count-start)
@@ -341,14 +383,15 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
           result=Int32(n); return result
         }
       }
-      let active=flights.values.first(where: { $0.start<=offset && offset<=$0.end })
+      let active=flights.values.first(where: { $0.start<=offset && offset<=$0.end && ($0.error==0 || $0.readers.contains(wanted)) })
       let budget=active.map { $0.recovery.hadFailure && $0.recovery.outcome=="recovering" ? min(deadline,$0.recovery.started+9) : deadline } ?? continuation.map { min(deadline,$0.started+9) } ?? deadline
       if ProcessInfo.processInfo.systemUptime>=budget {
         let f=active ?? Flight(start:offset,end:offset,generation:wanted)
         f.recovery.reason="total-budget"
-        issue(.timeout,flight:f,code:-2); result=terminate(f); return result
+        issue(.timeout,flight:f,code:-2); result=terminate(f,reader:wanted); return result
       }
-      if let f=flights.values.first(where: { $0.start<=offset && offset<=$0.end }) {
+      if let f=flights.values.first(where: { $0.start<=offset && offset<=$0.end && ($0.error==0 || $0.readers.contains(wanted)) }) {
+        f.readers.insert(wanted)
         if !cacheEnabled, offset<f.consumedThrough {
           f.task?.cancel(); if let id=f.task?.taskIdentifier { flights.removeValue(forKey:id) }; continue
         }
@@ -357,10 +400,10 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
         if f.finished, f.error != 0, !f.retryPending {
           if f.error == -5, !refreshed, let refresh {
             f.recovery.hadFailure=true
-            if f.recovery.attempts.count>=3 { f.recovery.reason="attempt-limit"; result=terminate(f); return result }
+            if f.recovery.attempts.count>=3 { f.recovery.reason="attempt-limit"; result=terminate(f,reader:wanted); return result }
             continuation=f.recovery; publishRecovery(f.recovery)
             if let id=f.task?.taskIdentifier { flights.removeValue(forKey:id) }
-            refreshed=true; refreshing=true; stats.refreshes+=1
+            refreshed=true; refreshing=true; refreshOwner=wanted; stats.refreshes+=1
             refreshTask=Task.detached { [weak self] in
               do { self?.didRefresh(try await refresh(),generation:wanted) }
               catch { self?.didRefresh(nil,generation:wanted) }
@@ -373,25 +416,31 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
             let delay=max(backoff,f.retryAfter ?? 0)
             if cycle.attempts.count>=3 || ProcessInfo.processInfo.systemUptime+delay>=budget {
               cycle.reason=cycle.attempts.count>=3 ? "attempt-limit" : "retry-after-exceeds-budget"
-              result=terminate(f); return result
+              result=terminate(f,reader:wanted); return result
             }
             f.retryPending=true // One waiter owns the retry; other readers coalesce.
             cycle.attempts[f.attemptIndex].plannedWait=delay
             let waitStart=ProcessInfo.processInfo.systemUptime, until=waitStart+delay
             publishRecovery(cycle)
-            while !closed && wanted==generation && fatalError==nil && ProcessInfo.processInfo.systemUptime<until {
+            while valid(wanted) && fatalError==nil && ProcessInfo.processInfo.systemUptime<until {
               _=condition.wait(until:Date(timeIntervalSinceNow:min(0.1,until-ProcessInfo.processInfo.systemUptime)))
               cycle.attempts[f.attemptIndex].actualWait=ProcessInfo.processInfo.systemUptime-waitStart
             }
             cycle.attempts[f.attemptIndex].actualWait=ProcessInfo.processInfo.systemUptime-waitStart
             publishRecovery(cycle)
-            if closed || wanted != generation { publishRecovery(cycle,outcome:"cancelled"); result = -3; return result }
-            if let fatalError { result=fatalError; return result }
-            if ProcessInfo.processInfo.systemUptime>=budget { cycle.reason="total-budget"; result=terminate(f); return result }
+            if !valid(wanted) {
+              f.retryPending=false
+              if f.readers.isEmpty { publishRecovery(cycle,outcome:"cancelled") }
+              condition.broadcast(); result = -3; return result
+            }
+            if let fatalError=readerErrors[wanted] ?? fatalError { result=fatalError; return result }
+            if ProcessInfo.processInfo.systemUptime>=budget { cycle.reason="total-budget"; result=terminate(f,reader:wanted); return result }
             guard let id=f.task?.taskIdentifier, flights[id] === f else { continue }
             flights.removeValue(forKey:id)
-            observed.insert(startFlight(at:offset,generation:wanted,recovery:cycle))
-          } else { result=terminate(f); return result }
+            let retryID=startFlight(at:offset,generation:wanted,recovery:cycle)
+            flights[retryID]?.readers=f.readers
+            observed.insert(retryID)
+          } else { result=terminate(f,reader:wanted); return result }
           continue
         }
         let start=Int(offset-f.start)
@@ -407,7 +456,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
         }
       } else if !refreshing {
         if flights.count>=2, let old=flights.values.first(where:{ $0.finished && !$0.retryPending }), let id=old.task?.taskIdentifier { flights.removeValue(forKey:id) }
-        if flights.count<2 {
+        if flights.count<2, wanted==generation || (primaryReaders==0 && !flights.values.contains(where: { !$0.readers.contains(generation) && !$0.finished })) {
           observed.insert(startFlight(at:offset,generation:wanted,recovery:continuation)); continuation=nil
         }
       }
@@ -450,14 +499,16 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
   }
   private func didRefresh(_ value:VideoSource?,generation wanted:Int32) {
     condition.lock(); defer { condition.broadcast(); condition.unlock() }
-    guard !closed, generation==wanted, refreshing else { return }
+    guard valid(wanted), refreshing else { return }
     refreshing=false; refreshTask=nil
     if let value, value.isOriginal==source.isOriginal { source=value }
     else {
       // Preserve the original 401/403 facts if refreshing the signed URL fails.
-      if stats.terminalFailure==nil { stats.terminalFailure=stats.lastIssue }
-      if stats.clues.count<4 { stats.clues.append("URL refresh failed") }
-      fatalError = -5
+      readerErrors[wanted] = -5
+      if wanted==generation {
+        if stats.terminalFailure==nil { stats.terminalFailure=stats.lastIssue }
+        if stats.clues.count<4 { stats.clues.append("URL refresh failed") }; fatalError = -5
+      }
     }
   }
   private func verifyIdentity(total:Int64,validator:String?,flight f:Flight) -> Bool {
@@ -563,7 +614,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
           flight:f,code:native?.code==NSURLErrorTimedOut ? -2 : -1,native:native)
         // A partially delivered response that later breaks is not a legal short
         // prefix. Do not turn repeated disconnects into unbounded prefix retries.
-        if f.receivedBytes>0 { _=terminate(f) }
+        if f.receivedBytes>0 { for token in f.readers { _=terminate(f,reader:token) } }
       }
     }
     if f.error==0, f.accepted { recovered(f) }
