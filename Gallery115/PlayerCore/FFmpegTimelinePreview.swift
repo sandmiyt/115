@@ -132,7 +132,6 @@ final class FFmpegTimelinePreview {
   private var task:Task<Void,Never>?
   private var epoch=UUID()
   private var latest=0.0
-  private var requestedAt=0.0
   private var direction=0
   private var directionEpoch=0
   private var source:VideoSource?
@@ -155,7 +154,7 @@ final class FFmpegTimelinePreview {
       if direction != 0 && direction != nextDirection { directionEpoch &+= 1 }
       direction=nextDirection
     }
-    latest=next; requestedAt=ProcessInfo.processInfo.systemUptime; display.targetExternal(latest)
+    latest=next; display.targetExternal(latest)
     guard task==nil, let worker else { return }
     let expected=epoch
     task=Task { [weak self] in
@@ -169,8 +168,8 @@ final class FFmpegTimelinePreview {
         // Never publish a result from an old drag, reversal or long stale read.
         if self.latest==target || (self.directionEpoch==motion && ProcessInfo.processInfo.systemUptime-began<0.25) {
           self.display.displayExternal(result.image,pts:result.pts,note:result.note)
-          self.diagnostic=String(format:"目标更新→预览结果 %.1f ms · 目标 %@ · 实际 PTS %@ · 误差 %.3f s · %@",
-            (ProcessInfo.processInfo.systemUptime-self.requestedAt)*1000,PlaybackPolicy.timestamp(target),PlaybackPolicy.timestamp(result.pts),
+          self.diagnostic=String(format:"预览取帧 %.1f ms · 采样目标 %@ · 实际 PTS %@ · 误差 %.3f s · %@",
+            result.milliseconds,PlaybackPolicy.timestamp(target),PlaybackPolicy.timestamp(result.pts),
             result.pts-target,result.note)
         }
         if self.latest==target { self.task=nil; return }

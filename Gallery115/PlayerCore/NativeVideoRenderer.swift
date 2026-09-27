@@ -13,6 +13,7 @@ final class NativeVideoRenderer {
   private var blockedSince: Double?
   private var playbackRate = 1.0
   private(set) var anchored = false
+  private(set) var anchorSubmittedAt: Double?
   private(set) var waitingForData = true
   private(set) var lastPTS = -1.0
   private(set) var lastEnd = -1.0
@@ -43,6 +44,7 @@ final class NativeVideoRenderer {
     if preservingImage { output.flush() } else { layer.flushAndRemoveImage() }
     format = nil
     anchored = false
+    anchorSubmittedAt = nil
     waitingForData = true
     blockedSince = nil
     lastPTS = -1
@@ -93,6 +95,7 @@ final class NativeVideoRenderer {
     format = nil
     blockedSince = nil
     anchored = false
+    anchorSubmittedAt = nil
     waitingForData = true
     lastPTS = -1
     lastEnd = -1
@@ -161,6 +164,7 @@ final class NativeVideoRenderer {
         Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
     }
     output.enqueue(sample)
+    if restarting { anchorSubmittedAt=now }
     anchored = true
     lastPTS = pts
     lastEnd = pts + duration

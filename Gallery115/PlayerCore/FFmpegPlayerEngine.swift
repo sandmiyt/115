@@ -457,7 +457,10 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
       resetSubtitleImage()
       toneMapTask?.cancel(); toneMapTask=nil; pendingToneMapped=false
       serial=snapshot.serial; target=snapshot.recoveryTarget
-      localSeek=false; seekGeneration=0; commitAt=nil
+      localSeek=false
+      // Native decoder fallback can legitimately advance the generation during
+      // a seek. Keep its overlay until the replacement target frame arrives.
+      if commitAt != nil { seekGeneration=serial } else { seekGeneration=0; seekIO=nil }
       audio.reset(to:target,generation:serial); renderer.reset(to:target,preservingImage:true); pending=nil
       waiting=true; waitStarted=now; resumeTarget=0.75
     }
@@ -582,7 +585,8 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     else { displayReady=renderer.layer.status == .rendering }
     if displayReady, renderer.anchored {
       if displayReadyAt==nil { displayReadyAt=now }
-      if let began=commitAt, serial==seekGeneration, !hasAudio || audio.hasScheduledAudio {
+      if let began=commitAt, serial==seekGeneration, !hasAudio || audio.hasScheduledAudio,
+        let submitted=renderer.anchorSubmittedAt, now-submitted>=1.0/60 {
         seekFrameMilliseconds=(now-began)*1000; commitAt=nil
         preview.display.end() // Readiness proxy, never claim physical presentation.
       }
