@@ -53,11 +53,18 @@ struct DiagnosticBufferPolicy {
 }
 
 enum FFmpegReadMode: String, CaseIterable, Identifiable {
-  case standard, videoOnlySequential
+  case videoOnlyStandard, videoOnlySequential, standard, cachedAudio, decodeAudio
   var id: Self { self }
-  var videoOnly: Bool { self == .videoOnlySequential }
+  var videoOnly: Bool { self == .videoOnlySequential || self == .videoOnlyStandard }
+  var outputsAudio: Bool { self == .standard || self == .cachedAudio }
   var title: String {
-    self == .standard ? "A. 标准 FFmpeg" : "B. Video-only 顺序读取"
+    switch self {
+    case .videoOnlyStandard: return "Video-only + 标准读取"
+    case .videoOnlySequential: return "Video-only + 顺序读取（稳定对照）"
+    case .standard: return "音视频输出 + 旧 HTTP"
+    case .cachedAudio: return "音视频输出 + Custom AVIO 缓存"
+    case .decodeAudio: return "音频仅解码 + 旧 HTTP（不输出声音）"
+    }
   }
 }
 
@@ -80,6 +87,9 @@ struct FFmpegDiagnosticTrial: Identifiable {
   var compressed = 0.0
   var complete = false
   var interruption: String?
+  var httpRequests: Int?
+  var networkBytes: Int64?
+  var cacheHitBytes: Int64?
 
   var text: String {
     func seconds(_ value: Double?) -> String { value.map { String(format: "%.3f s", $0) } ?? "尚未发生" }
@@ -90,5 +100,6 @@ struct FFmpegDiagnosticTrial: Identifiable {
       + String(format: "AVIO 累计 %.2f MiB · packet jump 回退 %d / 前跳 >1 MiB %d\n", Double(bytes) / 1048576, backwards, forwards)
       + String(format: "取包平均 %.4f s / 最大 %.4f s · 压缩视频队列 %.3f s", averageRead, maximumRead, compressed)
       + (interruption.map { "\n对照标记：" + $0 } ?? "")
+      + (httpRequests.map { "\n真实 HTTP requests \($0) · 网络 bytes \(networkBytes ?? 0) · 缓存命中 bytes \(cacheHitBytes ?? 0)（以实际命中区分冷/暖）" } ?? "")
   }
 }

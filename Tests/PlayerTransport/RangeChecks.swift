@@ -18,6 +18,7 @@ import Foundation
     func read(_ c: RangeCoordinator,_ offset: Int64,_ count: Int = 4096,_ generation: Int32 = 1) -> Int32 {
       var bytes=[UInt8](repeating:0,count:count)
       let n=c.read(offset:offset,buffer:&bytes,count:count,generation:generation)
+      if n<0 { print("Range result \(n) at \(offset): \(c.statistics)"); fflush(stdout) }
       if n>0 { expect((0..<Int(n)).allSatisfy { bytes[$0]==UInt8((offset+Int64($0))%251) },"Byte integrity at \(offset)") }
       return n
     }

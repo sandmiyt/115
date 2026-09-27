@@ -5,9 +5,13 @@ import UIKit
 struct FFmpegDecodeValidationView: View {
   @Environment(\.dismiss) private var dismiss
   @Environment(\.scenePhase) private var scenePhase
+  @Environment(AppState.self) private var appState
+  let item: CloudItem
   let source: VideoSource
   let startTime: Double
   @State private var session = FFmpegDecodeSession()
+  @State private var player = FFmpegPlayerEngine()
+  @State private var activeMode: FFmpegReadMode = .videoOnlySequential
   @State private var slider = 0.0
   @State private var dragging = false
   @State private var preferHardware = true
@@ -20,54 +24,59 @@ struct FFmpegDecodeValidationView: View {
   var body: some View {
     ScrollView {
       VStack(spacing: 14) {
-        FFmpegValidationSurface(session: session)
+        Group {
+          if activeMode.outputsAudio { FFmpegPlayerSurface(engine:player,layout:.fit) }
+          else { FFmpegValidationSurface(session:session) }
+        }
           .frame(maxWidth: .infinity)
           .frame(height: 230)
           .background(.black)
           .clipped()
-        Text("原生渲染验证 · 暂不输出声音")
+        Text(activeMode.outputsAudio ? "完整音视频输出对照" : "原生渲染验证 · 无声对照")
           .font(.headline)
         VStack(alignment: .leading, spacing: 8) {
           Text("远程 MP4 读取模式").font(.subheadline.weight(.medium))
           Picker("远程 MP4 读取模式", selection: $readMode) {
             ForEach(FFmpegReadMode.allCases) { mode in Text(mode.title).tag(mode) }
           }.pickerStyle(.menu)
-          Text(session.modeDescription).font(.caption)
+          Text(activeMode.outputsAudio ? activeMode.title : session.modeDescription).font(.caption)
           Text(String(format: "A/B 共用当前取流 URL · 固定起点 %.3f 秒", comparisonPosition)).font(.caption)
           HStack {
             Button("重测当前模式") { restart() }
-            Button("设为当前进度并重测") { restart(at: session.currentTime) }
+            Button("设为当前进度并重测") { restart(at: activeTime) }
           }.font(.caption)
           Text("切换 A/B 会从同一起点重新验证。起播后计时 10 秒（含缓冲等待），结果保留在下方；暂停或手动拖动会标记未完成的对照。")
             .font(.caption).foregroundStyle(.secondary)
         }.frame(maxWidth: .infinity, alignment: .leading)
-        Text(session.mediaDescription).font(.caption).foregroundStyle(.secondary)
-        Text(session.decoderDescription).font(.subheadline.weight(.medium))
+        Text(activeMode.outputsAudio ? (player.statistics.codec ?? "正在探测媒体") : session.mediaDescription).font(.caption).foregroundStyle(.secondary)
+        Text(activeMode.outputsAudio ? (player.statistics.decoder ?? "等待解码") : session.decoderDescription).font(.subheadline.weight(.medium))
         Toggle("优先硬件解码", isOn: $preferHardware)
           .font(.subheadline)
-        if case .failed(let message) = session.state {
+        if case .failed(let message) = activeState {
           Text(message).font(.callout).foregroundStyle(.red)
           Button("从头验证") {
             restart(at: 0)
           }
         } else {
           HStack {
-            Text(session.state.title)
-            if session.state.needsLoadingIndicator || session.state == .seeking { ProgressView() }
+            Text(activeState.title)
+            if activeState.needsLoadingIndicator || activeState == .seeking { ProgressView() }
             Spacer()
-            Text("\(Int(session.currentTime)) / \(Int(session.duration)) 秒").monospacedDigit()
+            Text("\(Int(activeTime)) / \(Int(activeDuration)) 秒").monospacedDigit()
           }.font(.caption)
-          Slider(value: $slider, in: 0...max(1, session.duration), onEditingChanged: { editing in
+          Slider(value: $slider, in: 0...max(1, activeDuration), onEditingChanged: { editing in
             dragging = editing
-            if !editing { session.seek(to: slider) }
-          }).disabled(session.duration <= 0)
+            if !editing { seek(to: slider) }
+          }).disabled(activeDuration <= 0)
           HStack(spacing: 36) {
-            Button { session.seek(to: session.currentTime - 10) } label: { Image(systemName: "gobackward.10") }
-            Button { session.toggle() } label: { Image(systemName: session.wantsPlayback ? "pause.fill" : "play.fill") }
-            Button { session.seek(to: session.currentTime + 10) } label: { Image(systemName: "goforward.10") }
+            Button { seek(to: activeTime - 10) } label: { Image(systemName: "gobackward.10") }
+            Button { toggle() } label: { Image(systemName: activeWants ? "pause.fill" : "play.fill") }
+            Button { seek(to: activeTime + 10) } label: { Image(systemName: "goforward.10") }
           }.font(.title2)
         }
         VStack(alignment: .leading, spacing: 6) {
+          if activeMode.outputsAudio { Text(player.diagnostics).textSelection(.enabled) }
+          else {
           Text(session.outputDescription)
           Text(session.colorDescription)
           Text("渲染器：Apple Native · NV12 / P010")
@@ -95,6 +104,7 @@ struct FFmpegDecodeValidationView: View {
           if let latency = session.lastSeekSeconds { Text(String(format: "最近定位至首帧入队：%.2f 秒", latency)) }
           Text("硬解保持原分辨率和像素缓冲，HDR10 / HLG 保留 10 位及色彩标记；软件对照最高 720p，保留 HDR 位深。A 模式音频仅解码计数，B 模式不解码音频。Dolby Vision、字幕、音画同步及画中画尚未接入此入口。")
             .foregroundStyle(.secondary)
+          }
         }.font(.caption).frame(maxWidth: .infinity, alignment: .leading)
         VStack(alignment: .leading, spacing: 12) {
           Text("A/B 诊断记录").font(.headline)
@@ -104,11 +114,11 @@ struct FFmpegDecodeValidationView: View {
             Text(trial.text).textSelection(.enabled)
             Divider()
           }
-          Text("当前记录\n" + session.trial.text).textSelection(.enabled)
+          Text("当前记录\n" + activeTrial.text).textSelection(.enabled)
         }.font(.caption).frame(maxWidth: .infinity, alignment: .leading)
         Button(copiedDiagnostics ? "播放诊断已复制" : "复制播放诊断") {
-          UIPasteboard.general.string = session.diagnosticText + "\n\nA/B 诊断记录\n"
-            + (trials + [session.trial]).map(\.text).joined(separator: "\n\n")
+          UIPasteboard.general.string = activeDiagnostics + "\n\nA/B 诊断记录\n"
+            + (trials + [activeTrial]).map(\.text).joined(separator: "\n\n")
           copiedDiagnostics = true
         }.font(.caption)
         Spacer(minLength: 0)
@@ -125,22 +135,35 @@ struct FFmpegDecodeValidationView: View {
     }
     .onChange(of: preferHardware) { _, _ in restart() }
     .onChange(of: readMode) { _, _ in restart() }
-    .onDisappear { session.stop() }
-    .onChange(of: session.currentTime) { _, time in if !dragging { slider = time } }
+    .onDisappear { session.stop(); player.stop() }
+    .onChange(of: activeTime) { _, time in if !dragging { slider = time } }
     .onChange(of: scenePhase) { _, phase in
       // No experimental decoder survives backgrounding/privacy lock.
-      if phase != .active { session.stop(); dismiss() }
+      if phase != .active { session.stop(); player.stop(); dismiss() }
     }
   }
 
+  private var activeTime: Double { activeMode.outputsAudio ? player.currentTime : session.currentTime }
+  private var activeDuration: Double { activeMode.outputsAudio ? player.duration : session.duration }
+  private var activeState: PlayerState { activeMode.outputsAudio ? player.playbackState : session.state }
+  private var activeWants: Bool { activeMode.outputsAudio ? player.wantsPlayback : session.wantsPlayback }
+  private var activeTrial: FFmpegDiagnosticTrial { activeMode.outputsAudio ? player.trial : session.trial }
+  private var activeDiagnostics: String { activeMode.outputsAudio ? player.diagnostics : session.diagnosticText }
+  private func seek(to time: Double) { if activeMode.outputsAudio { player.seek(to:time) } else { session.seek(to:time) } }
+  private func toggle() { if activeMode.outputsAudio { player.togglePlayback() } else { session.toggle() } }
   private func restart(at position: Double? = nil) {
-    session.stop()
-    trials.append(session.trial)
+    session.stop(); player.stop()
+    trials.append(activeTrial)
     if let position { comparisonPosition = position.isFinite ? max(0, position) : 0 }
-    copiedDiagnostics = false
-    slider = comparisonPosition
-    session.start(source: source, at: comparisonPosition, preferHardware: preferHardware, mode: readMode)
+    copiedDiagnostics = false; slider = comparisonPosition; activeMode=readMode
+    if readMode.outputsAudio {
+      player.start(source:source,item:item,api:appState.api,library:appState.libraryStore,
+        at:comparisonPosition,useCache:readMode == .cachedAudio,preferHardware:preferHardware)
+    } else {
+      session.start(source:source,at:comparisonPosition,preferHardware:preferHardware,mode:readMode)
+    }
   }
+
 }
 
 private struct FFmpegValidationSurface: UIViewRepresentable {

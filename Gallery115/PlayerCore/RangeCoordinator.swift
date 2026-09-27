@@ -325,7 +325,8 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
       f.finished = true
       if error != nil || !f.accepted || f.data.count != f.expected {
         f.error = (error as NSError?)?.code == NSURLErrorTimedOut ? -2 : -1
-        stats.lastError = "Range 请求中断或响应长度不足"
+        let native=error as NSError?
+        stats.lastError = "Range 请求中断 / 长度不足：\(native?.domain ?? "length") \(native?.code ?? 0)，\(f.data.count)/\(f.expected)"
       }
     }
     var pages: [(Int64,Data)] = []

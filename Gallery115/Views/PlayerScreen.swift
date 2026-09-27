@@ -3082,8 +3082,8 @@ private struct PlayerInfoSheet: View {
 
         Section("内核诊断") {
           if let source = model?.selectedSource {
-            NavigationLink("FFmpeg 解码验证（无声）") {
-              FFmpegDecodeValidationView(source: source, startTime: decodeStartTime)
+            NavigationLink("FFmpeg 读取与音视频对照") {
+              FFmpegDecodeValidationView(item:item,source: source, startTime: decodeStartTime)
                 .onAppear(perform: beginDecodeValidation)
                 .onDisappear(perform: endDecodeValidation)
             }

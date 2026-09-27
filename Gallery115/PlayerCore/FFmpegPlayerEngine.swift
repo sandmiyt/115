@@ -17,6 +17,9 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   private(set) var wantsPlayback = true
   private(set) var statistics = PlayerStatistics(backend:.ffmpeg)
   private(set) var diagnostics = "FFmpeg 正在准备"
+  private(set) var trial = FFmpegDiagnosticTrial(mode:.cachedAudio,position:0,hardware:true)
+  @ObservationIgnored private var trialPlaybackAt: Double?
+  @ObservationIgnored private var trialFrozen = false
   private(set) var errorMessage: String?
   private(set) var videoSize: CGSize?
   private(set) var rotation = 0.0
@@ -70,10 +73,12 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   @ObservationIgnored private var restoredAudioPreference = false
 
   func start(source: VideoSource, item: CloudItem, api: APIClient, library: LibraryStore,
-             at position: Double, playing: Bool = true, useCache: Bool = true) {
+             at position: Double, playing: Bool = true, useCache: Bool = true, preferHardware: Bool = true) {
     stop()
     currentSource=source; sourceItem=item; self.api=api; self.library=library
     target=max(0,position.isFinite ? position : 0); currentTime=target
+    trial=FFmpegDiagnosticTrial(mode:useCache ? .cachedAudio : .standard,position:target,hardware:preferHardware)
+    trialPlaybackAt=nil; trialFrozen=false
     wantsPlayback=playing; waiting=true; resumeTarget=0.75; serial=1
     rebufferCount=0; audioUnderruns=0; firstFrameAt=nil
     audioTracks=[]; selectedAudioOptionID=nil; audioTail=false; restoredAudioPreference=false
@@ -86,7 +91,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
       fail("媒体请求头格式无效"); return
     }
     var options = CinevaFFmpegSessionOptions()
-    options.preferHardware=1; options.videoOnly=0; options.outputAudio=1
+    options.preferHardware=preferHardware ? 1 : 0; options.videoOnly=0; options.outputAudio=1
     if useCache {
       let scope: String
       if MediaSourceSelectionStore.shared.resolvedSource == .cloud115 {
@@ -119,6 +124,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     RunLoop.main.add(timer,forMode:.common); ticker=timer
   }
   func stop() {
+    interruptTrial("提前停止 / 切换模式")
     pip?.stop()
     scrubTask?.cancel(); scrubTask=nil
     saveProgress(force:true)
@@ -129,6 +135,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     playbackState = .stopped
   }
   func pause() {
+    interruptTrial("暂停或播放结束，观察窗口未完成")
     wantsPlayback=false; audio.pause(); renderer.setPlaying(false)
     playbackState = .paused; saveProgress(force:true)
   }
@@ -146,6 +153,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   }
   func setVolume(_ value: Float) { volume=min(1,max(0,value)); audio.setVolume(volume) }
   func seek(to seconds: Double) {
+    interruptTrial("含手动定位，观察窗口未完成")
     guard let handle, seconds.isFinite else { return }
     target=min(max(0,seconds),duration>0 ? max(0,duration-0.01) : max(0,seconds))
     // Stop already scheduled old audio before publishing a new generation.
@@ -187,10 +195,14 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     if id != nil { errorMessage="此内封字幕尚未接入 FFmpeg；请选择兼容内核。" }
   }
   private func fail(_ message: String) {
+    interruptTrial("播放失败，观察窗口未完成")
     errorMessage=message
     audio.stop(); renderer.setPlaying(false)
     handle=nil; cache?.close(); cache=nil; ticker?.invalidate(); ticker=nil
     playbackState = .failed(message)
+  }
+  private func interruptTrial(_ reason: String) {
+    if !trialFrozen { trial.interruption=reason; trialFrozen=true }
   }
   private func saveProgress(force: Bool = false) {
     guard let sourceItem, let library, duration>0 else { return }
@@ -307,6 +319,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
           renderer.resume(nextPTS:pending?.1,playing:true)
           renderer.alignClock(to:hasAudio ? audio.audibleTime : currentTime,rate:Double(rate),running:true)
           waiting=false; playbackState = .playing
+          if trialPlaybackAt==nil { trialPlaybackAt=now }
         } catch { fail("音频输出失败：\(error.localizedDescription)"); return }
       }
     }
@@ -338,6 +351,17 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
           tracks.contains(where: { $0.id==saved }) { selectAudio(saved); return }
       }
       let io=cache?.statistics
+      if !trialFrozen {
+        trial.firstFrame=firstFrameAt.map { $0-startAt }
+        trial.firstPlayback=trialPlaybackAt.map { $0-startAt }
+        trial.elapsed=trialPlaybackAt.map { min(10,now-$0) } ?? 0
+        trial.stalls=rebufferCount; trial.bytes=snapshot.ioBytesRead
+        trial.backwards=Int(snapshot.backwardPacketJumps); trial.forwards=Int(snapshot.largeForwardPacketJumps)
+        trial.averageRead=snapshot.averageReadFrameDuration; trial.maximumRead=snapshot.maximumReadFrameDuration
+        trial.compressed=snapshot.queuedSeconds; trial.httpRequests=io?.requests; trial.networkBytes=io?.networkBytes
+        trial.cacheHitBytes=io.map { $0.memoryHitBytes+$0.diskHitBytes }
+        if trial.elapsed>=10 { trial.complete=true; trialFrozen=true }
+      }
       let bytes=io?.networkBytes ?? 0
       let speed=now>lastNetworkAt ? Double(bytes-lastNetworkBytes)*8/(now-lastNetworkAt)/1_000_000 : 0
       lastNetworkAt=now; lastNetworkBytes=bytes

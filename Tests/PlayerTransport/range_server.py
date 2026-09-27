@@ -7,7 +7,9 @@ SIZE = 3 * 1048576 + 97
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
-    def handle_error(self, *args): pass  # Deliberate disconnects.
+    def handle_error(self, *args):
+        import traceback
+        traceback.print_exc()  # Fixture-only failures, no private media/credentials.
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
