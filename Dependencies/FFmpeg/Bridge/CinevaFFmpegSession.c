@@ -44,6 +44,7 @@ struct CinevaFFmpegSession {
     char *url, *headers;
     double target, origin;
     int64_t createdUs;
+    int64_t seekLookupFinishedUs; // Protected by mutex, cleared on each seek.
     AVFormatContext *format;
     AVIOContext *customIO;
     int64_t customOffset;
@@ -336,6 +337,8 @@ static int emitVideo(CinevaFFmpegSession *s, AVFrame *frame, int serial, double 
         s->frames[(s->frameHead + s->frameCount++) % FRAMES] = (Frame){pixel, fmax(0, pts), step, serial, estimated};
         s->frameSeconds += step;
         s->snapshot.videoFrames++;
+        if (s->seekLookupFinishedUs > 0 && s->snapshot.seekPrerollSeconds < 0)
+            s->snapshot.seekPrerollSeconds = (av_gettime_relative()-s->seekLookupFinishedUs)/1000000.0;
         s->snapshot.decoderType = output.decoderType;
         s->snapshot.hardwareFrames += output.decoderType == 2;
         s->snapshot.softwareFrames += output.decoderType == 1;
@@ -863,6 +866,7 @@ static void *readLoop(void *opaque) {
                 atomic_store(&s->deadline, av_gettime_relative() + 10000000);
                 int64_t videoStamp = av_rescale_q(stamp, AV_TIME_BASE_Q, s->videoTimeBase);
                 s->readerFunction = "avformat_seek_file";
+                int64_t lookupBeganUs = av_gettime_relative();
                 result = avformat_seek_file(s->format, s->videoIndex, INT64_MIN, videoStamp, videoStamp, 0);
                 if (result < 0 && result != AVERROR_EXIT && wanted == atomic_load(&s->generation) && !atomic_load(&s->cancelled) &&
                     av_gettime_relative() < atomic_load(&s->deadline)) {
@@ -877,6 +881,12 @@ static void *readLoop(void *opaque) {
                 readerFinished(s, 0);
                 if (wanted != atomic_load(&s->generation)) { result = 0; continue; }
                 if (result < 0) goto done;
+                pthread_mutex_lock(&s->mutex);
+                if (wanted == atomic_load(&s->generation)) {
+                    s->seekLookupFinishedUs = av_gettime_relative();
+                    s->snapshot.seekLookupSeconds = (s->seekLookupFinishedUs-lookupBeganUs)/1000000.0;
+                }
+                pthread_mutex_unlock(&s->mutex);
                 // Both seek APIs flush internally. A second avformat_flush can
                 // discard packets/attached state the demuxer buffered at seek.
             }
@@ -1013,6 +1023,8 @@ void CinevaFFmpegSessionDestroy(CinevaFFmpegSession *s) {
 }
 int CinevaFFmpegSessionSeek(CinevaFFmpegSession *s, double seconds) {
     pthread_mutex_lock(&s->mutex);
+    s->seekLookupFinishedUs = 0;
+    s->snapshot.seekLookupSeconds = s->snapshot.seekPrerollSeconds = -1;
     s->target = isfinite(seconds) ? fmax(0, seconds) : 0;
     s->playbackPosition = s->target;
     s->snapshot.recoveryTarget = s->target;

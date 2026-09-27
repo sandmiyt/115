@@ -4,13 +4,13 @@ import Foundation
 import CoreImage
 
 @main struct PreviewChecks {
-  static func main() async {
+  @MainActor static func main() async {
     setbuf(stdout,nil)
     let base=CommandLine.arguments[1]
     let originVideoOffset=Double(CommandLine.arguments[2])!
     var checks=0
     func expect(_ ok:Bool,_ text:String) { precondition(ok,text); checks+=1 }
-    for file in ["bframes.mp4","longgop.mkv","hevc.mp4","fractional.mp4","vfr.mp4","noaudio.mp4","rotated.mp4","origin.mp4","subtitles.mkv","4k.mp4"] {
+    for file in ["bframes.mp4","longgop.mkv","hevc.mp4","fractional.mp4","vfr.mp4","noaudio.mp4","rotated.mp4","origin.mp4","subtitles.mkv","4k.mp4","long-cache.mp4"] {
       let source=VideoSource(id:file,title:file,definition:0,url:URL(string:base+"/media/"+file)!,kind:.original,headers:[:])
       let io=RangeCoordinator(source:source,identity:RangeCacheIdentity(account:"test",fileID:file,size:0,validator:"generated-fixture"))
       let worker=FFmpegPreviewWorker(source:source,coordinator:io)
@@ -48,7 +48,7 @@ import CoreImage
           expect(Double(same)/Double(total)>0.98,"Preview orientation matches preferred track transform: \(same)/\(total) samples")
         }
         expect(max(image.width,image.height)<=481,"Preview output size bounded independently of source")
-        if file != "rotated.mp4" && file != "4k.mp4", let raw=image.dataProvider?.data {
+        if file != "rotated.mp4" && file != "4k.mp4" && file != "long-cache.mp4", let raw=image.dataProvider?.data {
           let bytes=CFDataGetBytePtr(raw)!
           func number(_ y:Int) -> Int {
             (0..<8).reduce(0) { $0 | (bytes[y*image.bytesPerRow+(30+$1*32)*4]>128 ? (1 << $1) : 0) }
@@ -59,6 +59,8 @@ import CoreImage
         }
         print("Preview fixture \(file): target=\(target) pts=\(frame.pts) duration=\(frame.duration) \(frame.note)")
       }
+      let opened=await worker.sessionOpenCount
+      expect(opened==1,"Repeated previews retain a single demux/index/decoder session")
       await worker.close()
       expect(io.statistics.terminalFailure==nil,"Preview close does not terminate primary transport")
       // The SAME coordinator still supports an audio-enabled production C session.
@@ -79,7 +81,8 @@ import CoreImage
       }
       expect(video && (audio || file=="noaudio.mp4"),"Primary demux/video/PCM preserved; this does NOT prove audible iPhone output")
       if file=="subtitles.mkv" { expect(CinevaFFmpegSessionSubtitleTrackCount(primary.pointer)>0,"Subtitle enumeration survives preview isolation") }
-      if file=="bframes.mp4" {
+      if file=="long-cache.mp4" {
+        expect(io.fileSize>512*1048576,"Offline acceptance uses a real media file over 512 MiB")
         let localRoot=FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at:localRoot) }
         let disk=SegmentDiskCache(root:localRoot)
@@ -89,30 +92,65 @@ import CoreImage
         var probe=[UInt8](repeating:0,count:4096)
         expect(fill.read(offset:0,buffer:&probe,count:4096,generation:1)>0,"Offline fixture begins incrementally")
         fill.allowPrefetch(true)
-        for _ in 0..<300 where !fill.mediaCacheProgress.complete { try? await Task.sleep(for:.milliseconds(50)) }
+        for tick in 0..<6000 where !fill.mediaCacheProgress.complete {
+          try? await Task.sleep(for:.milliseconds(100))
+          if tick%300==0 { print("LONG_MEDIA_CACHE \(fill.mediaCacheProgress.bytes)/\(io.fileSize)") }
+        }
         expect(fill.mediaCacheProgress.complete,"Independent fixture fill reaches all media bytes")
         fill.close(); disk.flush()
-        for target in [0.0,3.0,5.3] {
-          let offlineSource=VideoSource(id:file,title:file,definition:0,
-            url:URL(string:"cineva-cache://media/offline")!,kind:.original,headers:[:])
-          let local=RangeCoordinator(source:offlineSource,identity:identity,disk:SegmentDiskCache(root:localRoot))
-          var localOptions=CinevaFFmpegSessionOptions(); localOptions.outputAudio=1; localOptions.attach(local)
-          let localPointer=offlineSource.url.absoluteString.withCString { CinevaFFmpegSessionCreate($0,"",target,localOptions) }!
-          let localHandle=FFmpegSessionHandle(localPointer,io:local)
+        let offlineSource=VideoSource(id:file,title:file,definition:0,
+          url:URL(string:"cineva-cache://media/offline")!,kind:.original,headers:[:])
+        let local=RangeCoordinator(source:offlineSource,identity:identity,disk:SegmentDiskCache(root:localRoot))
+        var localOptions=CinevaFFmpegSessionOptions(); localOptions.outputAudio=1; localOptions.attach(local)
+        let localPointer=offlineSource.url.absoluteString.withCString { CinevaFFmpegSessionCreate($0,"",0,localOptions) }!
+        let localHandle=FFmpegSessionHandle(localPointer,io:local)
+        let timeline=FFmpegTimelinePreview()
+        timeline.configure(source:offlineSource,coordinator:local)
+        // Continuous moves must publish images BEFORE release, not only at rest.
+        for start in [0.0,330.0,650.0] {
+          timeline.begin(at:start)
+          var observed=Set<Double>()
+          for step in 0..<180 {
+            let point=start+Double(step)*0.01
+            timeline.update(point)
+            expect(timeline.display.requestedPreviewTime==point,"Millisecond target follows every touch")
+            if timeline.display.image != nil { observed.insert(timeline.display.imageTime) }
+            try? await Task.sleep(for:.milliseconds(16))
+          }
+          expect(observed.count>=3,"Live preview updates during uninterrupted head/middle/tail drag: \(observed.count)")
+          timeline.finish(keepOverlay:true)
+          expect(timeline.display.isActive && timeline.display.image != nil,"Preview survives release until primary target ready")
+          print("OFFLINE_DRAG start=\(start) previewFrames=\(observed.count) HTTP=\(local.statistics.requests)")
+        }
+        timeline.finish(keepOverlay:false)
+        timeline.begin(at:100); timeline.update(200); timeline.finish(keepOverlay:false)
+        timeline.begin(at:300); timeline.update(301.125)
+        for _ in 0..<500 where abs(timeline.display.imageTime-301.125)>0.1 { try? await Task.sleep(for:.milliseconds(10)) }
+        expect(timeline.display.image != nil && abs(timeline.display.imageTime-301.125)<0.1,"Cancelled/old drag cannot overwrite a new drag")
+        timeline.finish(keepOverlay:true)
+        for target in [0.0,330.0,650.0,10.0,500.0] {
+          let began=ProcessInfo.processInfo.systemUptime
+          let generation=CinevaFFmpegSessionSeek(localHandle.pointer,target)
           var gotVideo=false,gotPCM=false
           let limit=ProcessInfo.processInfo.systemUptime+10
           while ProcessInfo.processInfo.systemUptime<limit && (!gotVideo || !gotPCM) {
             var pts=0.0,frameDuration=0.0,serial:Int32=0
-            if CinevaFFmpegSessionCopyFrame(localHandle.pointer,&pts,&frameDuration,&serial) != nil { gotVideo=true }
+            if CinevaFFmpegSessionCopyFrame(localHandle.pointer,&pts,&frameDuration,&serial) != nil {
+              gotVideo=gotVideo || (serial==generation && abs(pts-target)<0.1)
+            }
             var pcm=[Float](repeating:0,count:131072)
             let count=CinevaFFmpegSessionCopyAudio(localHandle.pointer,&pcm,65536,&pts,&serial)
-            if count>0 { gotPCM = gotPCM || pcm.prefix(Int(count)*2).contains { abs($0)>0.00001 } }
+            if count>0 && serial==generation { gotPCM = gotPCM || pcm.prefix(Int(count)*2).contains { abs($0)>0.00001 } }
             try? await Task.sleep(for:.milliseconds(10))
           }
           expect(gotVideo && gotPCM,"Offline FFmpeg head/middle/tail video and non-silent PCM at \(target)")
           expect(local.statistics.requests==0,"Offline native session makes zero HTTP requests")
-          local.close()
+          expect(local.statistics.refreshes==0,"Offline primary and preview never refresh a remote URL")
+          var timing=CinevaFFmpegSnapshot(); CinevaFFmpegSessionSnapshot(localHandle.pointer,&timing)
+          print("OFFLINE_SEEK target=\(target) framePCMms=\((ProcessInfo.processInfo.systemUptime-began)*1000) lookupMs=\(timing.seekLookupSeconds*1000) prerollMs=\(timing.seekPrerollSeconds*1000) HTTP=\(local.statistics.requests)")
+          timeline.display.end()
         }
+        timeline.stop(); local.close()
       }
       io.close()
     }

@@ -35,11 +35,12 @@ final class NativeVideoRenderer {
     setRate(0)
   }
 
-  func reset(to seconds: Double, newSession: Bool = false) {
+  func reset(to seconds: Double, newSession: Bool = false, preservingImage: Bool = false) {
     setRate(0)
     setTime(seconds)
-    // Seek/stop explicitly remove the old image. Recovery below preserves it.
-    layer.flushAndRemoveImage()
+    // Flush old scheduled samples while retaining the last displayed picture
+    // across seek. anchored still becomes false until a NEW frame is submitted.
+    if preservingImage { output.flush() } else { layer.flushAndRemoveImage() }
     format = nil
     anchored = false
     waitingForData = true

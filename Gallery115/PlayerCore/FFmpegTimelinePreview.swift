@@ -26,18 +26,23 @@ actor FFmpegPreviewWorker {
   private var cursor = -1.0
   private var frames:[Frame]=[] // actual frame intervals; LRU <= 12 MiB / 64 frames
   private var ended=false
+  private var operation=0
+  private(set) var sessionOpenCount=0
   init(source:VideoSource,coordinator:RangeCoordinator?) {
     self.source=source; self.coordinator=coordinator
   }
   // Can be called during an awaited read: native cancellation wakes its scoped
   // condition. Destruction/join is dispatched off MainActor by the handle.
   func suspend() {
+    operation &+= 1
     if let handle { CinevaFFmpegSessionCancel(handle.pointer) }
     handle=nil; reader?.cancel(-1); reader=nil
   }
   func close() { ended=true; suspend(); frames=[]; context.clearCaches() }
 
   func frame(at target:Double) async -> Result {
+    operation &+= 1
+    let expectedOperation=operation
     let began=ProcessInfo.processInfo.systemUptime
     func result(_ f:Frame?,_ note:String) -> Result {
       Result(image:f?.image,pts:f?.pts ?? target,duration:f?.duration ?? 0,note:note,
@@ -58,6 +63,7 @@ actor FFmpegPreviewWorker {
       } }
       guard let pointer else { return result(nil,"无法创建预览") }
       handle=FFmpegSessionHandle(pointer,previewReader:reader); cursor=target; serial=1
+      sessionOpenCount+=1
     } else if target<cursor || target-cursor>3 {
       serial=CinevaFFmpegSessionSeek(handle!.pointer,target); cursor=target
     }
@@ -65,7 +71,7 @@ actor FFmpegPreviewWorker {
     var tailFallback=false
     // Reuse queued frames and decode forward for nearby targets. A long GOP may
     // need more work, but never monopolizes the worker or resets the main engine.
-    while !ended && !Task.isCancelled && ProcessInfo.processInfo.systemUptime-began<5 {
+    while !ended && operation==expectedOperation && !Task.isCancelled && ProcessInfo.processInfo.systemUptime-began<5 {
       var snapshot=CinevaFFmpegSnapshot(); CinevaFFmpegSessionSnapshot(handle.pointer,&snapshot)
       if snapshot.serial != serial { serial=snapshot.serial; cursor=snapshot.recoveryTarget }
       if snapshot.status<0 { self.handle=nil; return result(nil,"预览读取失败（\(snapshot.errorCode)），播放不受影响") }
@@ -117,7 +123,6 @@ actor FFmpegPreviewWorker {
   }
 }
 
-#if !PREVIEW_WORKER_TEST
 /// MainActor merges the latest target while one worker request progresses. It
 /// does not repeatedly cancel a cold read, which would starve first preview.
 @MainActor
@@ -128,6 +133,8 @@ final class FFmpegTimelinePreview {
   private var epoch=UUID()
   private var latest=0.0
   private var requestedAt=0.0
+  private var direction=0
+  private var directionEpoch=0
   private var source:VideoSource?
   private var coordinator:RangeCoordinator?
   private(set) var diagnostic="预览尚未请求"
@@ -135,35 +142,46 @@ final class FFmpegTimelinePreview {
     stop(); self.source=source; self.coordinator=coordinator
   }
   func begin(at time:Double) {
+    epoch=UUID(); task?.cancel(); task=nil; direction=0; latest=time
     display.beginExternal(at:time)
     if worker==nil, let source { worker=FFmpegPreviewWorker(source:source,coordinator:coordinator) }
     update(time)
   }
   func update(_ time:Double) {
     guard time.isFinite, display.isActive else { return }
-    latest=max(0,time); requestedAt=ProcessInfo.processInfo.systemUptime; display.targetExternal(latest)
+    let next=max(0,time), delta=next-latest
+    if abs(delta)>0.001 {
+      let nextDirection=delta>0 ? 1 : -1
+      if direction != 0 && direction != nextDirection { directionEpoch &+= 1 }
+      direction=nextDirection
+    }
+    latest=next; requestedAt=ProcessInfo.processInfo.systemUptime; display.targetExternal(latest)
     guard task==nil, let worker else { return }
     let expected=epoch
     task=Task { [weak self] in
       while let self, !Task.isCancelled, self.epoch==expected {
         let target=self.latest
+        let motion=self.directionEpoch, began=ProcessInfo.processInfo.systemUptime
         let result=await worker.frame(at:target)
         guard !Task.isCancelled, self.epoch==expected else { return }
-        if self.latest==target {
+        // One sampled frame in flight, one replaceable pending target. Requiring
+        // equality with every touch event starves all output while dragging.
+        // Never publish a result from an old drag, reversal or long stale read.
+        if self.latest==target || (self.directionEpoch==motion && ProcessInfo.processInfo.systemUptime-began<0.25) {
           self.display.displayExternal(result.image,pts:result.pts,note:result.note)
           self.diagnostic=String(format:"目标更新→预览结果 %.1f ms · 目标 %@ · 实际 PTS %@ · 误差 %.3f s · %@",
             (ProcessInfo.processInfo.systemUptime-self.requestedAt)*1000,PlaybackPolicy.timestamp(target),PlaybackPolicy.timestamp(result.pts),
             result.pts-target,result.note)
-          self.task=nil; return
         }
-        do { try await Task.sleep(for:.milliseconds(60)) } catch { return }
+        if self.latest==target { self.task=nil; return }
+        do { try await Task.sleep(for:.milliseconds(16)) } catch { return }
       }
     }
   }
   func finish(keepOverlay:Bool) {
     epoch=UUID(); task?.cancel(); task=nil
-    let previous=worker
-    Task { await previous?.suspend() }
+    // Keep the bounded decoder/index alive between gestures. An unawaited
+    // suspend used to race the next begin and cancel its brand-new preview.
     display.end(keepImageUntilSeekCompletes:keepOverlay)
   }
   func stop() {
@@ -172,5 +190,3 @@ final class FFmpegTimelinePreview {
     source=nil; coordinator=nil; display.reset()
   }
 }
-
-#endif

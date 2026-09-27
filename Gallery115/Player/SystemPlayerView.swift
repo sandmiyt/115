@@ -165,7 +165,8 @@ final class TimelinePreviewController {
   }
   func targetExternal(_ seconds:Double) { requestedPreviewTime=seconds }
   func displayExternal(_ image:UIImage?,pts:Double,note:String) {
-    self.image=image; imageTime=pts; previewNote=note
+    if let image { self.image=image; imageTime=pts }
+    previewNote=note
   }
 
   func configure(asset: AVAsset, identity: String, allowsWarmup: Bool, fallbackAsset: AVAsset? = nil) {
@@ -363,7 +364,7 @@ struct TimelinePreviewOverlay: View {
         .background(.black)
         .clipped()
         .overlay(alignment: .topLeading) {
-          Text("预览 \(PlaybackPolicy.timestamp(previews.imageTime))" + (previews.previewNote.map { " · " + $0 } ?? ""))
+          Text("目标 \(PlaybackPolicy.timestamp(previews.requestedPreviewTime)) · 画面 \(PlaybackPolicy.timestamp(previews.imageTime))" + (previews.previewNote.map { " · " + $0 } ?? ""))
             .font(.caption.monospacedDigit())
             .padding(6)
             .background(.black.opacity(0.55), in: Capsule())

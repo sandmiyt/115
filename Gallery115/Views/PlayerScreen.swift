@@ -1855,6 +1855,8 @@ struct PlayerScreen: View {
         Text(ffmpegEngine.mediaCacheText)
           .font(.caption2.monospacedDigit()).foregroundStyle(.white.opacity(0.75))
           .lineLimit(2).padding(.horizontal,42)
+          .frame(maxWidth:.infinity,minHeight:20,alignment:.center)
+          .padding(.top,4)
           .transaction { $0.animation=nil }
       }
 

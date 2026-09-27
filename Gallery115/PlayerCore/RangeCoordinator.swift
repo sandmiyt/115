@@ -68,6 +68,7 @@ struct RangeRecoveryReport: Sendable {
 struct RangeStatistics: Sendable {
   var requests = 0, responses200 = 0, responses206 = 0, responses416 = 0
   var networkBytes: Int64 = 0, memoryHitBytes: Int64 = 0, diskHitBytes: Int64 = 0
+  var diskReads=0, diskReadSeconds=0.0
   var misses = 0, coalesced = 0, cancelled = 0, refreshes = 0
   var memoryBytes = 0
   var lastError: String?
@@ -674,7 +675,11 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
       // Authenticate this representation via HTTP before consulting old disk pages.
       if !checkedDisk, let key=diskKey, length>base {
         checkedDisk=true; let expected=Int(min(page,length-base))
-        condition.unlock(); let bytes=disk.read(key:key,offset:base,length:expected); condition.lock()
+        condition.unlock()
+        let began=ProcessInfo.processInfo.systemUptime
+        let bytes=disk.read(key:key,offset:base,length:expected)
+        let elapsed=ProcessInfo.processInfo.systemUptime-began
+        condition.lock(); stats.diskReads+=1; stats.diskReadSeconds+=elapsed
         if !valid(wanted) { result = -3; return result }
         if let fatalError=readerErrors[wanted] ?? fatalError { result=fatalError; return result }
         if let bytes {

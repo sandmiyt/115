@@ -294,6 +294,8 @@ private final class SlowDiskGate: @unchecked Sendable {
       account:"test",fileID:"blocked-writer",size:576*1048576+97,validator:"test-v1"),disk:blockedDisk)
     expect(read(whileWriting,0)>0,"First bytes precede disk persistence")
     expect(diskGate.entered.wait(timeout:.now()+2) == .success,"Fixture holds actual utility writer")
+    expect(!whileWriting.mediaCacheProgress.complete && whileWriting.mediaCacheProgress.bytes==0,
+      "Network completion and pending writes never count as durable complete coverage")
     let duringWrite=ProcessInfo.processInfo.systemUptime
     expect(read(whileWriting,2*1048576)>0,"Foreground miss progresses with disk writer blocked")
     expect(ProcessInfo.processInfo.systemUptime-duringWrite<1,"Disk callback cannot delay foreground network read")
