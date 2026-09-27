@@ -864,7 +864,7 @@ struct PhotoLibraryGrid<FolderCell: View, MediaCell: View, Footer: View>: UIView
 
     func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
       if gestureRecognizer === selectionDrag {
-        guard parent.selectionMode, let view, !tapGate.hasMultipleTouches,
+        guard parent.selectionMode, zoom.phase == .idle, let view, !tapGate.hasMultipleTouches,
           let path = view.indexPathForItem(at: gestureRecognizer.location(in: view)), path.section == 1,
           path.item < parent.items.count else { return false }
         return parent.items[path.item].isVideo
@@ -979,6 +979,14 @@ struct PhotoLibraryGrid<FolderCell: View, MediaCell: View, Footer: View>: UIView
         pendingPinch = nil; zoom.end(cancelled: true); lastWidth = view.bounds.width
       }
       consumePinch(layout: layout, view: view)
+      if zoom.phase != .tracking, view.isDragging || view.isDecelerating,
+        let anchorID, let path = dataSource.indexPath(for: .media(anchorID)),
+        let frame = layout.layoutAttributesForItem(at: path)?.frame {
+        // Adopt the pan's current viewport before advancing the zoom, so the
+        // settling driver cannot pull content back against a one-finger scroll.
+        anchorScreen = CGPoint(x: frame.minX + frame.width * anchorFraction.x - view.contentOffset.x,
+                               y: frame.minY + frame.height * anchorFraction.y - view.contentOffset.y)
+      }
       let finished = zoom.step(seconds: link.targetTimestamp - link.timestamp, reduceMotion: parent.reduceMotion)
       layout.position = zoom.position
       layout.invalidateLayout()
