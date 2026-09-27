@@ -160,13 +160,15 @@ final class FFmpegTimelinePreview {
     task=Task { [weak self] in
       while let self, !Task.isCancelled, self.epoch==expected {
         let target=self.latest
-        let motion=self.directionEpoch, began=ProcessInfo.processInfo.systemUptime
+        let motion=self.directionEpoch
         let result=await worker.frame(at:target)
         guard !Task.isCancelled, self.epoch==expected else { return }
         // One sampled frame in flight, one replaceable pending target. Requiring
         // equality with every touch event starves all output while dragging.
-        // Never publish a result from an old drag, reversal or long stale read.
-        if self.latest==target || (self.directionEpoch==motion && ProcessInfo.processInfo.systemUptime-began<0.25) {
+        // Never publish a result from an old drag or reversal. A slow GOP still
+        // publishes its actual sampled PTS; an age cutoff would starve every
+        // frame on slower devices. The next decode takes only the newest target.
+        if self.latest==target || self.directionEpoch==motion {
           self.display.displayExternal(result.image,pts:result.pts,note:result.note)
           self.diagnostic=String(format:"预览取帧 %.1f ms · 采样目标 %@ · 实际 PTS %@ · 误差 %.3f s · %@",
             result.milliseconds,PlaybackPolicy.timestamp(target),PlaybackPolicy.timestamp(result.pts),
