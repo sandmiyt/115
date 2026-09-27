@@ -24,6 +24,7 @@ xcrun simctl bootstatus "$SIM_ID" -b
 FRAMEWORK_DIR="$PWD/Dependencies/FFmpeg/Generated/CinevaFFmpeg.xcframework/ios-arm64-simulator"
 xcrun --sdk iphonesimulator swiftc -target arm64-apple-ios17.0-simulator \
   -sdk "$(xcrun --sdk iphonesimulator --show-sdk-path)" -D PREVIEW_WORKER_TEST \
+  -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker Gallery115/Info.plist \
   -F "$FRAMEWORK_DIR" -framework CinevaFFmpeg -Xlinker -rpath -Xlinker "$FRAMEWORK_DIR" \
   Gallery115/Models/VideoSource.swift Gallery115/PlayerCore/RangeCoordinator.swift \
   Gallery115/PlayerCore/FFmpegIOBridge.swift Gallery115/PlayerCore/FFmpegSessionHandle.swift \

@@ -13,7 +13,8 @@ class Server(ThreadingHTTPServer):
     attempts = {}
     attempts_lock = threading.Lock()
     def handle_error(self, *args):
-        import traceback
+        import traceback, sys
+        if isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError)): return
         traceback.print_exc()  # Fixture-only failures, no private media/credentials.
 
 class Handler(BaseHTTPRequestHandler):

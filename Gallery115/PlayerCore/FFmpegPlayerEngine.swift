@@ -186,6 +186,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     playbackState = .stopped
   }
   func pause() {
+    if scrubbing { scrubIntent=false; cancelInteractiveScrub() }
     wantsPlayback=false; audio.pause(); renderer.setPlaying(false)
     playbackState = .paused; saveProgress(force:true)
   }
@@ -213,6 +214,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   }
   func setVolume(_ value: Float) { volume=min(1,max(0,value)); audio.setVolume(volume) }
   func seek(to seconds: Double) {
+    if scrubbing { cancelInteractiveScrub() }
     resetSubtitleImage()
     toneMapTask?.cancel(); toneMapTask=nil; pendingToneMapped=false
     guard let handle, seconds.isFinite else { return }
@@ -521,7 +523,10 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     }
     if !wantsPlayback, renderer.anchored { playbackState = .paused }
     if !backgroundAudioOnly { renderSubtitle(now:now) }
-    if renderer.layer.isReadyForDisplay, renderer.anchored {
+    let displayReady:Bool
+    if #available(iOS 17.4,*) { displayReady=renderer.layer.isReadyForDisplay }
+    else { displayReady=renderer.layer.status == .rendering }
+    if displayReady, renderer.anchored {
       if displayReadyAt==nil { displayReadyAt=now }
       if let began=commitAt {
         seekFrameMilliseconds=(now-began)*1000; commitAt=nil
@@ -574,9 +579,11 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
         renderer:"Apple Native + AVAudioEngine PCM",droppedFrames:renderer.droppedFrames,
         avSyncOffset:hasAudio ? renderer.time-audio.audibleTime : nil)
       func elapsed(_ time:Double?) -> String { time.map { String(format:"%.3f s",$0-clickAt) } ?? "尚未发生 / 不可获得" }
+      let displayStage:String
+      if #available(iOS 17.4,*) { displayStage="显示就绪代理" } else { displayStage="已提交/渲染状态代理（iOS 17.4 前）" }
       let stages="session=\(sessionID.uuidString) · 播放请求→地址 \(elapsed(sourceResolvedAt)) · 首有效字节 \(snapshot.firstByteSeconds>0 ? elapsed(startAt+snapshot.firstByteSeconds) : "原生 HTTP 不可获得")\n"
         + "容器打开 \(snapshot.openSeconds>0 ? elapsed(startAt+snapshot.openSeconds) : "尚未发生") · 流信息 \(snapshot.probeSeconds>0 ? elapsed(startAt+snapshot.probeSeconds) : "尚未发生")\n"
-        + "首解码 \(snapshot.firstDecodedSeconds>0 ? elapsed(startAt+snapshot.firstDecodedSeconds) : "尚未发生") · 首提交 \(elapsed(firstFrameAt)) · 显示就绪代理 \(elapsed(displayReadyAt))（非屏幕呈现测量）\n"
+        + "首解码 \(snapshot.firstDecodedSeconds>0 ? elapsed(startAt+snapshot.firstDecodedSeconds) : "尚未发生") · 首提交 \(elapsed(firstFrameAt)) · \(displayStage) \(elapsed(displayReadyAt))（非屏幕呈现测量）\n"
         + "音频 render 时钟开始 \(elapsed(audioRenderedAt))（非实际扬声器首声测量） · 连续运行 1 秒代理 \(elapsed(stableAt))\n"
         + "拖动最终 seek \(finalSeekCount) 次 · 松手→目标帧就绪代理 \(seekFrameMilliseconds.map { String(format:"%.1f ms",$0) } ?? "尚未发生")\n\(preview.diagnostic)\n"
       var usage=rusage(); getrusage(RUSAGE_SELF,&usage)
