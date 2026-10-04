@@ -73,7 +73,9 @@ import CoreImage
       if file.hasSuffix(".mkv") || ["fragmented.mp4","avc3.mp4","eac3.mp4","subtitles.mp4"].contains(file) {
         expect(after.snapshot.probeSkipped==0,"Media outside the complete ordinary MP4 gate retains full probing: \(file)")
       }
-      if file=="hdr-no-colr.mp4" { expect(after.snapshot.colorTransfer==16,"First decoded VUI retains PQ metadata without a container colr hint") }
+      if file=="hdr-no-colr.mp4" {
+        expect(after.snapshot.colorTransfer==16,"First decoded VUI retains PQ metadata without a container colr hint: full/fast=\(before.snapshot.colorTransfer)/\(after.snapshot.colorTransfer) decoder=\(after.snapshot.decoderType) bits=\(after.snapshot.outputBitDepth)")
+      }
       if ["bframes.mp4","hevc.mp4","noaudio.mp4","rotated.mp4","origin.mp4","4k.mp4","hdr-no-colr.mp4"].contains(file) {
         expect(after.snapshot.probeSkipped==1 && after.snapshot.probeReadBytes==0,"Complete ordinary MP4 reaches the guarded fast path: \(file)")
       }

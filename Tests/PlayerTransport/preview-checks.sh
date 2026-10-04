@@ -29,10 +29,14 @@ ffmpeg -hide_banner -loglevel error -y -i "$MEDIA/bframes.mp4" -i "$MEDIA/text.s
 # Verify first decoded metadata; this does not verify a physical HDR display.
 ffmpeg -hide_banner -loglevel error -y -f lavfi -i 'testsrc2=size=320x180:rate=24:duration=6' \
   -f lavfi -i 'sine=frequency=440:duration=6' -c:v libx265 -pix_fmt yuv420p10le \
-  -x265-params log-level=error -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc \
+  -x265-params log-level=error:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc \
+  -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc \
   -tag:v hvc1 -c:a aac "$MEDIA/hdr-vui.mp4"
 ffmpeg -hide_banner -loglevel error -y -i "$MEDIA/hdr-vui.mp4" -c copy -color_primaries unknown \
   -color_trc unknown -colorspace unknown -movflags +faststart "$MEDIA/hdr-no-colr.mp4"
+ffprobe -v error -select_streams v:0 -read_intervals '%+1' \
+  -show_entries frame=color_transfer,color_primaries,color_space -of json "$MEDIA/hdr-no-colr.mp4" | \
+  python3 -c 'import json,sys; j=json.load(sys.stdin); f=j["frames"][0]; assert f.get("color_transfer")=="smpte2084" and f.get("color_primaries")=="bt2020", f; print("Fixture decoded PQ VUI verified")'
 ffmpeg -hide_banner -loglevel error -y -f lavfi -i 'color=c=blue:size=3840x2160:rate=24:duration=6' \
   -f lavfi -i 'sine=frequency=440:duration=6' -c:v libx264 -preset ultrafast -g 24 -c:a aac "$MEDIA/4k.mp4"
 # A real eleven-minute indexed A/V container over 512 MiB, not padded random bytes.
