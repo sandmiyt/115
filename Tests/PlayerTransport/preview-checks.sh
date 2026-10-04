@@ -19,6 +19,20 @@ ffmpeg -hide_banner -loglevel error -y -display_rotation:v:0 90 -i "$MEDIA/bfram
 ffmpeg -hide_banner -loglevel error -y -i "$MEDIA/bframes.mp4" -c copy -output_ts_offset 2 "$MEDIA/origin.mp4"
 printf '1\n00:00:01,000 --> 00:00:05,000\nFixture subtitles\n' > "$MEDIA/text.srt"
 ffmpeg -hide_banner -loglevel error -y -i "$MEDIA/bframes.mp4" -i "$MEDIA/text.srt" -map 0 -map 1 -c copy -c:s srt "$MEDIA/subtitles.mkv"
+ffmpeg -hide_banner -loglevel error -y -i "$MEDIA/bframes.mp4" -c copy \
+  -movflags +frag_keyframe+empty_moov+default_base_moof "$MEDIA/fragmented.mp4"
+ffmpeg -hide_banner -loglevel error -y -i "$MEDIA/bframes.mp4" -c copy -tag:v avc3 "$MEDIA/avc3.mp4"
+ffmpeg -hide_banner -loglevel error -y -i "$MEDIA/bframes.mp4" -c:v copy -c:a eac3 "$MEDIA/eac3.mp4"
+ffmpeg -hide_banner -loglevel error -y -i "$MEDIA/bframes.mp4" -i "$MEDIA/text.srt" -map 0 -map 1 \
+  -c copy -c:s mov_text "$MEDIA/subtitles.mp4"
+# VUI marks PQ while the remux deliberately leaves container colr unspecified.
+# Verify first decoded metadata; this does not verify a physical HDR display.
+ffmpeg -hide_banner -loglevel error -y -f lavfi -i 'testsrc2=size=320x180:rate=24:duration=6' \
+  -f lavfi -i 'sine=frequency=440:duration=6' -c:v libx265 -pix_fmt yuv420p10le \
+  -x265-params log-level=error -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc \
+  -tag:v hvc1 -c:a aac "$MEDIA/hdr-vui.mp4"
+ffmpeg -hide_banner -loglevel error -y -i "$MEDIA/hdr-vui.mp4" -c copy -color_primaries unknown \
+  -color_trc unknown -colorspace unknown -movflags +faststart "$MEDIA/hdr-no-colr.mp4"
 ffmpeg -hide_banner -loglevel error -y -f lavfi -i 'color=c=blue:size=3840x2160:rate=24:duration=6' \
   -f lavfi -i 'sine=frequency=440:duration=6' -c:v libx264 -preset ultrafast -g 24 -c:a aac "$MEDIA/4k.mp4"
 # A real eleven-minute indexed A/V container over 512 MiB, not padded random bytes.

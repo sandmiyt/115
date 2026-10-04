@@ -8,6 +8,7 @@
 #include <libavformat/avformat.h>
 #include <libavutil/display.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/intreadwrite.h>
 #include <libavutil/log.h>
 #include <libavutil/opt.h>
 #include <libavutil/bprint.h>
@@ -661,6 +662,111 @@ static void publishMedia(CinevaFFmpegSession *s) {
     s->snapshot.colorMatrix = video->codecpar->color_space;
     pthread_mutex_unlock(&s->mutex);
 }
+static int parameterSet(const uint8_t *data, int size, int *cursor, int hevc, int type) {
+    if (*cursor > size - 2) return 0;
+    int length = AV_RB16(data + *cursor); *cursor += 2;
+    if (length < (hevc ? 2 : 1) || length > size - *cursor) return 0;
+    int actualType = hevc ? (data[*cursor] >> 1) & 63 : data[*cursor] & 31;
+    *cursor += length;
+    return actualType == type;
+}
+static int completeMP4Config(const AVCodecParameters *params) {
+    const uint8_t *data = params->extradata;
+    int size = params->extradata_size, cursor;
+    if (!data || size < 2 || size > 1048576) return 0;
+    if (params->codec_id == AV_CODEC_ID_H264 && params->codec_tag == MKTAG('a','v','c','1')) {
+        if (size < 7 || data[0] != 1 || (data[4] & 3) == 2) return 0;
+        cursor = 6;
+        int sps = data[5] & 31;
+        if (!sps) return 0;
+        for (int i = 0; i < sps; i++) if (!parameterSet(data, size, &cursor, 0, 7)) return 0;
+        if (cursor >= size) return 0;
+        int pps = data[cursor++];
+        if (!pps) return 0;
+        for (int i = 0; i < pps; i++) if (!parameterSet(data, size, &cursor, 0, 8)) return 0;
+        return 1; // Optional high-profile configuration extensions stay with the decoder.
+    }
+    if (params->codec_id == AV_CODEC_ID_HEVC && params->codec_tag == MKTAG('h','v','c','1')) {
+        if (size < 23 || data[0] != 1 || (data[21] & 3) == 2) return 0;
+        cursor = 23;
+        unsigned found = 0;
+        for (int i = 0; i < data[22]; i++) {
+            if (cursor > size - 3) return 0;
+            int type = data[cursor++] & 63;
+            int count = AV_RB16(data + cursor); cursor += 2;
+            if (!count) return 0;
+            for (int j = 0; j < count; j++) if (!parameterSet(data, size, &cursor, 1, type)) return 0;
+            if (type >= 32 && type <= 34) found |= 1U << (type - 32);
+        }
+        return found == 7 && cursor == size;
+    }
+    if (params->codec_id == AV_CODEC_ID_AAC && params->codec_tag == MKTAG('m','p','4','a')) {
+        static const int rates[] = {96000,88200,64000,48000,44100,32000,24000,22050,16000,12000,11025,8000,7350};
+        static const int channels[] = {0,1,2,3,4,5,6,8};
+        int object = data[0] >> 3, rate = ((data[0] & 7) << 1) | (data[1] >> 7);
+        int layout = (data[1] >> 3) & 15;
+        // AAC-LC with an explicit standard layout. HE-AAC, PCE, explicit rates
+        // and nonstandard frame lengths keep the established full probe path.
+        // Do not infer LC from the leading object type when a trailing sync
+        // extension may enable SBR/PS. The encoder's usual 56e500 suffix
+        // explicitly declares SBR absent; unknown extensions need full probing.
+        int lcExtension = size == 2 || (size == 5 && data[2] == 0x56 && data[3] == 0xe5 && data[4] == 0);
+        return lcExtension && object == 2 && rate < 13 && layout > 0 && layout < 8 && !(data[1] & 7) &&
+            params->sample_rate == rates[rate] && params->ch_layout.nb_channels == channels[layout];
+    }
+    return 0;
+}
+static int indexedMP4Metadata(AVFormatContext *format) {
+    if (format->iformat != av_find_input_format("mov") || !format->pb ||
+        !(format->pb->seekable & AVIO_SEEKABLE_NORMAL) ||
+        (format->ctx_flags & AVFMTCTX_NOHEADER) || !format->nb_streams || format->nb_stream_groups ||
+        format->nb_programs || format->nb_streams > 32) return 0;
+    const AVDictionaryEntry *brand = av_dict_get(format->metadata, "major_brand", NULL, 0);
+    if (!brand || (strcmp(brand->value,"isom") && strcmp(brand->value,"iso2") &&
+        strcmp(brand->value,"mp41") && strcmp(brand->value,"mp42") && strcmp(brand->value,"avc1"))) return 0;
+    int64_t size = avio_size(format->pb);
+    if (size <= 0) return 0;
+    int videoCount = 0;
+    int64_t beginning = INT64_MAX, ending = INT64_MIN, longest = 0;
+    for (unsigned i = 0; i < format->nb_streams; i++) {
+        const AVStream *stream = format->streams[i];
+        const AVCodecParameters *params = stream->codecpar;
+        if ((params->codec_type != AVMEDIA_TYPE_VIDEO && params->codec_type != AVMEDIA_TYPE_AUDIO) ||
+            (stream->disposition & AV_DISPOSITION_ATTACHED_PIC) || !completeMP4Config(params) ||
+            stream->time_base.num <= 0 || stream->time_base.den <= 0 ||
+            stream->start_time == AV_NOPTS_VALUE || stream->duration <= 0 || stream->nb_frames <= 0) return 0;
+        if (av_packet_side_data_get(params->coded_side_data, params->nb_coded_side_data, AV_PKT_DATA_ENCRYPTION_INIT_INFO)) return 0;
+        if (params->codec_type == AVMEDIA_TYPE_VIDEO) {
+            if (++videoCount != 1 || params->width <= 0 || params->height <= 0 ||
+                (int64_t)params->width * params->height > 4096LL * 2304 ||
+                stream->avg_frame_rate.num <= 0 || stream->avg_frame_rate.den <= 0) return 0;
+        }
+        // Ordinary MOV header indexes every sample. Fragmented, empty or
+        // partially indexed media must retain find_stream_info and its budgets.
+        int entries = avformat_index_get_entries_count(stream);
+        if (entries <= 0 || entries != stream->nb_frames) return 0;
+        const AVIndexEntry *first = avformat_index_get_entry(stream, 0);
+        const AVIndexEntry *last = avformat_index_get_entry(stream, entries - 1);
+        if (!first || !last || first->pos < 0 || last->pos < first->pos ||
+            first->timestamp == AV_NOPTS_VALUE || last->timestamp < first->timestamp ||
+            first->pos > size || first->size <= 0 || first->size > size - first->pos ||
+            last->pos > size || last->size <= 0 || last->size > size - last->pos ||
+            (params->codec_type == AVMEDIA_TYPE_VIDEO && !(first->flags & AVINDEX_KEYFRAME))) return 0;
+        int64_t start = av_rescale_q(stream->start_time, stream->time_base, AV_TIME_BASE_Q);
+        int64_t duration = av_rescale_q(stream->duration, stream->time_base, AV_TIME_BASE_Q);
+        if (start < INT64_MIN / 4 || start > INT64_MAX / 4 || duration <= 0 || duration > INT64_MAX / 4) return 0;
+        beginning = FFMIN(beginning, start); ending = FFMAX(ending, start + duration);
+        longest = FFMAX(longest, duration);
+    }
+    if (videoCount != 1 || beginning == INT64_MAX || ending <= beginning ||
+        (format->duration != AV_NOPTS_VALUE && format->duration <= 0)) return 0;
+    // Match the common A/V timing envelope used by update_stream_timings.
+    // MOV has already applied edit lists and AAC priming to EACH stream: retain
+    // that shared origin, never independently rebase audio/video to zero.
+    format->start_time = beginning;
+    if (format->duration == AV_NOPTS_VALUE) format->duration = FFMAX(longest, ending - beginning);
+    return 1;
+}
 static int openInput(CinevaFFmpegSession *s, int extended) {
     AVDictionary *options = NULL;
     s->format = avformat_alloc_context();
@@ -742,10 +848,16 @@ static void *readLoop(void *opaque) {
         snprintf(s->snapshot.container, sizeof(s->snapshot.container), "%s", s->format->iformat->name);
         pthread_mutex_unlock(&s->mutex);
         stage = CinevaStageProbe; readerStage(s, stage);
-        s->readerFunction = "avformat_find_stream_info";
-        result = avformat_find_stream_info(s->format, NULL);
+        int64_t probeBytes = s->format->pb ? s->format->pb->bytes_read : 0;
+        int skipProbe = !attempt && !s->options.forceFullProbe && indexedMP4Metadata(s->format);
+        s->readerFunction = skipProbe ? "indexed_mp4_metadata" : "avformat_find_stream_info";
+        result = skipProbe ? 0 : avformat_find_stream_info(s->format, NULL);
         readerFinished(s, 0);
-        pthread_mutex_lock(&s->mutex); s->snapshot.probeSeconds=(av_gettime_relative()-s->createdUs)/1000000.0; pthread_mutex_unlock(&s->mutex);
+        pthread_mutex_lock(&s->mutex);
+        s->snapshot.probeSeconds=(av_gettime_relative()-s->createdUs)/1000000.0;
+        s->snapshot.probeSkipped = skipProbe;
+        s->snapshot.probeReadBytes = s->format->pb ? s->format->pb->bytes_read - probeBytes : 0;
+        pthread_mutex_unlock(&s->mutex);
         s->videoIndex = selectVideo(s->format);
         s->audioSourceIndex = av_find_best_stream(s->format, AVMEDIA_TYPE_AUDIO, -1, s->videoIndex, NULL, 0);
         s->audioIndex = s->videoOnly ? -1 : s->audioSourceIndex;
@@ -791,14 +903,18 @@ static void *readLoop(void *opaque) {
         s->videoParameters->nb_coded_side_data, AV_PKT_DATA_DOVI_CONF)) {
         result = -70001; goto done;
     }
+    int64_t videoOpenBegan = av_gettime_relative();
     result = openVideoDecoder(s);
+    pthread_mutex_lock(&s->mutex); s->snapshot.videoOpenSeconds=(av_gettime_relative()-videoOpenBegan)/1000000.0; pthread_mutex_unlock(&s->mutex);
     if (result < 0) goto done;
     if (s->audioIndex >= 0) {
         stage = CinevaStageAudioOpen; readerStage(s, stage);
         AVStream *audio = s->format->streams[s->audioIndex];
         s->audioTimeBase = audio->time_base;
+        int64_t audioOpenBegan = av_gettime_relative();
         result = allocateDecoder(audio->codecpar, audio->time_base, &s->audio);
         if (result >= 0) result = avcodec_open2(s->audio, s->audio->codec, NULL);
+        pthread_mutex_lock(&s->mutex); s->snapshot.audioOpenSeconds=(av_gettime_relative()-audioOpenBegan)/1000000.0; pthread_mutex_unlock(&s->mutex);
         if (result < 0) {
             if (s->options.outputAudio) goto done;
             disableValidationAudio(s, result); result = 0;

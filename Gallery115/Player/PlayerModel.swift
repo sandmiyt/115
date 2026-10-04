@@ -251,7 +251,6 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
     self.duration = max(item.duration, libraryStore.knownDuration(for: item))
     player.automaticallyWaitsToMinimizeStalling = true
     player.allowsExternalPlayback = true
-    configureAudioSession()
     installAudioSessionObservers()
   }
 
@@ -278,7 +277,6 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
   func prepareAndPlay(external: Bool = false) async {
     externallyControlled=external
     guard !Task.isCancelled, !isPreparing else { return }
-    activateAudioSession()
     isPreparing = true
     didReachEnd = false
     defer { isPreparing = false }
@@ -324,10 +322,11 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
     deferredSourcesTask?.cancel()
     let api = self.api
     let item = self.item
+    let preferOriginal = defaultQuality == .original
     deferredSourcesTask = Task { @MainActor [weak self] in
       do {
         try await Task.sleep(for: .seconds(2))
-        let remaining = try await api.remainingVideoSources(for: item)
+        let remaining = try await api.remainingVideoSources(for: item, preferOriginal: preferOriginal)
         guard let self, !Task.isCancelled else { return }
         let existingIDs = Set(self.sources.map(\.id))
         self.sources.append(contentsOf: remaining.filter { !existingIDs.contains($0.id) })
@@ -689,6 +688,11 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
       isPlaying=false; isBuffering=false
       return
     }
+
+    // An external engine owns audio output. Do not activate a second audio
+    // session on the source-resolution path before FFmpeg has any media.
+    configureAudioSession()
+    activateAudioSession()
 
     // Containers that AVPlayer commonly rejects should go straight to VLC when
     // the VLC runtime is actually bundled. MP4/MOV and other Apple-friendly
@@ -1192,13 +1196,16 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
   private func configureAudioSession() {
     do {
       let session = AVAudioSession.sharedInstance()
-      try session.setCategory(.playback, mode: .moviePlayback, options: [])
+      if session.category != .playback || session.mode != .moviePlayback || !session.categoryOptions.isEmpty {
+        try session.setCategory(.playback, mode: .moviePlayback, options: [])
+      }
     } catch {
       // Non-fatal. Playback can still proceed on self-signed builds.
     }
   }
 
   private func activateAudioSession() {
+    guard !externallyControlled else { return }
     do {
       try AVAudioSession.sharedInstance().setActive(true)
     } catch {}

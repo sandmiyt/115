@@ -22,7 +22,8 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args): pass
     def do_GET(self):
         path = self.path.split("?")[0]
-        if path.startswith("/media/"):
+        if path.startswith(("/media/", "/slow-media/")):
+            throttled = path.startswith("/slow-media/")
             media = Path(self.server.media_dir) / Path(path).name
             if not media.is_file(): self.send_error(404); return
             size = media.stat().st_size
@@ -31,6 +32,7 @@ class Handler(BaseHTTPRequestHandler):
             if start >= size:
                 self.send_response(416); self.send_header("Content-Range", f"bytes */{size}")
                 self.send_header("Content-Length", "0"); self.end_headers(); return
+            if throttled: time.sleep(0.06)  # Fixture RTT, independent of request size.
             self.send_response(206); self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
             self.send_header("Content-Length", str(end-start+1)); self.send_header("ETag", f'"fixture-{media.name}-{size}"')
             self.end_headers()
@@ -38,7 +40,8 @@ class Handler(BaseHTTPRequestHandler):
                 with media.open("rb") as data:
                     data.seek(start); remaining=end-start+1
                     while remaining:
-                        chunk=data.read(min(65536, remaining)); self.wfile.write(chunk); remaining-=len(chunk)
+                        chunk=data.read(min(65536, remaining)); self.wfile.write(chunk); self.wfile.flush(); remaining-=len(chunk)
+                        if throttled and remaining: time.sleep(0.018)
             except (BrokenPipeError, ConnectionResetError): pass
             return
         if path == "/timeout": time.sleep(14)

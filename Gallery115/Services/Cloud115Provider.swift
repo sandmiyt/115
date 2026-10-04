@@ -200,6 +200,26 @@ actor Cloud115Provider: CloudProvider {
     return try await originalSource(pickCode: item.pickCode)
   }
 
+  func initialPlaybackSources(for item: CloudItem, preferOriginal: Bool) async throws -> (sources: [VideoSource], hasDeferredSources: Bool) {
+    guard !item.pickCode.isEmpty else { throw CloudProviderError.noPlayableSource }
+    let pickCode = item.pickCode
+    return try await Cloud115PlaybackSourceSelection.initial(
+      preferOriginal: preferOriginal,
+      original: { try await self.originalSource(pickCode: pickCode) },
+      transcodes: { try await self.transcodedSources(pickCode: pickCode) }
+    )
+  }
+
+  func remainingPlaybackSources(for item: CloudItem, preferOriginal: Bool) async throws -> [VideoSource] {
+    guard !item.pickCode.isEmpty else { throw CloudProviderError.noPlayableSource }
+    let pickCode = item.pickCode
+    return try await Cloud115PlaybackSourceSelection.remaining(
+      preferOriginal: preferOriginal,
+      original: { try await self.originalSource(pickCode: pickCode) },
+      transcodes: { try await self.transcodedSources(pickCode: pickCode) }
+    )
+  }
+
   func playbackTranscodedSources(for item: CloudItem) async throws -> [VideoSource] {
     guard !item.pickCode.isEmpty else { throw CloudProviderError.noPlayableSource }
     return try await transcodedSources(pickCode: item.pickCode)
@@ -635,6 +655,88 @@ actor Cloud115Provider: CloudProvider {
     "jpg", "jpeg", "png", "heic", "heif", "webp", "gif", "tif", "tiff", "bmp", "avif",
   ]
 }
+
+// BEGIN PLAYBACK SOURCE SELECTION
+/// The initial URL only waits for the requested playable quality. Other
+/// qualities are resolved after playback starts, using the same auth/request
+/// implementation. Closures let regression tests gate an actual slow lookup.
+enum Cloud115PlaybackSourceSelection {
+  private static func propagateBlockingFailure(_ error: Error) throws {
+    try Task.checkCancellation()
+    if error is CancellationError { throw error }
+    if let error = error as? URLError, error.code == .cancelled { throw CancellationError() }
+    if let error = error as? CloudProviderError {
+      switch error {
+      case .authenticationRequired, .rateLimited: throw error
+      default: break
+      }
+    }
+  }
+
+  private static func ordered(_ sources: [VideoSource]) -> [VideoSource] {
+    Dictionary(grouping: sources, by: \.id).compactMap { $0.value.first }.sorted { lhs, rhs in
+      if lhs.isOriginal != rhs.isOriginal { return !lhs.isOriginal }
+      return lhs.definition > rhs.definition
+    }
+  }
+
+  static func initial(
+    preferOriginal: Bool,
+    original: () async throws -> VideoSource,
+    transcodes: () async throws -> [VideoSource]
+  ) async throws -> (sources: [VideoSource], hasDeferredSources: Bool) {
+    try Task.checkCancellation()
+    if preferOriginal {
+      do {
+        let source = try await original()
+        try Task.checkCancellation()
+        return ([source], true)
+      } catch {
+        try propagateBlockingFailure(error)
+      }
+      // The original already failed in this launch. Fallback must not repeat
+      // the same downurl request before the available transcode can play.
+      let sources = ordered(try await transcodes())
+      try Task.checkCancellation()
+      guard !sources.isEmpty else { throw CloudProviderError.noPlayableSource }
+      return (sources, false)
+    }
+
+    var transcodeError: Error?
+    do {
+      let sources = ordered(try await transcodes())
+      try Task.checkCancellation()
+      if !sources.isEmpty { return (sources, true) }
+    } catch {
+      try propagateBlockingFailure(error)
+      transcodeError = error
+    }
+    try Task.checkCancellation()
+    do {
+      let source = try await original()
+      try Task.checkCancellation()
+      return ([source], false)
+    } catch {
+      try propagateBlockingFailure(error)
+      if let transcodeError { throw transcodeError }
+      throw CloudProviderError.noPlayableSource
+    }
+  }
+
+  static func remaining(
+    preferOriginal: Bool,
+    original: () async throws -> VideoSource,
+    transcodes: () async throws -> [VideoSource]
+  ) async throws -> [VideoSource] {
+    try Task.checkCancellation()
+    let sources: [VideoSource]
+    if preferOriginal { sources = ordered(try await transcodes()) }
+    else { sources = [try await original()] }
+    try Task.checkCancellation()
+    return sources
+  }
+}
+// END PLAYBACK SOURCE SELECTION
 
 private struct Cloud115Status {
   let state: Bool

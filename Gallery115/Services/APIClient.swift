@@ -63,27 +63,19 @@ actor APIClient {
   }
 
   func initialVideoSources(for item: CloudItem, preferOriginal: Bool) async throws -> (sources: [VideoSource], hasDeferredTranscodes: Bool) {
-    if preferOriginal, source == .cloud115 {
-      do {
-        let original = try await cloud115.playbackOriginalSource(for: item)
-        return ([original], true)
-      } catch let error as CloudProviderError {
-        switch error {
-        case .authenticationRequired, .rateLimited: throw error
-        default: break
-        }
-      } catch {
-        try Task.checkCancellation()
-        // Keep the existing authenticated/transcode fallback if original lookup fails.
-      }
+    if source == .cloud115 {
+      let initial = try await cloud115.initialPlaybackSources(for: item, preferOriginal: preferOriginal)
+      // Keep the existing response shape; this flag now also defers the
+      // original quality when the requested transcode is already playable.
+      return (initial.sources, initial.hasDeferredSources)
     }
     try Task.checkCancellation()
     return (try await videoSources(for: item), false)
   }
 
-  func remainingVideoSources(for item: CloudItem) async throws -> [VideoSource] {
+  func remainingVideoSources(for item: CloudItem, preferOriginal: Bool = true) async throws -> [VideoSource] {
     guard source == .cloud115 else { return [] }
-    return try await cloud115.playbackTranscodedSources(for: item)
+    return try await cloud115.remainingPlaybackSources(for: item, preferOriginal: preferOriginal)
   }
 
   func thumbnailLibraryPage(id: String, offset: Int, forceRefresh: Bool = false) async throws -> ThumbnailLibraryPage {

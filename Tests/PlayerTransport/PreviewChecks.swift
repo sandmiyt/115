@@ -10,6 +10,95 @@ import CoreImage
     let originVideoOffset=Double(CommandLine.arguments[2])!
     var checks=0
     func expect(_ ok:Bool,_ text:String) { precondition(ok,text); checks+=1 }
+    struct StartupSample {
+      let frame:CVPixelBuffer, framePTS:Double, span:Double
+      let pcm:[Float], pcmPTS:Double?, frameMS:Double, audioMS:Double?
+      let snapshot:CinevaFFmpegSnapshot, requests:Int
+    }
+    func startup(_ file:String,fullProbe:Bool,slow:Bool = false) async -> StartupSample {
+      let source=VideoSource(id:file,title:file,definition:0,
+        url:URL(string:base+(slow ? "/slow-media/" : "/media/")+file)!,kind:.original,headers:[:])
+      let io=RangeCoordinator(source:source,identity:RangeCacheIdentity(
+        account:"startup-fixture",fileID:file,size:0,validator:"generated-fixture"))
+      var options=CinevaFFmpegSessionOptions()
+      options.outputAudio=1; options.preferHardware=1; options.forceFullProbe=fullProbe ? 1 : 0; options.attach(io)
+      let began=ProcessInfo.processInfo.systemUptime
+      let pointer=source.url.absoluteString.withCString { CinevaFFmpegSessionCreate($0,"",0,options) }!
+      let handle=FFmpegSessionHandle(pointer,io:io)
+      defer { CinevaFFmpegSessionCancel(pointer); io.close(); withExtendedLifetime(handle) {} }
+      var frame:CVPixelBuffer?, framePTS=0.0, span=0.0, frameMS=0.0
+      var pcm:[Float]=[], pcmPTS:Double?, audioMS:Double?, state=CinevaFFmpegSnapshot()
+      let needsAudio=file != "noaudio.mp4"
+      while ProcessInfo.processInfo.systemUptime-began<20 && (frame==nil || (needsAudio && audioMS==nil)) {
+        CinevaFFmpegSessionSnapshot(pointer,&state)
+        expect(state.status>=0,"Startup \(file) fullProbe=\(fullProbe): stage=\(state.failureStage) error=\(state.errorCode)")
+        if frame==nil {
+          var pts=0.0,duration=0.0,generation:Int32=0
+          if let pixel=CinevaFFmpegSessionCopyFrame(pointer,&pts,&duration,&generation) {
+            frame=pixel; framePTS=pts; span=duration
+            frameMS=(ProcessInfo.processInfo.systemUptime-began)*1000
+          }
+        }
+        if needsAudio && audioMS==nil {
+          var bytes=[Float](repeating:0,count:131072), pts=0.0, generation:Int32=0
+          let count=CinevaFFmpegSessionCopyAudio(pointer,&bytes,65536,&pts,&generation)
+          if count>0 && bytes.prefix(Int(count)*2).contains(where:{ abs($0)>0.00001 }) {
+            pcm=Array(bytes.prefix(Int(count)*2)); pcmPTS=pts
+            audioMS=(ProcessInfo.processInfo.systemUptime-began)*1000
+          }
+        }
+        if frame==nil || (needsAudio && audioMS==nil) { try? await Task.sleep(for:.milliseconds(2)) }
+      }
+      expect(frame != nil && (!needsAudio || audioMS != nil),"Startup yields real video and nonzero PCM before deadline")
+      CinevaFFmpegSessionSnapshot(pointer,&state)
+      return StartupSample(frame:frame!,framePTS:framePTS,span:span,pcm:pcm,pcmPTS:pcmPTS,
+        frameMS:frameMS,audioMS:audioMS,snapshot:state,requests:io.statistics.requests)
+    }
+    func equivalent(_ a:StartupSample,_ b:StartupSample,_ file:String) {
+      expect(abs(a.framePTS-b.framePTS)<0.002 && abs(a.span-b.span)<0.002,"Fast/full probe keeps first frame PTS/span: \(file) \(a.framePTS)/\(b.framePTS)")
+      expect(CVPixelBufferGetWidth(a.frame)==CVPixelBufferGetWidth(b.frame) &&
+        CVPixelBufferGetHeight(a.frame)==CVPixelBufferGetHeight(b.frame),"Fast/full probe keeps decoded dimensions")
+      expect(abs(a.snapshot.duration-b.snapshot.duration)<0.03 && abs(a.snapshot.rotation-b.snapshot.rotation)<0.001,"Fast/full probe keeps media timing/rotation: \(file)")
+      expect(a.snapshot.colorTransfer==b.snapshot.colorTransfer && a.snapshot.colorPrimaries==b.snapshot.colorPrimaries,
+        "First decoded HDR/color metadata agrees, including header-late metadata")
+      if let left=a.pcmPTS,let right=b.pcmPTS {
+        expect(abs(left-right)<1.0/48000 && a.pcm.count==b.pcm.count,"AAC priming/PCM PTS and size agree: \(file) \(left)/\(right)")
+        expect(zip(a.pcm,b.pcm).allSatisfy { abs($0.0-$0.1)<0.0001 },"Decoded PCM agrees between complete-header and full-probe paths")
+      } else { expect(a.pcmPTS==nil && b.pcmPTS==nil,"No-audio input remains audio-free") }
+    }
+    for file in ["bframes.mp4","hevc.mp4","fractional.mp4","vfr.mp4","noaudio.mp4","rotated.mp4","origin.mp4","4k.mp4","hdr-no-colr.mp4","longgop.mkv","subtitles.mkv","fragmented.mp4","avc3.mp4","eac3.mp4","subtitles.mp4"] {
+      let before=await startup(file,fullProbe:true), after=await startup(file,fullProbe:false)
+      equivalent(before,after,file)
+      expect(before.snapshot.probeSkipped==0,"Forced baseline uses the previous complete probe")
+      if file.hasSuffix(".mkv") || ["fragmented.mp4","avc3.mp4","eac3.mp4","subtitles.mp4"].contains(file) {
+        expect(after.snapshot.probeSkipped==0,"Media outside the complete ordinary MP4 gate retains full probing: \(file)")
+      }
+      if file=="hdr-no-colr.mp4" { expect(after.snapshot.colorTransfer==16,"First decoded VUI retains PQ metadata without a container colr hint") }
+      if ["bframes.mp4","hevc.mp4","noaudio.mp4","rotated.mp4","origin.mp4","4k.mp4","hdr-no-colr.mp4"].contains(file) {
+        expect(after.snapshot.probeSkipped==1 && after.snapshot.probeReadBytes==0,"Complete ordinary MP4 reaches the guarded fast path: \(file)")
+      }
+      print("STARTUP_COMPAT file=\(file) probeSkipped=\(after.snapshot.probeSkipped) framePTS=\(after.framePTS) audioPTS=\(after.pcmPTS ?? -1)")
+    }
+    var oldFrames:[Double]=[],newFrames:[Double]=[],oldAudio:[Double]=[],newAudio:[Double]=[]
+    for run in 0..<3 {
+      let before:StartupSample,after:StartupSample
+      if run%2==0 {
+        before=await startup("long-cache.mp4",fullProbe:true,slow:true)
+        after=await startup("long-cache.mp4",fullProbe:false,slow:true)
+      } else {
+        after=await startup("long-cache.mp4",fullProbe:false,slow:true)
+        before=await startup("long-cache.mp4",fullProbe:true,slow:true)
+      }
+      equivalent(before,after,"long-cache.mp4")
+      expect(after.snapshot.probeSkipped==1 && after.snapshot.probeReadBytes==0,"Large indexed MP4 skips extra probe reads")
+      oldFrames.append(before.frameMS); newFrames.append(after.frameMS)
+      oldAudio.append(before.audioMS!); newAudio.append(after.audioMS!)
+      for (name,sample) in [("before",before),("after",after)] {
+        print("STARTUP_SAMPLE path=\(name) run=\(run) firstFrameDequeueMs=\(sample.frameMS) nonzeroPCMMs=\(sample.audioMS!) openMs=\(sample.snapshot.openSeconds*1000) probeMs=\((sample.snapshot.probeSeconds-sample.snapshot.openSeconds)*1000) probeBytes=\(sample.snapshot.probeReadBytes) requests=\(sample.requests)")
+      }
+    }
+    func median(_ values:[Double])->Double { values.sorted()[values.count/2] }
+    print("STARTUP_BENCH n=3 before_frame_ms=\(median(oldFrames)) after_frame_ms=\(median(newFrames)) before_pcm_ms=\(median(oldAudio)) after_pcm_ms=\(median(newAudio)) scope=simulator_throttled_HTTP_decoded_data_NOT_screen_or_speaker")
     for file in ["bframes.mp4","longgop.mkv","hevc.mp4","fractional.mp4","vfr.mp4","noaudio.mp4","rotated.mp4","origin.mp4","subtitles.mkv","4k.mp4","long-cache.mp4"] {
       let source=VideoSource(id:file,title:file,definition:0,url:URL(string:base+"/media/"+file)!,kind:.original,headers:[:])
       let io=RangeCoordinator(source:source,identity:RangeCacheIdentity(account:"test",fileID:file,size:0,validator:"generated-fixture"))

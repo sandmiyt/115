@@ -117,6 +117,7 @@ jobs:
           print("Buffer policy checks passed: \(checks)")
           SWIFT
           swift "$RUNNER_TEMP/buffer-policy.swift"
+          bash Tests/PlayerTransport/source-checks.sh
           swiftc Gallery115/Models/VideoSource.swift Gallery115/PlayerCore/PlaybackPolicy.swift \
             Tests/PlayerTransport/PlaybackChecks.swift -o "$RUNNER_TEMP/playback-checks"
           "$RUNNER_TEMP/playback-checks"
@@ -135,8 +136,8 @@ jobs:
           curl --fail --silent --max-time 5 -H 'Range: bytes=0-0' "http://127.0.0.1:$RANGE_PORT/ok" >/dev/null
           "$RUNNER_TEMP/range-checks" "http://127.0.0.1:$RANGE_PORT"
           # Compare the exact pre-change transport with identical loopback calls.
-          git fetch --depth=1 origin d293f0600ed02e78a877adb715702df30ece6495
-          git show d293f0600ed02e78a877adb715702df30ece6495:Gallery115/PlayerCore/RangeCoordinator.swift > "$RUNNER_TEMP/RangeBefore.swift"
+          git fetch --depth=1 origin db4cdc3732aeb9531dc35271dc9fbc053908cc6c
+          git show db4cdc3732aeb9531dc35271dc9fbc053908cc6c:Gallery115/PlayerCore/RangeCoordinator.swift > "$RUNNER_TEMP/RangeBefore.swift"
           swiftc Gallery115/Models/VideoSource.swift "$RUNNER_TEMP/RangeBefore.swift" \
             Tests/PlayerTransport/RangeTimingChecks.swift -o "$RUNNER_TEMP/range-before"
           swiftc Gallery115/Models/VideoSource.swift Gallery115/PlayerCore/RangeCoordinator.swift \

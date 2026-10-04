@@ -927,27 +927,76 @@ private actor ArtworkImageWorker {
   }
 }
 
-/// AsyncBytes returns after headers, so oversized/malformed bodies are stopped
-/// before allocation. The running task is cancelled on every early return.
+/// Reuse the image session's connections and receive bounded chunks instead of
+/// awaiting/appending each byte. Headers and streamed bodies share one budget.
 enum ArtworkByteReceiver {
   static func receive(_ request: URLRequest, session: URLSession, limit: Int) async throws -> Data {
-    let (bytes, response) = try await session.bytes(for: request)
-    defer { bytes.task.cancel() }
-    guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
-      response.expectedContentLength <= Int64(limit),
-      let mime = response.mimeType?.lowercased(),
-      mime.hasPrefix("image/") || mime == "application/octet-stream" else { throw URLError(.badServerResponse) }
+    guard limit>0 else { throw URLError(.dataLengthExceedsMaximum) }
+    let receiver=ArtworkChunkReceiver(limit:limit)
+    defer { withExtendedLifetime(receiver) {} }
     return try await withTaskCancellationHandler {
-      var data = Data()
-      data.reserveCapacity(min(limit, max(0, Int(response.expectedContentLength))))
-      for try await byte in bytes {
-        if data.count % 16384 == 0 { try Task.checkCancellation() }
-        guard data.count < limit else { throw URLError(.dataLengthExceedsMaximum) }
-        data.append(byte)
-      }
       try Task.checkCancellation()
-      return data
-    } onCancel: { bytes.task.cancel() }
+      return try await withCheckedThrowingContinuation { continuation in
+        receiver.start(request,session:session,continuation:continuation)
+      }
+    } onCancel: { receiver.cancel() }
+  }
+}
+
+/// Task-specific delegates preserve the existing session and its request pool.
+/// The lock also covers cancellation before installation and late callbacks.
+private final class ArtworkChunkReceiver: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+  private let lock=NSLock(), limit:Int
+  private var data=Data(), accepted=false, completed=false
+  private var continuation:CheckedContinuation<Data,Error>?
+  private var task:URLSessionDataTask?
+  init(limit:Int) { self.limit=limit; super.init() }
+  func start(_ request:URLRequest,session:URLSession,continuation:CheckedContinuation<Data,Error>) {
+    lock.lock()
+    guard !completed else { lock.unlock(); continuation.resume(throwing:URLError(.cancelled)); return }
+    let task=session.dataTask(with:request)
+    task.delegate=self
+    self.task=task; self.continuation=continuation
+    lock.unlock(); task.resume()
+  }
+  func cancel() { finish(URLError(.cancelled)) }
+  private func finish(_ error:Error?) {
+    lock.lock()
+    guard !completed else { lock.unlock(); return }
+    completed=true
+    let continuation=self.continuation, task=self.task
+    self.continuation=nil; self.task=nil
+    let result=data; data=Data()
+    lock.unlock()
+    if let error { task?.cancel(); continuation?.resume(throwing:error) }
+    else { continuation?.resume(returning:result) }
+  }
+  func urlSession(_ session:URLSession,dataTask:URLSessionDataTask,didReceive response:URLResponse,
+    completionHandler:@escaping (URLSession.ResponseDisposition)->Void) {
+    guard let http=response as? HTTPURLResponse,(200...299).contains(http.statusCode),
+      response.expectedContentLength<=Int64(limit),let mime=response.mimeType?.lowercased(),
+      mime.hasPrefix("image/") || mime=="application/octet-stream" else {
+      completionHandler(.cancel); finish(URLError(.badServerResponse)); return
+    }
+    lock.lock()
+    let allowed = !completed
+    if allowed {
+      accepted=true
+      data.reserveCapacity(min(limit,max(0,Int(response.expectedContentLength))))
+    }
+    lock.unlock(); completionHandler(allowed ? .allow : .cancel)
+  }
+  func urlSession(_ session:URLSession,dataTask:URLSessionDataTask,didReceive bytes:Data) {
+    lock.lock()
+    guard !completed else { lock.unlock(); return }
+    guard accepted,bytes.count<=limit-data.count else {
+      lock.unlock(); finish(URLError(.dataLengthExceedsMaximum)); return
+    }
+    data.append(bytes); lock.unlock()
+  }
+  func urlSession(_ session:URLSession,task:URLSessionTask,didCompleteWithError error:Error?) {
+    lock.lock(); let accepted=self.accepted; lock.unlock()
+    finish(error ?? (accepted ? nil : URLError(.badServerResponse)))
   }
 }
 

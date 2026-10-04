@@ -95,6 +95,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   @ObservationIgnored private var lastPump = 0.0
   @ObservationIgnored private var firstFrameAt: Double?
   @ObservationIgnored private var startAt = 0.0
+  @ObservationIgnored private var nativeCreatedAt = 0.0
   @ObservationIgnored private var sourceItem: CloudItem?
   @ObservationIgnored private var library: LibraryStore?
   @ObservationIgnored private var api: APIClient?
@@ -117,7 +118,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   @ObservationIgnored private let toneMapper = FFmpegSDRToneMapper()
   private(set) var toneMappedSDR = false
 
-  static func cacheIdentity(for item:CloudItem)->RangeCacheIdentity {
+  nonisolated static func cacheIdentity(for item:CloudItem)->RangeCacheIdentity {
     let scope: String
     if MediaSourceSelectionStore.shared.resolvedSource == .cloud115 {
       // Account API has no stable user identifier in the current auth model.
@@ -151,7 +152,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     subtitleTracks=[]; selectedSubtitleOptionID=nil; subtitleWarning=nil
     hasAtmosMetadata=false
     toneMappedSDR=false
-    errorMessage=nil; startAt=CACurrentMediaTime(); waitStarted=startAt
+    errorMessage=nil; startAt=CACurrentMediaTime(); nativeCreatedAt=0; waitStarted=startAt
     lastPublished=0; lastNetworkAt=startAt; lastNetworkBytes=0
     duration=item.duration; playbackState = .preparing
     renderer.reset(to:target,newSession:true); audio.reset(to:target,generation:serial)
@@ -159,22 +160,26 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
       fail("媒体请求头格式无效"); return
     }
     if self.inputBackend != .ffmpegHTTP {
-      let identity=Self.cacheIdentity(for:item)
-      audioPreferenceKey="cineva.ffmpeg.audio."+identity.key
       let epoch=lifecycleEpoch, cacheEnabled=self.inputBackend != .customAVIODirect
       seekReadiness.begin(generation:serial)
       // Network setup runs away from the UI. The rolling memory window never
       // joins the disk queue, scans manifests, persists or downloads ahead.
       startupTask=Task { @MainActor [weak self] in
-        let coordinator=await Task.detached(priority:.userInitiated) {
-          RangeCoordinator(source:source,identity:identity,cacheEnabled:cacheEnabled,persistenceEnabled:false,refresh:{
+        let prepared=await Task.detached(priority:.userInitiated) {
+          // The account identity reads Keychain. Preserve its isolation while
+          // keeping synchronous credential I/O off the playback/UI thread.
+          let identity=Self.cacheIdentity(for:item)
+          let coordinator=RangeCoordinator(source:source,identity:identity,cacheEnabled:cacheEnabled,persistenceEnabled:false,refresh:{
             let response=try await api.initialVideoSources(for:item,preferOriginal:true)
             guard let fresh=response.sources.first(where: \.isOriginal) else { throw URLError(.resourceUnavailable) }
             return fresh
           })
+          return (coordinator,identity.key)
         }.value
+        let coordinator=prepared.0
         guard let self,!Task.isCancelled,self.lifecycleEpoch==epoch else { coordinator.close(); return }
         self.startupTask=nil; self.cache=coordinator
+        self.audioPreferenceKey="cineva.ffmpeg.audio."+prepared.1
         self.openSession(source:source,preferHardware:preferHardware)
       }
     } else {
@@ -186,6 +191,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     options.preferHardware=preferHardware ? 1 : 0; options.videoOnly=0; options.outputAudio=1
     if let cache { options.attach(cache) }
     let headers=source.headers.sorted { $0.key < $1.key }.map { "\($0.key): \($0.value)\r\n" }.joined()
+    nativeCreatedAt=CACurrentMediaTime()
     let pointer=source.url.absoluteString.withCString { url in
       headers.withCString { CinevaFFmpegSessionCreate(url,$0,target,options) }
     }
@@ -487,6 +493,10 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
       if pending==nil {
         var pts=0.0, duration=0.0, generation:Int32=0
         if let pixel=CinevaFFmpegSessionCopyFrame(handle.pointer,&pts,&duration,&generation) {
+          // Header metadata can be completed by the first decoded frame. Read
+          // its generation/color update before choosing HDR display handling.
+          CinevaFFmpegSessionSnapshot(handle.pointer,&snapshot)
+          guard snapshot.serial==serial else { pending=nil; return }
           pending=(pixel,pts,duration,generation)
           pendingToneMapped=false
         }
@@ -655,9 +665,11 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
       func elapsed(_ time:Double?) -> String { time.map { String(format:"%.3f s",$0-clickAt) } ?? "尚未发生 / 不可获得" }
       let displayStage:String
       if #available(iOS 17.4,*) { displayStage="显示就绪代理" } else { displayStage="已提交/渲染状态代理（iOS 17.4 前）" }
-      let stages="session=\(sessionID.uuidString) · 播放请求→地址 \(elapsed(sourceResolvedAt)) · 首有效字节 \(snapshot.firstByteSeconds>0 ? elapsed(startAt+snapshot.firstByteSeconds) : "原生 HTTP 不可获得")\n"
-        + "容器打开 \(snapshot.openSeconds>0 ? elapsed(startAt+snapshot.openSeconds) : "尚未发生") · 流信息 \(snapshot.probeSeconds>0 ? elapsed(startAt+snapshot.probeSeconds) : "尚未发生")\n"
-        + "首解码 \(snapshot.firstDecodedSeconds>0 ? elapsed(startAt+snapshot.firstDecodedSeconds) : "尚未发生") · 首提交 \(elapsed(firstFrameAt)) · \(displayStage) \(elapsed(displayReadyAt))（非屏幕呈现测量）\n"
+      let nativeOrigin=nativeCreatedAt>0 ? nativeCreatedAt : startAt
+      let stages="session=\(sessionID.uuidString) · 播放请求→地址 \(elapsed(sourceResolvedAt)) · 首有效字节 \(snapshot.firstByteSeconds>0 ? elapsed(nativeOrigin+snapshot.firstByteSeconds) : "原生 HTTP 不可获得")\n"
+        + "输入准备 \(String(format:"%.1f ms",max(0,nativeOrigin-startAt)*1000)) · 容器打开 \(snapshot.openSeconds>0 ? elapsed(nativeOrigin+snapshot.openSeconds) : "尚未发生") · 流信息 \(snapshot.probeSeconds>0 ? elapsed(nativeOrigin+snapshot.probeSeconds) : "尚未发生")\n"
+        + "探测 \(snapshot.probeSkipped != 0 ? "完整 MP4 头/索引" : "流探测") · 额外读取 \(snapshot.probeReadBytes) B · V/A decoder \(String(format:"%.1f/%.1f ms",snapshot.videoOpenSeconds*1000,snapshot.audioOpenSeconds*1000))\n"
+        + "首解码 \(snapshot.firstDecodedSeconds>0 ? elapsed(nativeOrigin+snapshot.firstDecodedSeconds) : "尚未发生") · 首提交 \(elapsed(firstFrameAt)) · \(displayStage) \(elapsed(displayReadyAt))（非屏幕呈现测量）\n"
         + "音频 render 时钟开始 \(elapsed(audioRenderedAt))（非实际扬声器首声测量） · 连续运行 1 秒代理 \(elapsed(stableAt))\n"
         + "拖动最终 seek \(finalSeekCount) 次 · 松手→目标帧就绪代理 \(seekFrameMilliseconds.map { String(format:"%.1f ms",$0) } ?? "尚未发生")\n\(preview.diagnostic)\n"
       var usage=rusage(); getrusage(RUSAGE_SELF,&usage)

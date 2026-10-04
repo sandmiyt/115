@@ -35,6 +35,7 @@ typedef struct {
     CinevaFFmpegRead _Nullable read;
     CinevaFFmpegSize _Nullable size;
     CinevaFFmpegCancelIO _Nullable cancelIO;
+    int forceFullProbe; // Diagnostic before/after comparison; no shipping UI.
 } CinevaFFmpegSessionOptions;
 typedef struct {
     int status; // 0 opening, 1 decoding, 2 drained, -1 failed
@@ -78,6 +79,9 @@ typedef struct {
     int audioProfile, atmosMetadataDetected;
     double firstByteSeconds, openSeconds, probeSeconds, firstDecodedSeconds;
     double seekLookupSeconds, seekPrerollSeconds; // Current generation, -1 until ready.
+    int probeSkipped; // Complete indexed MP4 metadata; all other inputs probe normally.
+    int64_t probeReadBytes;
+    double videoOpenSeconds, audioOpenSeconds; // Stage durations, not cumulative timestamps.
 } CinevaFFmpegSnapshot;
 typedef struct { int index, codec, channels, sampleRate; char language[32], title[128]; } CinevaFFmpegAudioTrack;
 typedef struct { int index, codec; char language[32], title[128]; } CinevaFFmpegSubtitleTrack;
