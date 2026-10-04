@@ -514,16 +514,16 @@ actor ThumbnailService {
     let wantsFrame = image == nil && item.isVideo && !item.isDiscImage &&
       (loader == nil || frameLoader != nil || sourceFrameLoader != nil) &&
       canRetryFrame(identity.key, isPrefetch: isPrefetch)
+    let attempt = frameAttempts[identity.key, default: 0]
     var sourcePlan = SourcePlan(sources: [], blocked: false)
     if wantsFrame, frameLoader == nil {
       // URL lookup uses a network lane, never a decoder lane. Slow 115 address
       // resolution must not consume the frame deadline or both frame slots.
-      sourcePlan = await resolveFrameSources(item, identity: identity, api: api, fallback: nil)
+      sourcePlan = await resolveFrameSources(item, identity: identity, api: api, fallback: nil, attempt: attempt)
     }
     releaseSlot(workID)
     holdsNetworkSlot = false
     if wantsFrame, !Task.isCancelled, generation == cacheGeneration {
-      let attempt = frameAttempts[identity.key, default: 0]
       if frameAttempts.count > 1_024 { frameAttempts.removeAll() }
       frameAttempts[identity.key] = min(attempt + 1, 2)
       let budgets = timing.frameSeconds.isEmpty ? [15.0] : timing.frameSeconds
@@ -549,7 +549,7 @@ actor ThumbnailService {
           // Only resolve the original after available transcodes fail. Release
           // decoder resources while waiting for that second address lookup.
           if await acquireSlot(workID, isPrefetch: inFlight[identity.key]?.isPrefetch ?? isPrefetch) {
-            let fallback = await resolveFrameSources(item, identity: identity, api: api, fallback: sourcePlan.sources)
+            let fallback = await resolveFrameSources(item, identity: identity, api: api, fallback: sourcePlan.sources, attempt: attempt)
             releaseSlot(workID)
             sourcePlan.blocked = fallback.blocked
             if let source = fallback.sources.first, !Task.isCancelled, generation == cacheGeneration {
@@ -589,8 +589,9 @@ actor ThumbnailService {
   private struct SourcePlan: Sendable { var sources: [VideoSource]; var blocked: Bool }
 
   private func resolveFrameSources(_ item: CloudItem, identity: ArtworkIdentity,
-    api: APIClient, fallback: [VideoSource]?) async -> SourcePlan {
+    api: APIClient, fallback: [VideoSource]?, attempt: Int) async -> SourcePlan {
     let started = ProcessInfo.processInfo.systemUptime
+    let sourceBudget = timing.sourceSeconds * Double(min(attempt, 2) + 1)
     let completion = ArtworkCompletion<SourcePlan>()
     let result = await withTaskCancellationHandler {
       await withCheckedContinuation { continuation in
@@ -615,7 +616,7 @@ actor ThumbnailService {
           } catch { completion.finish(SourcePlan(sources: [], blocked: false)) }
         }
         let timeout = Task {
-          do { try await Task.sleep(for: .seconds(timing.sourceSeconds)) } catch { return }
+          do { try await Task.sleep(for: .seconds(sourceBudget)) } catch { return }
           completion.finish(nil)
         }
         completion.attach([worker, timeout])

@@ -145,6 +145,21 @@ final class ArtworkRecoveryTests: XCTestCase {
     XCTAssertEqual(calls, 2)
   }
 
+  func testSlowValidSourceReceivesLongerLookupBudgetOnRetry() async {
+    let api = APIClient(), ready = image(), clock = RecoveryClock()
+    await api.setThumbnailSources([source("slow-lookup")])
+    await api.setThumbnailSourceDelay(0.15)
+    var timing = ThumbnailLoadTiming(); timing.sourceSeconds = 0.1
+    let service = ThumbnailService(disk: disk, namespace: { "recovery" }, loader: { _, _ in nil },
+      sourceFrameLoader: { _ in ready }, timing: timing, now: { clock.now })
+    let first = await service.thumbnail(for: item(), api: api)
+    XCTAssertNil(first)
+    clock.advance(6)
+    let second = await service.thumbnail(for: item(), api: api)
+    XCTAssertNotNil(second, "A slow valid lookup cannot be permanently cut off by the first-attempt deadline")
+    await service.flushPersistence()
+  }
+
   func testRateLimitRetainsBackoffEvenWhenVisible() async {
     let api = APIClient(), clock = RecoveryClock()
     await api.setThumbnailSourceError(CloudProviderError.rateLimited("fixture"))
