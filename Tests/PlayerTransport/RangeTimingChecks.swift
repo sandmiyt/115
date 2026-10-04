@@ -29,7 +29,8 @@ import Foundation
       cachedSeek.append(read(first,65536))
       first.changeGeneration(2); missSeek.append(read(first,2*1048576,2))
       for _ in 0..<200 where first.statistics.memoryBytes<2*1048576 { Thread.sleep(forTimeInterval:0.01) }
-      // Exclude asynchronous durability from the warm-start measurement.
+      // The baseline reuses disk; current streaming intentionally reopens via
+      // HTTP. Report request counts rather than calling this an offline warm hit.
       Thread.sleep(forTimeInterval:0.1)
       first.close()
       let reopened=ProcessInfo.processInfo.systemUptime
@@ -41,7 +42,7 @@ import Foundation
       let sorted=samples.sorted()
       print(String(format:"AVIO_BENCH %@ %@ n=%d median_ms=%.3f max_ms=%.3f",label,name,samples.count,sorted[sorted.count/2],sorted.last!))
     }
-    report("cold",cold); report("warm",warm); report("cached_seek",cachedSeek); report("uncached_seek",missSeek)
-    print("AVIO_BENCH \(label) warm_requests=\(warmRequests)")
+    report("cold",cold); report("reopen",warm); report("memory_seek",cachedSeek); report("network_seek",missSeek)
+    print("AVIO_BENCH \(label) reopen_requests=\(warmRequests)")
   }
 }

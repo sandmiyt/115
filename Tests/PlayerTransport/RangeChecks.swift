@@ -183,6 +183,52 @@ private final class SlowDiskGate: @unchecked Sendable {
       && pausedShared.statistics.requests==sharedRequests,
       "Resumed preview rejoins the existing shared transfer without another HTTP request")
     pausedShared.cancelPreview(pausedSharedToken); pausedShared.close()
+    // Server retry state keys include the complete query and requested offset,
+    // so these cases cannot inherit a successful attempt from another fixture.
+    let pausedRetry=client("/retry-503?paused-owner="+UUID().uuidString)
+    let pausedRetryToken=pausedRetry.makePreviewToken(), pausedRetryRead=PendingRangeRead()
+    pausedRetryRead.start(pausedRetry,at:22345,generation:pausedRetryToken)
+    for _ in 0..<100 where (pausedRetry.statistics.recovery?.attempts.first?.plannedWait ?? 0)<1 {
+      Thread.sleep(forTimeInterval:0.005)
+    }
+    expect(pausedRetry.statistics.requests==1 && pausedRetry.statistics.recovery?.attempts.first?.status==503
+      && (pausedRetry.statistics.recovery?.attempts.first?.plannedWait ?? 0)>=1,
+      "Preview owns the initial one-second 503 backoff before being paused")
+    pausedRetry.setPreviewReadsAllowed(false)
+    Thread.sleep(forTimeInterval:1.25)
+    expect(pausedRetry.statistics.requests==1 && pausedRetryRead.result==nil,
+      "Paused preview cannot issue a retry after its original backoff expires")
+    pausedRetry.setPreviewReadsAllowed(true)
+    expect(pausedRetryRead.done.wait(timeout:.now()+2) == .success
+      && (pausedRetryRead.result ?? -1)>0 && pausedRetryRead.validBytes
+      && pausedRetry.statistics.requests==2,
+      "Resumed independent preview recovers with one real successful retry")
+    pausedRetry.cancelPreview(pausedRetryToken); pausedRetry.close()
+    let handoffRetry=client("/retry-503?paused-owner-primary="+UUID().uuidString)
+    let handoffToken=handoffRetry.makePreviewToken(), handoffOwner=PendingRangeRead(), handoffPrimary=PendingRangeRead()
+    handoffOwner.start(handoffRetry,at:32768,generation:handoffToken)
+    for _ in 0..<100 where (handoffRetry.statistics.recovery?.attempts.first?.plannedWait ?? 0)<1 {
+      Thread.sleep(forTimeInterval:0.005)
+    }
+    expect(handoffRetry.statistics.requests==1 && handoffRetry.statistics.recovery?.attempts.first?.status==503,
+      "Shared handoff begins with preview-owned failed request")
+    handoffPrimary.start(handoffRetry,at:32768)
+    for _ in 0..<100 where !handoffRetry.playbackReadState.waitingForNetwork {
+      Thread.sleep(forTimeInterval:0.005)
+    }
+    expect(handoffRetry.playbackReadState.waitingForNetwork && handoffRetry.statistics.requests==1,
+      "Primary has joined the existing preview retry rather than starting another request")
+    handoffRetry.setPreviewReadsAllowed(false)
+    expect(handoffPrimary.done.wait(timeout:.now()+3) == .success
+      && (handoffPrimary.result ?? -1)>0 && handoffPrimary.validBytes
+      && handoffRetry.statistics.requests==2 && handoffRetry.statistics.terminalFailure==nil,
+      "Pausing the preview retry owner hands backoff to primary without delay or duplicate requests")
+    expect(handoffOwner.result==nil,"Preview owner remains paused while primary recovers")
+    handoffRetry.setPreviewReadsAllowed(true)
+    expect(handoffOwner.done.wait(timeout:.now()+1) == .success
+      && (handoffOwner.result ?? -1)>0 && handoffOwner.validBytes && handoffRetry.statistics.requests==2,
+      "Resumed preview reads the recovered shared bytes without another download")
+    handoffRetry.cancelPreview(handoffToken); handoffRetry.close()
     // Independent preview cursors share bytes and request capacity, not stop/seek.
     let scoped=client("/retry-stop?scope-test")
     expect(read(scoped,0)>0,"Prime verified primary cache")

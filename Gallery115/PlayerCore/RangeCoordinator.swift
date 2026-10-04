@@ -817,7 +817,8 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
             cycle.attempts[f.attemptIndex].plannedWait=waited+delay
             let waitStart=ProcessInfo.processInfo.systemUptime, until=waitStart+delay
             publishRecovery(cycle)
-            while valid(wanted) && fatalError==nil && ProcessInfo.processInfo.systemUptime<until {
+            while valid(wanted) && fatalError==nil && ProcessInfo.processInfo.systemUptime<until
+              && (wanted==generation || wanted==prefetchToken || previewReadsAllowed) {
               _=condition.wait(until:Date(timeIntervalSinceNow:min(0.1,until-ProcessInfo.processInfo.systemUptime)))
               cycle.attempts[f.attemptIndex].actualWait=waited+ProcessInfo.processInfo.systemUptime-waitStart
             }
@@ -827,6 +828,11 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
               f.retryPending=false
               if f.readers.isEmpty { publishRecovery(cycle,outcome:"cancelled") }
               condition.broadcast(); result = -3; return result
+            }
+            if wanted != generation,wanted != prefetchToken,!previewReadsAllowed {
+              // Hand a shared retry back to the primary before freezing this
+              // preview's budget; an inactive gesture never owns its backoff.
+              f.retryPending=false; condition.broadcast(); continue
             }
             if let fatalError=readerErrors[wanted] ?? fatalError { result=fatalError; return result }
             if ProcessInfo.processInfo.systemUptime>=budget { cycle.reason="total-budget"; result=terminate(f,reader:wanted); return result }
