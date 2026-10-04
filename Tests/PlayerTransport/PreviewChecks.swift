@@ -86,13 +86,17 @@ import CoreImage
         // Retain the SAME preview context over a pause longer than both AVIO
         // budgets. Its uncached target must not download while inactive, and
         // must resume without an expired native deadline or a media reopen.
-        let pausedReader=FFmpegPreviewReader(io)
+        // Keep request accounting independent of the already-running primary
+        // fixture; its ordinary playback lookahead must not count as preview I/O.
+        let pausedIO=RangeCoordinator(source:source,identity:RangeCacheIdentity(
+          account:"pause-fixture",fileID:file,size:io.fileSize,validator:"generated-fixture"))
+        let pausedReader=FFmpegPreviewReader(pausedIO)
         var pausedOptions=CinevaFFmpegSessionOptions()
         pausedOptions.videoOnly=1; pausedOptions.sequentialVideoOnly=1; pausedOptions.preview=1
         pausedOptions.attachPreview(pausedReader)
         let pausedPointer=source.url.absoluteString.withCString { CinevaFFmpegSessionCreate($0,"",0,pausedOptions) }!
         let pausedHandle=FFmpegSessionHandle(pausedPointer,previewReader:pausedReader)
-        let activity=FFmpegPreviewActivity(coordinator:io); activity.attach(pausedHandle)
+        let activity=FFmpegPreviewActivity(coordinator:pausedIO); activity.attach(pausedHandle)
         var firstPreview=false
         let previewDeadline=ProcessInfo.processInfo.systemUptime+10
         while !firstPreview && ProcessInfo.processInfo.systemUptime<previewDeadline {
@@ -103,9 +107,9 @@ import CoreImage
         expect(firstPreview,"Native pause fixture opens a real independent preview session")
         activity.setActive(false)
         let pausedGeneration=CinevaFFmpegSessionSeek(pausedPointer,330.731)
-        let pausedRequests=io.statistics.requests
+        let pausedRequests=pausedIO.statistics.requests
         try? await Task.sleep(for:.seconds(12))
-        expect(io.statistics.requests==pausedRequests,"Finished drag cannot keep downloading preview ranges")
+        expect(pausedIO.statistics.requests==pausedRequests,"Finished drag cannot keep downloading preview ranges")
         activity.setActive(true)
         var resumedPreview=false
         let resumedDeadline=ProcessInfo.processInfo.systemUptime+8
@@ -119,7 +123,7 @@ import CoreImage
         }
         expect(resumedPreview,"Retained preview session resumes the exact uncached target after 12 seconds")
         print("STREAMING_PREVIEW_PAUSE seconds=12 resumed=true retainedSession=true")
-        CinevaFFmpegSessionCancel(pausedPointer); activity.attach(nil)
+        CinevaFFmpegSessionCancel(pausedPointer); activity.attach(nil); pausedIO.close()
         let localRoot=FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at:localRoot) }
         let disk=SegmentDiskCache(root:localRoot)
