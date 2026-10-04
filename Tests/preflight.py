@@ -196,7 +196,10 @@ check("try Task.checkCancellation()" in player_model
       and "scrubGeneration == generation" in player_model
       and "self.player.currentItem === item" in player_model,
       "Player retains cancelled-preparation guards and scopes seek callbacks to the active item")
-check("boundedResult(seconds: 18)" in service and "boundedArtwork(seconds: frameBudget)" in service
+check("boundedResult(seconds: timing.artworkSeconds)" in service
+      and "boundedArtwork(seconds: max(0.001, seconds))" in service
+      and "Task.sleep(for: .seconds(timing.sourceSeconds))" in service
+      and "remaining -= result.elapsed" in service
       and "boundedArtwork(seconds: 45)" not in card
       and "[0, 6, 15, 30, 60][min(attempt, 4)]" in card,
       "Active artwork stages have deadlines; queued cells retain automatic retries")

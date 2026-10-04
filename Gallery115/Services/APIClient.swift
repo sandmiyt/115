@@ -91,9 +91,22 @@ actor APIClient {
   }
 
   func thumbnailSource(for item: CloudItem) async throws -> VideoSource? {
+    try await thumbnailSources(for: item).first
+  }
+
+  func thumbnailSources(for item: CloudItem) async throws -> [VideoSource] {
+    try Task.checkCancellation()
     switch source {
-    case .webDAV: return try await webDAV.videoSources(for: item).first
-    case .cloud115: return try await cloud115.thumbnailSource(for: item)
+    case .webDAV: return Array(try await webDAV.videoSources(for: item).prefix(1))
+    case .cloud115: return try await cloud115.thumbnailSources(for: item)
+    }
+  }
+
+  func thumbnailFallbackSource(for item: CloudItem, attempted: [VideoSource]) async throws -> VideoSource? {
+    try Task.checkCancellation()
+    switch source {
+    case .webDAV: return nil
+    case .cloud115: return try await cloud115.thumbnailFallbackSource(for: item, attempted: attempted)
     }
   }
 

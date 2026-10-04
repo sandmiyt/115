@@ -227,21 +227,26 @@ actor Cloud115Provider: CloudProvider {
 
   /// Small artwork needs the cheapest available transcode, not playback quality.
   func thumbnailSource(for item: CloudItem) async throws -> VideoSource? {
-    guard !item.pickCode.isEmpty else { return nil }
-    do {
-      let sources = try await transcodedSources(pickCode: item.pickCode)
-      try Task.checkCancellation()
-      if let source = sources.min(by: { $0.definition < $1.definition }) { return source }
-    } catch let error as CloudProviderError {
-      switch error {
-      case .authenticationRequired, .rateLimited: throw error
-      default: break
-      }
-    } catch {
-      try Task.checkCancellation()
-    }
+    try await thumbnailSources(for: item).first
+  }
+
+  func thumbnailSources(for item: CloudItem) async throws -> [VideoSource] {
     try Task.checkCancellation()
-    return try await originalSource(pickCode: item.pickCode)
+    guard !item.pickCode.isEmpty else { return [] }
+    let pickCode = item.pickCode
+    return try await Cloud115ThumbnailSourceSelection.initial(
+      original: { try await self.originalSource(pickCode: pickCode) },
+      transcodes: { try await self.transcodedSources(pickCode: pickCode) }
+    )
+  }
+
+  /// Resolve the original only after the selected transcodes could not yield artwork.
+  func thumbnailFallbackSource(for item: CloudItem, attempted: [VideoSource]) async throws -> VideoSource? {
+    try Task.checkCancellation()
+    guard !item.pickCode.isEmpty else { return nil }
+    let pickCode = item.pickCode
+    return try await Cloud115ThumbnailSourceSelection.fallback(attempted: attempted,
+      original: { try await self.originalSource(pickCode: pickCode) })
   }
 
   func photoSource(for item: CloudItem) async throws -> VideoSource? {
@@ -737,6 +742,57 @@ enum Cloud115PlaybackSourceSelection {
   }
 }
 // END PLAYBACK SOURCE SELECTION
+
+// BEGIN THUMBNAIL SOURCE SELECTION
+enum Cloud115ThumbnailSourceSelection {
+  static func initial(
+    original: () async throws -> VideoSource,
+    transcodes: () async throws -> [VideoSource]
+  ) async throws -> [VideoSource] {
+    try Task.checkCancellation()
+    do {
+      let sources = try await transcodes()
+      try Task.checkCancellation()
+      let ordered = sources.enumerated().filter { !$0.element.isOriginal }.sorted { lhs, rhs in
+        if lhs.element.definition != rhs.element.definition {
+          return lhs.element.definition < rhs.element.definition
+        }
+        return lhs.offset < rhs.offset
+      }
+      var candidates: [VideoSource] = []
+      for entry in ordered {
+        let source = entry.element
+        if candidates.contains(where: { $0.url == source.url && $0.headers == source.headers }) { continue }
+        candidates.append(source)
+        if candidates.count == 2 { break }
+      }
+      if !candidates.isEmpty { return candidates }
+    } catch {
+      try Task.checkCancellation()
+      if error is CancellationError { throw error }
+      if let error = error as? URLError, error.code == .cancelled { throw CancellationError() }
+      if let error = error as? CloudProviderError {
+        switch error {
+        case .authenticationRequired, .rateLimited: throw error
+        default: break
+        }
+      }
+    }
+    try Task.checkCancellation()
+    let source = try await original()
+    try Task.checkCancellation()
+    return [source]
+  }
+
+  static func fallback(attempted: [VideoSource], original: () async throws -> VideoSource) async throws -> VideoSource? {
+    try Task.checkCancellation()
+    guard !attempted.contains(where: \.isOriginal) else { return nil }
+    let source = try await original()
+    try Task.checkCancellation()
+    return source
+  }
+}
+// END THUMBNAIL SOURCE SELECTION
 
 private struct Cloud115Status {
   let state: Bool

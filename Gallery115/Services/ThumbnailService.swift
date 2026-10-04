@@ -9,13 +9,21 @@ struct ThumbnailLibraryPage: Sendable {
   let nextOffset: Int?
 }
 
+struct ThumbnailLoadTiming: Sendable {
+  var artworkSeconds = 18.0
+  var sourceSeconds = 20.0
+  var frameSeconds = [15.0, 30.0, 60.0]
+  var candidateSeconds = 8.0
+}
+
 /// Local-first artwork; a small bounded pool fills visible rows while playback has priority.
 actor ThumbnailService {
   typealias Loader = @Sendable (CloudItem, APIClient) async -> UIImage?
+  typealias SourceFrameLoader = @Sendable (VideoSource) async -> UIImage?
   private struct Work {
     let id: UUID
     let task: Task<UIImage?, Never>
-    var clients: Set<UUID>
+    var clients: [UUID: Bool] // true only while this consumer is speculative.
     var isPrefetch: Bool
     let pixels: Int
   }
@@ -46,11 +54,19 @@ actor ThumbnailService {
   private let namespace: @Sendable () -> String
   private let loader: Loader?
   private let frameLoader: Loader?
+  private let sourceFrameLoader: SourceFrameLoader?
+  private let timing: ThumbnailLoadTiming
+  private let now: @Sendable () -> Date
   private nonisolated let memoryCache = ArtworkMemoryCache()
   private let logger = Logger(subsystem: "com.xiaocai.gallery115", category: "Artwork")
   private var inFlight: [String: Work] = [:]
   private var frameAttempts: [String: Int] = [:]
-  private var frameFailedUntil: [String: Date] = [:]
+  private struct FrameFailure {
+    let until: Date
+    let wasPrefetch: Bool
+    let blocked: Bool
+  }
+  private var frameFailedUntil: [String: FrameFailure] = [:]
   private var failedUntil: [String: Date] = [:]
   private var activeSlots: Set<UUID> = []
   private var activeFrameSlots: Set<UUID> = []
@@ -78,7 +94,10 @@ actor ThumbnailService {
     disk: ArtworkDiskStore = ArtworkDiskStore(),
     namespace: @escaping @Sendable () -> String = { ThumbnailService.currentNamespace() },
     loader: Loader? = nil,
-    frameLoader: Loader? = nil
+    frameLoader: Loader? = nil,
+    sourceFrameLoader: SourceFrameLoader? = nil,
+    timing: ThumbnailLoadTiming = ThumbnailLoadTiming(),
+    now: @escaping @Sendable () -> Date = { Date() }
   ) {
     let generation = UUID()
     self.cacheGeneration = generation
@@ -87,6 +106,9 @@ actor ThumbnailService {
     self.namespace = namespace
     self.loader = loader
     self.frameLoader = frameLoader
+    self.sourceFrameLoader = sourceFrameLoader
+    self.timing = timing
+    self.now = now
     memoryCache.countLimit = 160
     memoryCache.totalCostLimit = 72 * 1_024 * 1_024
   }
@@ -143,19 +165,17 @@ actor ThumbnailService {
         GridArtworkTrace.event("memory-hit", id: identity.key, since: requestedAt)
         return image
       }
-      if let retry = failedUntil[identity.key], retry > Date() { return nil }
+      if let retry = failedUntil[identity.key], retry > now() { return nil }
 
       let clientID = UUID()
       let work: Work
       if var existing = inFlight[identity.key] {
         GridArtworkTrace.event("deduplicated", id: identity.key)
-        existing.clients.insert(clientID)
-        if !isPrefetch { existing.isPrefetch = false }
-        if !isPrefetch, let index = slotWaiters.firstIndex(where: { $0.id == existing.id }) {
-          slotWaiters[index].isPrefetch = false
-          drainWaiters()
-        }
+        let previousPriority=existing.isPrefetch
+        existing.clients[clientID]=isPrefetch
+        existing.isPrefetch=existing.clients.values.allSatisfy { $0 }
         inFlight[identity.key] = existing
+        if previousPriority != existing.isPrefetch { updatePriority(existing) }
         work = existing
       } else {
         let workID = UUID()
@@ -163,7 +183,7 @@ actor ThumbnailService {
           guard let self else { return nil }
           return await self.load(item, identity: identity, api: api, generation: generation, workID: workID, isPrefetch: isPrefetch, pixels: pixels)
         }
-        work = Work(id: workID, task: task, clients: [clientID], isPrefetch: isPrefetch, pixels: pixels)
+        work = Work(id: workID, task: task, clients: [clientID:isPrefetch], isPrefetch: isPrefetch, pixels: pixels)
         inFlight[identity.key] = work
       }
 
@@ -190,7 +210,7 @@ actor ThumbnailService {
       if inFlight[identity.key]?.id == work.id {
         inFlight[identity.key] = nil
         if result == nil, !isPrefetch, !work.task.isCancelled, generation == cacheGeneration {
-          failedUntil[identity.key] = Date().addingTimeInterval(5)
+          failedUntil[identity.key] = now().addingTimeInterval(5)
         }
       }
       guard !Task.isCancelled, generation == cacheGeneration, identity.namespace == namespace() else { return nil }
@@ -483,7 +503,7 @@ actor ThumbnailService {
     var holdsNetworkSlot = true
     defer { if holdsNetworkSlot { releaseSlot(workID) } }
     guard !Task.isCancelled, generation == cacheGeneration, identity.namespace == namespace() else { return nil }
-    let artifact = await Self.boundedResult(seconds: 18) { [self] in
+    let artifact = await Self.boundedResult(seconds: timing.artworkSeconds) { [self] in
       if let loader {
         guard let image = await loader(item, api) else { return nil }
         return LoadedArtwork(image: image, data: nil)
@@ -491,39 +511,140 @@ actor ThumbnailService {
       return await loadNetworkArtwork(for: item, identity: identity, api: api, pixels: pixels, generation: generation)
     }
     var image = artifact?.image
-    // Independent frame lanes cannot hold up ready image downloads.
+    let wantsFrame = image == nil && item.isVideo && !item.isDiscImage &&
+      (loader == nil || frameLoader != nil || sourceFrameLoader != nil) &&
+      canRetryFrame(identity.key, isPrefetch: isPrefetch)
+    var sourcePlan = SourcePlan(sources: [], blocked: false)
+    if wantsFrame, frameLoader == nil {
+      // URL lookup uses a network lane, never a decoder lane. Slow 115 address
+      // resolution must not consume the frame deadline or both frame slots.
+      sourcePlan = await resolveFrameSources(item, identity: identity, api: api, fallback: nil)
+    }
     releaseSlot(workID)
     holdsNetworkSlot = false
-    if image == nil, item.isVideo, !item.isDiscImage, (loader == nil || frameLoader != nil),
-      (frameFailedUntil[identity.key] ?? .distantPast) <= Date() {
-      guard !Task.isCancelled, generation == cacheGeneration,
-        await acquireSlot(workID, isPrefetch: inFlight[identity.key]?.isPrefetch ?? isPrefetch, isFrame: true) else { return nil }
-      defer { releaseSlot(workID, isFrame: true) }
-      guard !Task.isCancelled, generation == cacheGeneration else { return nil }
-      let frameLoader = self.frameLoader
+    if wantsFrame, !Task.isCancelled, generation == cacheGeneration {
       let attempt = frameAttempts[identity.key, default: 0]
       if frameAttempts.count > 1_024 { frameAttempts.removeAll() }
       frameAttempts[identity.key] = min(attempt + 1, 2)
-      let frameBudget = Double([15, 30, 60][min(attempt, 2)])
-      image = await Self.boundedArtwork(seconds: frameBudget) {
-        if let frameLoader { return await frameLoader(item, api) }
-        let started = ProcessInfo.processInfo.systemUptime
-        guard let source = try? await api.thumbnailSource(for: item), !Task.isCancelled else { return nil }
-        GridArtworkTrace.event("frame-source", id: identity.key, since: started)
-        return await Self.frameThumbnail(source: source)
+      let budgets = timing.frameSeconds.isEmpty ? [15.0] : timing.frameSeconds
+      var remaining = max(0.001, budgets[min(attempt, budgets.count - 1)])
+      let candidateBudget = timing.candidateSeconds * pow(2.0, Double(min(attempt, 2)))
+      if frameLoader != nil {
+        let result = await frameCandidate(nil, item: item, identity: identity, api: api,
+          generation: generation, workID: workID, isPrefetch: isPrefetch, seconds: remaining)
+        image = result.image
+      } else {
+        for source in sourcePlan.sources {
+          guard !Task.isCancelled, generation == cacheGeneration, remaining > 0 else { break }
+          let result = await frameCandidate(source, item: item, identity: identity, api: api,
+            generation: generation, workID: workID, isPrefetch: isPrefetch,
+            seconds: source.isOriginal ? remaining : min(candidateBudget, remaining))
+          remaining -= result.elapsed
+          image = result.image
+          if image != nil { break }
+        }
+        if image == nil, !sourcePlan.blocked, !sourcePlan.sources.isEmpty,
+          !sourcePlan.sources.contains(where: \.isOriginal), remaining > 0,
+          !Task.isCancelled, generation == cacheGeneration {
+          // Only resolve the original after available transcodes fail. Release
+          // decoder resources while waiting for that second address lookup.
+          if await acquireSlot(workID, isPrefetch: inFlight[identity.key]?.isPrefetch ?? isPrefetch) {
+            let fallback = await resolveFrameSources(item, identity: identity, api: api, fallback: sourcePlan.sources)
+            releaseSlot(workID)
+            sourcePlan.blocked = fallback.blocked
+            if let source = fallback.sources.first, !Task.isCancelled, generation == cacheGeneration {
+              image = await frameCandidate(source, item: item, identity: identity, api: api,
+                generation: generation, workID: workID, isPrefetch: isPrefetch,
+                seconds: remaining).image
+            }
+          }
+        }
       }
       if image == nil, !Task.isCancelled, generation == cacheGeneration {
         if frameFailedUntil.count > 1_024 { frameFailedUntil.removeAll() }
-        frameFailedUntil[identity.key] = Date().addingTimeInterval(300)
+        let prefetch = inFlight[identity.key]?.isPrefetch ?? isPrefetch
+        let delay = sourcePlan.blocked ? 300.0 : Double([5, 15, 30][min(attempt, 2)])
+        frameFailedUntil[identity.key] = FrameFailure(until: now().addingTimeInterval(delay),
+          wasPrefetch: prefetch, blocked: sourcePlan.blocked)
+        GridArtworkTrace.event("frame-retry", id: identity.key,
+          detail: "reason=\(sourcePlan.blocked ? "auth-or-rate-limit" : "temporary-or-unavailable") delay=\(delay) prefetch=\(prefetch)")
       }
     }
     guard !Task.isCancelled, generation == cacheGeneration, identity.namespace == namespace(),
       inFlight[identity.key]?.id == workID, let image else { return nil }
     failedUntil[identity.key] = nil
     frameAttempts[identity.key] = nil
+    frameFailedUntil[identity.key] = nil
     cacheInMemory(image, key: identity.key, pixels: artifact?.data == nil ? 960 : pixels)
     enqueuePersistence(image, data: artifact?.data, identity: identity, generation: generation)
     return image
+  }
+
+  private func canRetryFrame(_ key: String, isPrefetch: Bool) -> Bool {
+    guard let failure = frameFailedUntil[key], failure.until > now() else { return true }
+    let prefetch = inFlight[key]?.isPrefetch ?? isPrefetch
+    return failure.wasPrefetch && !prefetch && !failure.blocked
+  }
+
+  private struct SourcePlan: Sendable { var sources: [VideoSource]; var blocked: Bool }
+
+  private func resolveFrameSources(_ item: CloudItem, identity: ArtworkIdentity,
+    api: APIClient, fallback: [VideoSource]?) async -> SourcePlan {
+    let started = ProcessInfo.processInfo.systemUptime
+    let completion = ArtworkCompletion<SourcePlan>()
+    let result = await withTaskCancellationHandler {
+      await withCheckedContinuation { continuation in
+        completion.install(continuation)
+        let worker = Task {
+          do {
+            let sources: [VideoSource]
+            if let fallback {
+              let candidate = try await api.thumbnailFallbackSource(for: item, attempted: fallback)
+              if let source = candidate {
+                sources = [source]
+              } else { sources = [] }
+            } else { sources = try await api.thumbnailSources(for: item) }
+            completion.finish(SourcePlan(sources: sources, blocked: false))
+          } catch let error as CloudProviderError {
+            let blocked: Bool
+            switch error {
+            case .authenticationRequired, .rateLimited: blocked = true
+            default: blocked = false
+            }
+            completion.finish(SourcePlan(sources: [], blocked: blocked))
+          } catch { completion.finish(SourcePlan(sources: [], blocked: false)) }
+        }
+        let timeout = Task {
+          do { try await Task.sleep(for: .seconds(timing.sourceSeconds)) } catch { return }
+          completion.finish(nil)
+        }
+        completion.attach([worker, timeout])
+      }
+    } onCancel: { completion.finish(nil) }
+    GridArtworkTrace.event("frame-source", id: identity.key,
+      detail: "fallback=\(fallback != nil) candidates=\(result?.sources.count ?? 0) blocked=\(result?.blocked ?? false)", since: started)
+    return result ?? SourcePlan(sources: [], blocked: false)
+  }
+
+  private func frameCandidate(_ source: VideoSource?, item: CloudItem, identity: ArtworkIdentity,
+    api: APIClient, generation: UUID, workID: UUID, isPrefetch: Bool, seconds: Double
+  ) async -> (image: UIImage?, elapsed: Double) {
+    guard !Task.isCancelled, generation == cacheGeneration,
+      await acquireSlot(workID, isPrefetch: inFlight[identity.key]?.isPrefetch ?? isPrefetch, isFrame: true) else { return (nil, 0) }
+    defer { releaseSlot(workID, isFrame: true) }
+    guard !Task.isCancelled, generation == cacheGeneration else { return (nil, 0) }
+    let frameLoader = self.frameLoader, sourceLoader = sourceFrameLoader
+    let started = ProcessInfo.processInfo.systemUptime
+    let image = await Self.boundedArtwork(seconds: max(0.001, seconds)) {
+      if let frameLoader { return await frameLoader(item, api) }
+      guard let source else { return nil }
+      if let sourceLoader { return await sourceLoader(source) }
+      return await Self.frameThumbnail(source: source)
+    }
+    let elapsed = ProcessInfo.processInfo.systemUptime - started
+    GridArtworkTrace.event("frame-candidate", id: identity.key,
+      detail: "kind=\(source.map { $0.isOriginal ? "original" : "transcoded" } ?? "injected") success=\(image != nil)", since: started)
+    return (image, elapsed)
   }
 
   private func loadNetworkArtwork(for item: CloudItem, identity: ArtworkIdentity, api: APIClient, pixels: Int, generation: UUID) async -> LoadedArtwork? {
@@ -661,13 +782,41 @@ actor ThumbnailService {
 
   private func cancelClient(_ client: UUID, key: String, workID: UUID) {
     guard var work = inFlight[key], work.id == workID else { return }
-    work.clients.remove(client)
+    work.clients.removeValue(forKey:client)
     if work.clients.isEmpty {
       work.task.cancel()
       inFlight[key] = nil
     } else {
+      let previousPriority=work.isPrefetch
+      work.isPrefetch=work.clients.values.allSatisfy { $0 }
       inFlight[key] = work
+      if previousPriority != work.isPrefetch { updatePriority(work) }
     }
+  }
+
+  /// Priority follows the remaining consumers, including already active lanes.
+  /// A promoted cover gives its speculative slot back immediately. If its last
+  /// visible card disappears, keep only the bounded background allocation;
+  /// interested prefetch consumers requeue a cancelled worker without failure.
+  private func updatePriority(_ work:Work) {
+    for index in slotWaiters.indices where slotWaiters[index].id==work.id {
+      slotWaiters[index].isPrefetch=work.isPrefetch
+    }
+    var mustYield=false
+    if activeSlots.contains(work.id) {
+      if work.isPrefetch {
+        if !activePrefetchSlots.contains(work.id),activePrefetchSlots.count>=maximumNetworkJobs-1 { mustYield=true }
+        else { activePrefetchSlots.insert(work.id) }
+      } else { activePrefetchSlots.remove(work.id) }
+    }
+    if activeFrameSlots.contains(work.id) {
+      if work.isPrefetch {
+        if !gridOwners.isEmpty || (!activePrefetchFrameSlots.contains(work.id) && !activePrefetchFrameSlots.isEmpty) { mustYield=true }
+        else { activePrefetchFrameSlots.insert(work.id) }
+      } else { activePrefetchFrameSlots.remove(work.id) }
+    }
+    if mustYield { work.task.cancel() }
+    drainWaiters()
   }
 
   private func acquireSlot(_ id: UUID, isPrefetch: Bool, isFrame: Bool = false) async -> Bool {
