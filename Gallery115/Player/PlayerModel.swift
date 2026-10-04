@@ -198,6 +198,7 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
   private var subtitleGroup: AVMediaSelectionGroup?
   nonisolated(unsafe) private var playbackTimer: Timer?
   @ObservationIgnored private var deferredSourcesTask: Task<Void, Never>?
+  @ObservationIgnored private var deferredSourcesPending=false
   nonisolated(unsafe) private var failureObserver: NSObjectProtocol?
   nonisolated(unsafe) private var endObserver: NSObjectProtocol?
   nonisolated(unsafe) private var stallObserver: NSObjectProtocol?
@@ -283,12 +284,6 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
     defer { isPreparing = false }
 
     do {
-      if external, let local=await FFmpegPlayerEngine.cachedSource(for:item) {
-        try Task.checkCancellation()
-        sources=[local]; await play(local,allowFallback:false)
-        loadRemainingSources()
-        return
-      }
       let initial = try await api.initialVideoSources(for: item, preferOriginal: defaultQuality == .original)
       try Task.checkCancellation()
       sources = initial.sources
@@ -315,22 +310,17 @@ final class PlayerModel: PlayerEngine, PlayerTrackSelecting {
     }
   }
 
-  func resolveCachedSourceForExternalEngine() async -> Bool {
-    guard selectedSource?.url.scheme=="cineva-cache" else { return true }
-    do {
-      let response=try await api.initialVideoSources(for:item,preferOriginal:true)
-      try Task.checkCancellation()
-      guard let original=response.sources.first(where: \.isOriginal) else { return false }
-      sources=response.sources
-      await play(original,allowFallback:false,autoplay:false,resumeAt:currentTime)
-      return true
-    } catch {
-      if !Task.isCancelled { errorMessage="该播放方式需要在线获取地址："+error.localizedDescription }
-      return false
-    }
+  func releaseDeferredSourcesAfterStartup() {
+    guard deferredSourcesPending else { return }
+    deferredSourcesPending=false
+    loadRemainingSources(afterExternalStartup:true)
   }
 
-  private func loadRemainingSources() {
+  private func loadRemainingSources(afterExternalStartup:Bool = false) {
+    if externallyControlled,!afterExternalStartup {
+      deferredSourcesPending=true
+      return
+    }
     deferredSourcesTask?.cancel()
     let api = self.api
     let item = self.item

@@ -9,6 +9,7 @@ final class NativeAudioRenderer {
   private let pitch = AVAudioUnitTimePitch()
   private let format = AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 2)!
   private var anchor: Double?
+  private var sessionPrepared = false
   private var heldTime = 0.0
   private(set) var submittedEnd = 0.0
   private(set) var renderedTime = 0.0
@@ -38,20 +39,31 @@ final class NativeAudioRenderer {
     let session = AVAudioSession.sharedInstance()
     // Playback already permits AirPlay and A2DP. allowAirPlay may only be set
     // explicitly for playAndRecord; using it here can reject session setup.
-    try session.setCategory(.playback,mode:.moviePlayback,options:[])
-    try session.setActive(true)
+    if session.category != .playback || session.mode != .moviePlayback || !session.categoryOptions.isEmpty {
+      try session.setCategory(.playback,mode:.moviePlayback,options:[])
+      sessionPrepared = false
+    }
+    // A seek stops the player node but keeps the engine and audio session
+    // alive. Reactivating that session on every refill/seek adds synchronous
+    // system work to the target-frame path. Interruptions/configuration changes
+    // explicitly invalidate this state; a stopped engine also reactivates it.
+    if !sessionPrepared || !engine.isRunning {
+      try session.setActive(true)
+      sessionPrepared = true
+    }
     if !engine.isRunning { try engine.start() }
   }
+  func invalidateSession() { sessionPrepared = false }
   func reset(to time: Double, generation: Int32) {
     node.stop() // Unschedules every old-generation buffer, including TimePitch input.
     pitch.reset()
     self.generation=generation; anchor=nil; heldTime=time; submittedEnd=time; renderedTime=time; playing=false
   }
-  func stop() { node.stop(); engine.stop(); playing=false; anchor=nil }
+  func stop() { node.stop(); engine.stop(); sessionPrepared=false; playing=false; anchor=nil }
   func pause() { heldTime=audibleTime; node.pause(); playing=false }
   func resume() throws {
-    try prepare()
     guard anchor != nil else { return }
+    try prepare()
     node.play(); playing=true
   }
   func setRate(_ value: Float) { rate=min(2,max(0.5,value)); pitch.rate=rate }

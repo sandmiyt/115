@@ -1,7 +1,7 @@
 import Foundation
 
 private final class PendingRangeRead: @unchecked Sendable {
-  let done=DispatchSemaphore(value:0)
+  let started=DispatchSemaphore(value:0), done=DispatchSemaphore(value:0)
   private let lock=NSLock()
   private var value:Int32?
   private var integrity=true
@@ -10,6 +10,7 @@ private final class PendingRangeRead: @unchecked Sendable {
   func start(_ client:RangeCoordinator,at offset:Int64,generation:Int32 = 1) {
     DispatchQueue.global().async {
       var bytes=[UInt8](repeating:0,count:4096)
+      self.started.signal()
       let n=client.read(offset:offset,buffer:&bytes,count:4096,generation:generation)
       let valid=n<=0 || (0..<Int(n)).allSatisfy { bytes[$0]==UInt8((offset+Int64($0))%251) }
       self.lock.lock(); self.value=n; self.integrity=valid; self.lock.unlock(); self.done.signal()
@@ -38,8 +39,9 @@ private final class SlowDiskGate: @unchecked Sendable {
       VideoSource(id:"fixture",title:"fixture",definition:0,url:URL(string:base+path)!,kind:.original,headers:headers)
     }
     func client(_ path: String, size: Int64 = 3*1048576+97, id: String = UUID().uuidString,
-                version: String = "fixture-v1", cacheEnabled: Bool = true, headers: [String:String] = [:], refresh: RangeCoordinator.Refresh? = nil) -> RangeCoordinator {
-      RangeCoordinator(source:source(path,headers:headers),identity:RangeCacheIdentity(account:"test-account",fileID:id,size:size,validator:version),disk:disk,cacheEnabled:cacheEnabled,refresh:refresh)
+                version: String = "fixture-v1", cacheEnabled: Bool = true, persistenceEnabled: Bool = false,
+                headers: [String:String] = [:], refresh: RangeCoordinator.Refresh? = nil) -> RangeCoordinator {
+      RangeCoordinator(source:source(path,headers:headers),identity:RangeCacheIdentity(account:"test-account",fileID:id,size:size,validator:version),disk:disk,cacheEnabled:cacheEnabled,persistenceEnabled:persistenceEnabled,refresh:refresh)
     }
     var checks=0
     func expect(_ ok: Bool,_ message: String) { precondition(ok,message); checks+=1 }
@@ -50,6 +52,49 @@ private final class SlowDiskGate: @unchecked Sendable {
       if n>0 { expect((0..<Int(n)).allSatisfy { bytes[$0]==UInt8((offset+Int64($0))%251) },"Byte integrity at \(offset)") }
       return n
     }
+    let streamingRoot=root.appendingPathComponent("streaming-only")
+    try FileManager.default.createDirectory(at:streamingRoot,withIntermediateDirectories:true)
+    let streamingDisk=SegmentDiskCache(root:streamingRoot)
+    let streamingSize:Int64=40*1048576+97
+    let streamingIdentity=RangeCacheIdentity(account:"streaming",fileID:"movie",size:streamingSize,
+      validator:"sha1:"+String(repeating:"c",count:40))
+    let streaming=RangeCoordinator(source:source("/fragment"),identity:streamingIdentity,disk:streamingDisk)
+    expect(read(streaming,0)>0,"Default streaming delivers validated bytes without durable caching")
+    for _ in 0..<200 where streaming.statistics.memoryBytes<1048576 { Thread.sleep(forTimeInterval:0.005) }
+    expect(streaming.statistics.networkBytes==1048576 && streaming.statistics.memoryBytes==1048576,
+      "Only the requested startup window is transferred and committed to valid memory")
+    let startupRequests=streaming.statistics.requests
+    streaming.allowPrefetch(true)
+    Thread.sleep(forTimeInterval:1.4)
+    expect(streaming.statistics.requests==startupRequests && streaming.statistics.networkBytes==1048576,
+      "Default streaming never starts whole-file prefetch, even if a caller enables it")
+    streaming.changeGeneration(2)
+    let hitRequests=streaming.statistics.requests
+    expect(read(streaming,32768,4096,2)>0 && streaming.statistics.requests==hitRequests
+      && streaming.statistics.memoryHitBytes>0,"Streaming seek reuses valid bounded memory without redownload")
+    for window in 1..<40 {
+      expect(read(streaming,Int64(window)*1048576,4096,2)>0,"Streaming rolling window \(window)")
+      for _ in 0..<200 where streaming.statistics.networkBytes<Int64(window+1)*1048576 {
+        Thread.sleep(forTimeInterval:0.005)
+      }
+      expect(streaming.statistics.networkBytes==Int64(window+1)*1048576,
+        "Requested streaming window finishes before moving to the next one")
+      expect(streaming.statistics.memoryBytes<=32*1048576,"Streaming retained media stays within 32 MiB")
+      expect(streamingDisk.queuedWriteBytes==0,"Streaming has no pending disk writes")
+    }
+    expect(streaming.statistics.diskHitBytes==0 && streaming.mediaCacheProgress.bytes==0
+      && !streaming.mediaCacheProgress.complete,"Rolling memory never masquerades as a complete durable file")
+    let evictedRequests=streaming.statistics.requests
+    expect(read(streaming,0,4096,2)>0 && streaming.statistics.requests>evictedRequests,
+      "Evicted streaming bytes are fetched normally instead of reading stale memory")
+    streaming.close(); streamingDisk.flush()
+    expect((try FileManager.default.contentsOfDirectory(atPath:streamingRoot.path)).isEmpty,
+      "Default streaming creates no segment or manifest files")
+    let reopenedStream=RangeCoordinator(source:source("/expired"),identity:streamingIdentity,disk:streamingDisk)
+    expect(reopenedStream.fileSize == -1 && read(reopenedStream,0)<0
+      && reopenedStream.statistics.requests==1 && reopenedStream.statistics.diskHitBytes==0,
+      "A reopened default stream cannot silently resurrect an old whole-file cache")
+    reopenedStream.close()
     // A partially downloaded file must suppress buffering feedback when this
     // seek hits cached bytes, independently of preview/prefetch network work.
     let feedback=client("/retry-stop?seek-feedback")
@@ -85,6 +130,59 @@ private final class SlowDiskGate: @unchecked Sendable {
     readiness.observe(feedback.playbackReadState,buffering:true)
     expect(!readiness.needsNetwork,"Local decode underrun stays on local recovery without network feedback")
     feedback.close()
+    let gated=client("/ok?preview-pause-gate")
+    expect(read(gated,0)>0,"Prime memory before pausing preview reads")
+    for _ in 0..<200 where gated.statistics.memoryBytes<1048576 { Thread.sleep(forTimeInterval:0.005) }
+    gated.setPreviewReadsAllowed(false)
+    let gatedToken=gated.makePreviewToken(), gatedPreview=PendingRangeRead()
+    let beforeGate=gated.statistics.requests
+    gatedPreview.start(gated,at:1048576,generation:gatedToken)
+    expect(gatedPreview.started.wait(timeout:.now()+1) == .success,"Preview read reaches paused gate")
+    Thread.sleep(forTimeInterval:0.05)
+    expect(gatedPreview.result==nil && gated.statistics.requests==beforeGate,
+      "Paused preview does not start an HTTP request")
+    expect(read(gated,32768)>0 && gated.statistics.requests==beforeGate,
+      "Paused preview gate leaves primary memory hits available")
+    expect(read(gated,2097152)>0 && gated.statistics.requests==beforeGate+1,
+      "Paused preview gate leaves primary network misses available")
+    gated.setPreviewReadsAllowed(true)
+    expect(gatedPreview.done.wait(timeout:.now()+2) == .success
+      && (gatedPreview.result ?? -1)>0 && gatedPreview.validBytes,
+      "Resumed preview returns real validated bytes from its independent cursor")
+    expect(gated.statistics.requests==beforeGate+2,"Resumed preview fetches only its missing window")
+    gated.setPreviewReadsAllowed(false)
+    let cancelledGate=gated.makePreviewToken(), cancelledGateRead=PendingRangeRead()
+    cancelledGateRead.start(gated,at:0,generation:cancelledGate)
+    expect(cancelledGateRead.started.wait(timeout:.now()+1) == .success,"Cancelled fixture enters paused preview gate")
+    Thread.sleep(forTimeInterval:0.05)
+    let beforeCancelledGate=gated.statistics.requests
+    gated.cancelPreview(cancelledGate)
+    expect(cancelledGateRead.done.wait(timeout:.now()+1) == .success && cancelledGateRead.result == -3,
+      "Cancelling a paused preview wakes its read immediately")
+    expect(read(gated,0)>0 && gated.statistics.requests==beforeCancelledGate
+      && gated.statistics.terminalFailure==nil,"Paused preview cancellation preserves primary bytes and status")
+    gated.cancelPreview(gatedToken); gated.close()
+    let pausedShared=client("/slow?pause-shared-flight")
+    let pausedSharedToken=pausedShared.makePreviewToken()
+    expect(read(pausedShared,0,4096,pausedSharedToken)>0,"Preview starts a streaming shared flight")
+    expect(read(pausedShared,0)>0,"Primary attaches to preview-owned flight")
+    let sharedRequests=pausedShared.statistics.requests, sharedCancelled=pausedShared.statistics.cancelled
+    pausedShared.setPreviewReadsAllowed(false)
+    expect(read(pausedShared,65536)>0 && pausedShared.statistics.requests==sharedRequests
+      && pausedShared.statistics.cancelled==sharedCancelled,
+      "Pausing preview removes only its reader and preserves the primary shared transfer")
+    let pausedSharedWait=PendingRangeRead()
+    pausedSharedWait.start(pausedShared,at:131072,generation:pausedSharedToken)
+    expect(pausedSharedWait.started.wait(timeout:.now()+1) == .success,"Shared preview waits behind paused gate")
+    Thread.sleep(forTimeInterval:0.05)
+    expect(pausedSharedWait.result==nil && pausedShared.statistics.requests==sharedRequests,
+      "A paused shared preview cannot reopen or replace the primary flight")
+    pausedShared.setPreviewReadsAllowed(true)
+    expect(pausedSharedWait.done.wait(timeout:.now()+2) == .success
+      && (pausedSharedWait.result ?? -1)>0 && pausedSharedWait.validBytes
+      && pausedShared.statistics.requests==sharedRequests,
+      "Resumed preview rejoins the existing shared transfer without another HTTP request")
+    pausedShared.cancelPreview(pausedSharedToken); pausedShared.close()
     // Independent preview cursors share bytes and request capacity, not stop/seek.
     let scoped=client("/retry-stop?scope-test")
     expect(read(scoped,0)>0,"Prime verified primary cache")
@@ -203,7 +301,7 @@ private final class SlowDiskGate: @unchecked Sendable {
     expect(read(retryChanged,2*1048576)==(-4),"206 after retry still must match version")
     expect(retryChanged.statistics.terminalFailure?.kind == .resourceChanged && retryChanged.statistics.recovery?.outcome=="rejected","Version conflict is not recovered")
     retryChanged.close()
-    let cold=client("/ok",id:"warm")
+    let cold=client("/ok",id:"warm",persistenceEnabled:true)
     expect(read(cold,0)>0,"206 startup")
     expect(read(cold,1040000,8576)>0,"First transfer tail")
     for _ in 0..<100 where cold.statistics.memoryBytes==0 { Thread.sleep(forTimeInterval:0.02) }
@@ -211,12 +309,12 @@ private final class SlowDiskGate: @unchecked Sendable {
     expect(cold.statistics.memoryHitBytes>0,"Actual memory hit")
     expect(read(cold,size)==0,"Verified EOF")
     cold.close(); disk.flush()
-    let warm=client("/ok",id:"warm")
+    let warm=client("/ok",id:"warm",persistenceEnabled:true)
     expect(warm.fileSize == -1,"Listing size is not confirmed AVSEEK_SIZE")
     expect(read(warm,size-1)>0,"Warm session validates HTTP identity first")
     expect(read(warm,0)>0 && warm.statistics.diskHitBytes>0 && warm.statistics.requests==1,"Warm disk cache after validation")
     warm.close()
-    let changedIdentity=client("/ok",id:"warm",version:"fixture-v2")
+    let changedIdentity=client("/ok",id:"warm",version:"fixture-v2",persistenceEnabled:true)
     expect(read(changedIdentity,0)>0 && changedIdentity.statistics.requests>0,"Version isolates disk cache")
     changedIdentity.close()
     for path in ["/bad200","/wrongrange","/416"] {
@@ -238,7 +336,7 @@ private final class SlowDiskGate: @unchecked Sendable {
     expect(read(redirect,0)>0,"Cross-origin redirect strips credentials"); redirect.close()
     for path in ["/short64", "/short10"] {
       let cacheID="short-warm-"+path
-      let c=client(path,id:cacheID)
+      let c=client(path,id:cacheID,persistenceEnabled:true)
       var offset:Int64=0
       while offset<size {
         let n=read(c,offset,65536)
@@ -250,13 +348,13 @@ private final class SlowDiskGate: @unchecked Sendable {
       expect(c.statistics.requests<400,"Short 206 finite request count")
       for _ in 0..<100 where c.statistics.memoryBytes<Int(size) { Thread.sleep(forTimeInterval:0.01) }
       c.close(); disk.flush()
-      let warmShort=client(path,id:cacheID)
+      let warmShort=client(path,id:cacheID,persistenceEnabled:true)
       expect(read(warmShort,size-1)>0 && read(warmShort,0)>0,"Short 206 warm validation/read")
       expect(warmShort.statistics.diskHitBytes>0,"Only assembled complete short-response pages persist")
       warmShort.close()
     }
     for hint in [size-1,size+1] {
-      let c=client("/ok",size:hint,id:"warm")
+      let c=client("/ok",size:hint,id:"warm",persistenceEnabled:true)
       expect(c.fileSize == -1,"Provisional size unavailable to AVSEEK_SIZE")
       expect(read(c,hint)<0 && c.statistics.requests==1,"Hint cannot manufacture EOF")
       expect(c.statistics.terminalFailure?.kind == .metadataConflict,"Hint mismatch classified without mixing cache")
@@ -292,7 +390,7 @@ private final class SlowDiskGate: @unchecked Sendable {
       expect(read(sparse,offset,12000)>0,"Sparse holes must fetch real coverage, never zero-fill")
     }
     sparse.close()
-    let newHTTPVersion=client("/v2",id:"warm")
+    let newHTTPVersion=client("/v2",id:"warm",persistenceEnabled:true)
     expect(read(newHTTPVersion,size-1)>0 && read(newHTTPVersion,0)>0,"New HTTP version independently validates")
     expect(newHTTPVersion.statistics.diskHitBytes==0,"Changed HTTP ETag cannot reuse old version disk pages")
     newHTTPVersion.close()
@@ -326,11 +424,23 @@ private final class SlowDiskGate: @unchecked Sendable {
     let blockedDisk=SegmentDiskCache(root:root.appendingPathComponent("blocked-writer"),
       freeSpace:{ diskGate.available() })
     let whileWriting=RangeCoordinator(source:source("/large"),identity:RangeCacheIdentity(
-      account:"test",fileID:"blocked-writer",size:576*1048576+97,validator:"test-v1"),disk:blockedDisk)
+      account:"test",fileID:"blocked-writer",size:576*1048576+97,validator:"test-v1"),disk:blockedDisk,persistenceEnabled:true)
     expect(read(whileWriting,0)>0,"First bytes precede disk persistence")
     expect(diskGate.entered.wait(timeout:.now()+2) == .success,"Fixture holds actual utility writer")
     expect(!whileWriting.mediaCacheProgress.complete && whileWriting.mediaCacheProgress.bytes==0,
       "Network completion and pending writes never count as durable complete coverage")
+    // The shipping default must not even join the disk utility queue. A writer
+    // from an earlier session is deliberately held while a new stream opens.
+    let streamingStarted=ProcessInfo.processInfo.systemUptime
+    let independentStream=RangeCoordinator(source:source("/large"),identity:RangeCacheIdentity(
+      account:"test",fileID:"streaming-beside-writer",size:576*1048576+97,validator:"test-v1"),disk:blockedDisk)
+    expect(ProcessInfo.processInfo.systemUptime-streamingStarted<0.5,
+      "Default streaming construction does not wait behind disk persistence")
+    expect(read(independentStream,0)>0 && independentStream.statistics.requests==1,
+      "Default streaming starts through real network while the disk writer is blocked")
+    expect(independentStream.statistics.diskHitBytes==0 && independentStream.mediaCacheProgress.bytes==0,
+      "Default streaming cannot claim disk hits or whole-file cache completion")
+    independentStream.close()
     let duringWrite=ProcessInfo.processInfo.systemUptime
     expect(read(whileWriting,2*1048576)>0,"Foreground miss progresses with disk writer blocked")
     expect(ProcessInfo.processInfo.systemUptime-duringWrite<1,"Disk callback cannot delay foreground network read")
@@ -340,7 +450,7 @@ private final class SlowDiskGate: @unchecked Sendable {
       expect(blockedDisk.queuedWriteBytes<=4*1048576,"Pending persistence never exceeds 4 MiB")
     }
     diskGate.release.signal(); whileWriting.close(); blockedDisk.flush()
-    let priority=client("/slow?priority")
+    let priority=client("/slow?priority",persistenceEnabled:true)
     expect(read(priority,0)>0,"Prime foreground before prefetch priority check")
     for _ in 0..<400 where priority.statistics.memoryBytes<1048576 { Thread.sleep(forTimeInterval:0.01) }
     priority.allowPrefetch(true)
@@ -356,13 +466,14 @@ private final class SlowDiskGate: @unchecked Sendable {
     let resumeDisk=SegmentDiskCache(root:resumeRoot)
     let resumeIdentity=RangeCacheIdentity(account:"resume",fileID:"movie",size:size,
       validator:"sha1:"+String(repeating:"b",count:40))
-    let partial=RangeCoordinator(source:source("/ok"),identity:resumeIdentity,disk:resumeDisk)
+    let partial=RangeCoordinator(source:source("/ok"),identity:resumeIdentity,disk:resumeDisk,persistenceEnabled:true)
     expect(read(partial,0)>0,"Prime persistent partial media")
-    for _ in 0..<200 where partial.statistics.memoryBytes<1048576 { Thread.sleep(forTimeInterval:0.01) }
+    for _ in 0..<400 where partial.mediaCacheProgress.bytes<1048576 { Thread.sleep(forTimeInterval:0.01) }
+    expect(partial.mediaCacheProgress.bytes==1048576,"Partial reopen fixture waits for durable head pages")
     partial.close(); resumeDisk.flush()
     let resumedDisk=SegmentDiskCache(root:resumeRoot)
     expect(resumedDisk.restored(identity:resumeIdentity.key)?.complete==false,"Partial manifest is not complete")
-    let resumed=RangeCoordinator(source:source("/ok"),identity:resumeIdentity,disk:resumedDisk)
+    let resumed=RangeCoordinator(source:source("/ok"),identity:resumeIdentity,disk:resumedDisk,persistenceEnabled:true)
     expect(read(resumed,0)>0 && resumed.statistics.requests==0,"Partial reopen serves verified old head without redownload")
     var diskReadiness=CachedSeekReadiness(); diskReadiness.begin(generation:1)
     diskReadiness.observe(resumed.playbackReadState,buffering:true)
@@ -379,7 +490,7 @@ private final class SlowDiskGate: @unchecked Sendable {
     // Retain a completed unaligned seek flight while its partial memory pages
     // age out of the 32 MiB LRU. Gap fill must reassemble the old flight's tail.
     let fragmentSize:Int64=40*1048576+97
-    let fragment=client("/fragment",size:fragmentSize)
+    let fragment=client("/fragment",size:fragmentSize,persistenceEnabled:true)
     expect(read(fragment,34*1048576+123)>0,"Unaligned seek seeds partial page boundaries")
     for _ in 0..<200 where fragment.statistics.memoryBytes<1048576 { Thread.sleep(forTimeInterval:0.01) }
     fragment.allowPrefetch(true)
@@ -395,7 +506,7 @@ private final class SlowDiskGate: @unchecked Sendable {
     let largeDisk=SegmentDiskCache(root:largeRoot,capacity:{ 2*1073741824 },freeSpace:{ 8*1073741824 })
     let identity=RangeCacheIdentity(account:"large-test",fileID:"movie",size:largeSize,
       validator:"sha1:"+String(repeating:"a",count:40))
-    let large=RangeCoordinator(source:source("/large"),identity:identity,disk:largeDisk)
+    let large=RangeCoordinator(source:source("/large"),identity:identity,disk:largeDisk,persistenceEnabled:true)
     let coldAt=ProcessInfo.processInfo.systemUptime
     expect(read(large,0)>0,"Large file starts incrementally")
     let coldMS=(ProcessInfo.processInfo.systemUptime-coldAt)*1000
@@ -434,10 +545,15 @@ private final class SlowDiskGate: @unchecked Sendable {
     let reopenedDisk=SegmentDiskCache(root:largeRoot,capacity:{ 2*1073741824 },freeSpace:{ 8*1073741824 })
     expect(reopenedDisk.restored(identity:identity.key)?.complete==true,"Persisted identity, length and complete coverage survive reopening")
     // An unreachable URL proves neither URL refresh nor remote I/O is required.
-    let offline=RangeCoordinator(source:source("/expired"),identity:identity,disk:reopenedDisk)
+    let offline=RangeCoordinator(source:source("/expired"),identity:identity,disk:reopenedDisk,persistenceEnabled:true)
     for offset in [Int64(0),largeSize/2,largeSize-4096] { expect(read(offline,offset)>0,"Offline head/middle/tail bytes") }
     expect(offline.statistics.requests==0 && offline.statistics.diskHitBytes>0,"Fully cached AVIO never opens network")
     offline.close()
+    let onlineOnly=RangeCoordinator(source:source("/expired"),identity:identity,disk:reopenedDisk)
+    expect(onlineOnly.fileSize == -1 && read(onlineOnly,0)<0 && onlineOnly.statistics.requests==1
+      && onlineOnly.statistics.diskHitBytes==0 && !onlineOnly.mediaCacheProgress.complete,
+      "Default streaming ignores an actually complete legacy cache and requires valid network input")
+    onlineOnly.close()
     let block=largeRoot.appendingPathComponent("\(identity.key)-0.block")
     var corrupt=try Data(contentsOf:block); corrupt[40] ^= 0xff; try corrupt.write(to:block,options:.atomic)
     let checkedDisk=SegmentDiskCache(root:largeRoot)
@@ -446,7 +562,7 @@ private final class SlowDiskGate: @unchecked Sendable {
     for lowSpace in [false,true] {
       let limitedDisk=SegmentDiskCache(root:root.appendingPathComponent(UUID().uuidString),
         capacity:{ lowSpace ? 2*1073741824 : 8*1048576 },freeSpace:{ lowSpace ? 1073741824+2*1048576 : 8*1073741824 })
-      let limited=RangeCoordinator(source:source("/large"),identity:identity,disk:limitedDisk)
+      let limited=RangeCoordinator(source:source("/large"),identity:identity,disk:limitedDisk,persistenceEnabled:true)
       expect(read(limited,0)>0,"Limited capacity still streams normally")
       limited.allowPrefetch(true)
       for _ in 0..<100 where limited.mediaCacheProgress.limitation==nil { Thread.sleep(forTimeInterval:0.05) }

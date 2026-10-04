@@ -415,11 +415,13 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
   private let disk: SegmentDiskCache
   private let diskEpoch: UInt64
   private let cacheEnabled: Bool
+  private let persistenceEnabled: Bool
   private let refresh: Refresh?
   private var source: VideoSource
   private var length:Int64 = -1 // HTTP-confirmed only, never the listing hint.
   private var generation:Int32 = 1
   private var previewTokens:Set<Int32>=[]
+  private var previewReadsAllowed=true
   private var nextPreviewToken:Int32=1_000_000
   private var readerErrors:[Int32:Int32]=[:]
   private var primaryReaders=0
@@ -435,6 +437,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
   private var issueOwner:UUID?
   private var refreshTask:Task<Void,Never>?
   private var refreshOwner:Int32?
+  private var refreshRequestID=UUID()
   private let sessionKey=UUID().uuidString
   private let maintenance=DispatchQueue(label:"cineva.range.prefetch",qos:.utility)
   private var maintenanceTimer:DispatchSourceTimer?
@@ -446,7 +449,7 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
   private var acquiredKey:String?
   private var lastForegroundMiss=ProcessInfo.processInfo.systemUptime
   private var diskKey:String? {
-    guard cacheEnabled,length>0,responseValidator != nil else { return nil }
+    guard persistenceEnabled,cacheEnabled,length>0,responseValidator != nil else { return nil }
     if identity.isPersistent { return identity.key }
     // A strong HTTP validator permits merging within this session, but without
     // provider content identity it must not silently promise reuse after reopen.
@@ -458,8 +461,8 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
   }
   func allowPrefetch(_ allowed:Bool) {
     condition.lock(); defer { condition.broadcast(); condition.unlock() }
-    prefetchAllowed=allowed
-    if !allowed { yieldPrefetch() }
+    prefetchAllowed=persistenceEnabled && allowed
+    if !prefetchAllowed { yieldPrefetch() }
   }
   private func yieldPrefetch() {
     guard let token=prefetchToken else { return }
@@ -545,10 +548,11 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     condition.broadcast(); condition.unlock()
   }
   init(source: VideoSource, identity: RangeCacheIdentity, disk: SegmentDiskCache = .shared,
-       cacheEnabled: Bool = true, refresh: Refresh? = nil) {
+       cacheEnabled: Bool = true, persistenceEnabled:Bool = false, refresh: Refresh? = nil) {
     self.source=source; self.identity=identity; self.disk=disk; self.refresh=refresh
-    self.cacheEnabled=cacheEnabled; diskEpoch=disk.epoch; stats.hintedLength=identity.size
-    if cacheEnabled,identity.isPersistent,let restored=disk.restored(identity:identity.key,recheck:false) {
+    self.cacheEnabled=cacheEnabled; self.persistenceEnabled=persistenceEnabled && cacheEnabled
+    diskEpoch=persistenceEnabled && cacheEnabled ? disk.epoch : 0; stats.hintedLength=identity.size
+    if persistenceEnabled,cacheEnabled,identity.isPersistent,let restored=disk.restored(identity:identity.key,recheck:false) {
       length=restored.total; responseValidator=restored.validator; stats.verifiedLength=length
     }
     super.init()
@@ -559,10 +563,12 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     config.httpMaximumConnectionsPerHost=2
     let queue=OperationQueue(); queue.maxConcurrentOperationCount=1; queue.qualityOfService = .userInitiated
     session=URLSession(configuration:config,delegate:self,delegateQueue:queue)
-    let timer=DispatchSource.makeTimerSource(queue:maintenance)
-    timer.schedule(deadline:.now(),repeating:.milliseconds(200))
-    timer.setEventHandler { [weak self] in self?.maintain() }
-    maintenanceTimer=timer; timer.resume()
+    if self.persistenceEnabled {
+      let timer=DispatchSource.makeTimerSource(queue:maintenance)
+      timer.schedule(deadline:.now(),repeating:.milliseconds(200))
+      timer.setEventHandler { [weak self] in self?.maintain() }
+      maintenanceTimer=timer; timer.resume()
+    }
   }
   var statistics:RangeStatistics { condition.lock(); defer { condition.unlock() }; return stats }
   var playbackReadState:PlaybackReadState {
@@ -576,6 +582,18 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
   func makePreviewToken() -> Int32 {
     condition.lock(); defer { condition.unlock() }
     nextPreviewToken += 1; previewTokens.insert(nextPreviewToken); return nextPreviewToken
+  }
+  // Synchronous gesture gate. Keep independent AVIO cursors/indexes alive,
+  // but stop their extra network work before the final primary seek starts.
+  func setPreviewReadsAllowed(_ allowed:Bool) {
+    condition.lock(); defer { condition.broadcast(); condition.unlock() }
+    previewReadsAllowed=allowed
+    if !allowed {
+      for token in previewTokens where token != prefetchToken { cancelFlights(for:token) }
+      if let owner=refreshOwner,owner != generation,owner != prefetchToken,primaryReaders==0 {
+        refreshTask?.cancel(); refreshTask=nil; refreshing=false; refreshed=false; refreshOwner=nil
+      }
+    }
   }
   private func valid(_ token:Int32) -> Bool { !closed && (token==generation || previewTokens.contains(token)) }
   func cancelPreview(_ token:Int32) {
@@ -692,13 +710,21 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
       condition.broadcast(); condition.unlock()
     }
     guard offset>=0, count>0 else { return result }
-    let base=offset/page*page, deadline=ProcessInfo.processInfo.systemUptime+9
+    let base=offset/page*page
+    var deadline=ProcessInfo.processInfo.systemUptime+9
     var observed=Set<Int>(), checkedDisk=false
     var continuation:Recovery?
     while true {
       if !valid(wanted) {
         if let continuation { publishRecovery(continuation,outcome:"cancelled") }
         result = -3; return result
+      }
+      if wanted != generation,wanted != prefetchToken,!previewReadsAllowed {
+        let pausedAt=ProcessInfo.processInfo.systemUptime
+        repeat { condition.wait() } while valid(wanted) && !previewReadsAllowed
+        deadline+=ProcessInfo.processInfo.systemUptime-pausedAt
+        continuation=nil
+        continue
       }
       if let fatalError=readerErrors[wanted] ?? fatalError {
         if let continuation { publishRecovery(continuation,outcome:"exhausted") }
@@ -733,9 +759,10 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
         waitingOnNetwork()
         guard !refreshed,let refresh else { result = -1; return result }
         refreshed=true; refreshing=true; refreshOwner=wanted; stats.refreshes+=1
+        let requestID=UUID(); refreshRequestID=requestID
         refreshTask=Task.detached { [weak self] in
-          do { self?.didRefresh(try await refresh(),generation:wanted) }
-          catch { self?.didRefresh(nil,generation:wanted) }
+          do { self?.didRefresh(try await refresh(),generation:wanted,requestID:requestID) }
+          catch { self?.didRefresh(nil,generation:wanted,requestID:requestID) }
         }
       }
       if primary {
@@ -770,9 +797,10 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
             continuation=f.recovery; publishRecovery(f.recovery)
             if let id=f.task?.taskIdentifier { flights.removeValue(forKey:id) }
             refreshed=true; refreshing=true; refreshOwner=wanted; stats.refreshes+=1
+            let requestID=UUID(); refreshRequestID=requestID
             refreshTask=Task.detached { [weak self] in
-              do { self?.didRefresh(try await refresh(),generation:wanted) }
-              catch { self?.didRefresh(nil,generation:wanted) }
+              do { self?.didRefresh(try await refresh(),generation:wanted,requestID:requestID) }
+              catch { self?.didRefresh(nil,generation:wanted,requestID:requestID) }
             }
           } else if [-1,-2,-10,-11].contains(f.error) {
             let cycle=f.recovery
@@ -848,7 +876,9 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
       block.append(data.subdata(in:cursor..<(cursor+n)),at:inside); memory[base]=block
       order.removeAll { $0==base }; order.append(base)
       let required=Int(min(page,length-base))
-      if required>0, block.available(at:0)>=required { complete.append((base,Data(block.data.prefix(required)))) }
+      if persistenceEnabled,required>0, block.available(at:0)>=required {
+        complete.append((base,Data(block.data.prefix(required))))
+      }
       cursor+=n
     }
     while stats.memoryBytes>memoryLimit, let oldest=order.first {
@@ -882,9 +912,9 @@ final class RangeCoordinator: NSObject, URLSessionDataDelegate, @unchecked Senda
     task.priority=generation==self.generation ? URLSessionTask.highPriority : URLSessionTask.lowPriority
     stats.requests+=1; stats.misses+=1; task.resume(); return task.taskIdentifier
   }
-  private func didRefresh(_ value:VideoSource?,generation wanted:Int32) {
+  private func didRefresh(_ value:VideoSource?,generation wanted:Int32,requestID:UUID) {
     condition.lock(); defer { condition.broadcast(); condition.unlock() }
-    guard valid(wanted), refreshing else { return }
+    guard valid(wanted),refreshing,refreshOwner==wanted,refreshRequestID==requestID else { return }
     refreshing=false; refreshTask=nil
     if let value, value.isOriginal==source.isOriginal { source=value }
     else {

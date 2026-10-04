@@ -105,6 +105,9 @@ void CinevaFFmpegSessionCancel(CinevaFFmpegSession * _Nonnull session);
 void CinevaFFmpegSessionDestroy(CinevaFFmpegSession * _Nonnull session);
 int CinevaFFmpegSessionSeek(CinevaFFmpegSession * _Nonnull session, double seconds);
 void CinevaFFmpegSessionSetPosition(CinevaFFmpegSession * _Nonnull session, double seconds);
+/// Suspends only preview I/O timeout accounting. The caller gates preview AVIO
+/// reads; cancellation and generation changes remain effective while inactive.
+void CinevaFFmpegSessionSetPreviewIOActive(CinevaFFmpegSession * _Nonnull session, int active);
 void CinevaFFmpegSessionSetVideoActive(CinevaFFmpegSession * _Nonnull session, int active);
 void CinevaFFmpegSessionSnapshot(CinevaFFmpegSession * _Nonnull session,
     CinevaFFmpegSnapshot * _Nonnull snapshot);

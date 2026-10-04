@@ -14,9 +14,9 @@ import Foundation
       expect(defaults.string(forKey:"cineva.playback.originalEngine.v1")==nil,"Retired preference removed")
       expect(defaults.double(forKey:"rate")==1.5 && defaults.string(forKey:"quality")=="original" && defaults.string(forKey:"history")=="keep","Unrelated preferences preserved")
       let original=VideoSource(id:"x",title:"",definition:0,url:URL(string:"https://example.invalid/video.mp4")!,kind:.original,headers:[:])
-      expect(PlaybackPolicy.input(for:original) == .customAVIOCached,"Original always begins with FFmpeg cache")
+      expect(PlaybackPolicy.input(for:original) == .customAVIOStreaming,"Original always begins with FFmpeg streaming")
       PlaybackPolicy.migrateEnginePreference(defaults)
-      expect(PlaybackPolicy.input(for:original) == .customAVIOCached,"Restart/next-item policy is independent of legacy preference")
+      expect(PlaybackPolicy.input(for:original) == .customAVIOStreaming,"Restart/next-item policy is independent of legacy preference")
     }
     for kind in [VideoSource.Kind.original,.transcoded] {
       let hls=VideoSource(id:"hls",title:"",definition:1,url:URL(string:"https://example.invalid/master.m3u8")!,kind:kind,headers:[:])

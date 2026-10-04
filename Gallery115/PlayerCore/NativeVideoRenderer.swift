@@ -42,7 +42,9 @@ final class NativeVideoRenderer {
     // Flush old scheduled samples while retaining the last displayed picture
     // across seek. anchored still becomes false until a NEW frame is submitted.
     if preservingImage { output.flush() } else { layer.flushAndRemoveImage() }
-    format = nil
+    // A same-media seek retains its format description. submit() still checks
+    // dimensions, pixel format and color/HDR attachments against each frame.
+    if newSession || !preservingImage { format = nil }
     anchored = false
     anchorSubmittedAt = nil
     waitingForData = true

@@ -19,6 +19,7 @@ actor FFmpegPreviewWorker {
   }
   private let source:VideoSource
   private let coordinator:RangeCoordinator?
+  private let activity:FFmpegPreviewActivity
   private var reader:FFmpegPreviewReader?
   private lazy var context=CIContext(options:[.cacheIntermediates:false])
   private var handle:FFmpegSessionHandle?
@@ -28,7 +29,8 @@ actor FFmpegPreviewWorker {
   private var ended=false
   private var operation=0
   private(set) var sessionOpenCount=0
-  init(source:VideoSource,coordinator:RangeCoordinator?) {
+  init(source:VideoSource,coordinator:RangeCoordinator?,activity:FFmpegPreviewActivity? = nil) {
+    self.activity=activity ?? FFmpegPreviewActivity(coordinator:coordinator)
     self.source=source; self.coordinator=coordinator
   }
   // Can be called during an awaited read: native cancellation wakes its scoped
@@ -36,6 +38,7 @@ actor FFmpegPreviewWorker {
   func suspend() {
     operation &+= 1
     if let handle { CinevaFFmpegSessionCancel(handle.pointer) }
+    activity.attach(nil)
     handle=nil; reader?.cancel(-1); reader=nil
   }
   func close() { ended=true; suspend(); frames=[]; context.clearCaches() }
@@ -63,6 +66,7 @@ actor FFmpegPreviewWorker {
       } }
       guard let pointer else { return result(nil,"无法创建预览") }
       handle=FFmpegSessionHandle(pointer,previewReader:reader); cursor=target; serial=1
+      activity.attach(handle)
       sessionOpenCount+=1
     } else if target<cursor || target-cursor>3 {
       serial=CinevaFFmpegSessionSeek(handle!.pointer,target); cursor=target
@@ -74,7 +78,10 @@ actor FFmpegPreviewWorker {
     while !ended && operation==expectedOperation && !Task.isCancelled && ProcessInfo.processInfo.systemUptime-began<5 {
       var snapshot=CinevaFFmpegSnapshot(); CinevaFFmpegSessionSnapshot(handle.pointer,&snapshot)
       if snapshot.serial != serial { serial=snapshot.serial; cursor=snapshot.recoveryTarget }
-      if snapshot.status<0 { self.handle=nil; return result(nil,"预览读取失败（\(snapshot.errorCode)），播放不受影响") }
+      if snapshot.status<0 {
+        activity.attach(nil); self.handle=nil
+        return result(nil,"预览读取失败（\(snapshot.errorCode)），播放不受影响")
+      }
       var pts=0.0,duration=0.0,generation:Int32=0
       if let pixel=CinevaFFmpegSessionCopyFrame(handle.pointer,&pts,&duration,&generation) {
         // The first frame may arrive between the earlier snapshot and dequeue.
@@ -136,14 +143,18 @@ final class FFmpegTimelinePreview {
   private var directionEpoch=0
   private var source:VideoSource?
   private var coordinator:RangeCoordinator?
+  private var activity:FFmpegPreviewActivity?
   private(set) var diagnostic="预览尚未请求"
   func configure(source:VideoSource,coordinator:RangeCoordinator?) {
     stop(); self.source=source; self.coordinator=coordinator
+    activity=FFmpegPreviewActivity(coordinator:coordinator)
+    activity?.setActive(false)
   }
   func begin(at time:Double) {
     epoch=UUID(); task?.cancel(); task=nil; direction=0; latest=time
     display.beginExternal(at:time)
-    if worker==nil, let source { worker=FFmpegPreviewWorker(source:source,coordinator:coordinator) }
+    activity?.setActive(true)
+    if worker==nil, let source { worker=FFmpegPreviewWorker(source:source,coordinator:coordinator,activity:activity) }
     update(time)
   }
   func update(_ time:Double) {
@@ -181,6 +192,7 @@ final class FFmpegTimelinePreview {
   }
   func finish(keepOverlay:Bool) {
     epoch=UUID(); task?.cancel(); task=nil
+    activity?.setActive(false)
     // Keep the bounded decoder/index alive between gestures. An unawaited
     // suspend used to race the next begin and cancel its brand-new preview.
     display.end(keepImageUntilSeekCompletes:keepOverlay)
@@ -188,6 +200,6 @@ final class FFmpegTimelinePreview {
   func stop() {
     finish(keepOverlay:false)
     let previous=worker; worker=nil; Task { await previous?.close() }
-    source=nil; coordinator=nil; display.reset()
+    source=nil; coordinator=nil; activity=nil; display.reset()
   }
 }

@@ -46,7 +46,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   private(set) var errorMessage: String?
   private(set) var lastFailure: FFmpegFailureSnapshot?
   @ObservationIgnored private var sessionID=UUID()
-  private(set) var inputBackend: FFmpegInputBackend = .customAVIOCached
+  private(set) var inputBackend: FFmpegInputBackend = .customAVIOStreaming
   private(set) var videoSize: CGSize?
   private(set) var rotation = 0.0
   private(set) var audioUnderruns = 0
@@ -81,6 +81,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     return PlayerLoadingFeedback(delayMilliseconds:200,generation:Int(serial))
   }
   @ObservationIgnored private var handle: FFmpegSessionHandle?
+  @ObservationIgnored private var startupTask: Task<Void,Never>?
   @ObservationIgnored private var ticker: Timer?
   @ObservationIgnored private var pending: (CVPixelBuffer,Double,Double,Int32)?
   @ObservationIgnored private var samples = [Float](repeating:0,count:131072)
@@ -128,32 +129,11 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     return RangeCacheIdentity(account:scope,fileID:item.id,size:item.size,
       validator:item.sha1.isEmpty ? "" : "sha1:"+item.sha1.lowercased())
   }
-  static func cachedSource(for item:CloudItem) async -> VideoSource? {
-    let identity=cacheIdentity(for:item)
-    guard identity.isPersistent else { return nil }
-    let complete=await Task.detached(priority:.userInitiated) {
-      SegmentDiskCache.shared.restored(identity:identity.key)?.complete == true
-    }.value
-    guard complete,!Task.isCancelled else { return nil }
-    return VideoSource(id:"offline-"+identity.key,title:"原画 · 本地缓存",definition:0,
-      url:URL(string:"cineva-cache://media/"+identity.key)!,kind:.original,headers:[:])
-  }
-  private(set) var mediaCacheProgress=MediaCacheProgress()
-  var mediaCacheText:String {
-    guard inputBackend == .customAVIOCached else { return "当前视频使用在线播放" }
-    let p=mediaCacheProgress
-    if let message=p.limitation { return message+" · 已缓存 \(ByteCountFormatter.string(fromByteCount:p.bytes,countStyle:.file))" }
-    guard p.total>0 else { return "正在确认视频缓存" }
-    let size=ByteCountFormatter.string(fromByteCount:p.bytes,countStyle:.file)
-    let total=ByteCountFormatter.string(fromByteCount:p.total,countStyle:.file)
-    return p.complete ? (p.persistent ? "整片已缓存 · \(total)" : "本次播放已全部落盘 · \(total)")
-      : "已缓存 \(size) / \(total) · \(Int(Double(p.bytes)/Double(p.total)*100))%"+(p.persistent ? "" : " · 重开需在线验证")
-  }
   func start(source: VideoSource, item: CloudItem, api: APIClient, library: LibraryStore,
-             at position: Double, playing: Bool = true, useCache: Bool = true, preferHardware: Bool = true,
+             at position: Double, playing: Bool = true, preferHardware: Bool = true,
              recordsHistory: Bool = true, inputBackend: FFmpegInputBackend? = nil, startupOrigin:Double? = nil) {
     stop()
-    sessionID=UUID(); mediaCacheProgress=MediaCacheProgress()
+    sessionID=UUID()
     self.inputBackend=inputBackend ?? PlaybackPolicy.input(for:source)
     self.recordsHistory=recordsHistory
     currentSource=source; sourceItem=item; self.api=api; self.library=library
@@ -163,7 +143,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     playbackBeganAt=nil; audioRenderedAt=nil; displayReadyAt=nil; stableAt=nil; uninterruptedAt=nil
     finalSeekCount=0; seekFrameMilliseconds=nil; commitAt=nil
     seekReadiness=CachedSeekReadiness(); seekIO=nil; dragIO=nil; seekGeneration=0; seekDiagnostic="尚未拖动"
-    wantsPlayback=playing; waiting=true; resumeTarget=0.75; serial=1
+    wantsPlayback=playing; waiting=true; resumeTarget=PlaybackPolicy.startupRunway; serial=1
     backgroundAudioOnly=false
     rebufferCount=0; audioUnderruns=0; firstFrameAt=nil
     audioTracks=[]; selectedAudioOptionID=nil; audioTail=false; restoredAudioPreference=false
@@ -178,18 +158,33 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     guard source.headers.allSatisfy({ !$0.key.contains(where: \.isNewline) && !$0.value.contains(where: \.isNewline) && !$0.key.contains(":") }) else {
       fail("媒体请求头格式无效"); return
     }
-    var options = CinevaFFmpegSessionOptions()
-    options.preferHardware=preferHardware ? 1 : 0; options.videoOnly=0; options.outputAudio=1
     if self.inputBackend != .ffmpegHTTP {
       let identity=Self.cacheIdentity(for:item)
       audioPreferenceKey="cineva.ffmpeg.audio."+identity.key
-      let coordinator=RangeCoordinator(source:source,identity:identity,cacheEnabled:self.inputBackend == .customAVIOCached,refresh:{
-        let response=try await api.initialVideoSources(for:item,preferOriginal:true)
-        guard let fresh=response.sources.first(where: \.isOriginal) else { throw URLError(.resourceUnavailable) }
-        return fresh
-      })
-      cache=coordinator; options.attach(coordinator)
+      let epoch=lifecycleEpoch, cacheEnabled=self.inputBackend != .customAVIODirect
+      seekReadiness.begin(generation:serial)
+      // Network setup runs away from the UI. The rolling memory window never
+      // joins the disk queue, scans manifests, persists or downloads ahead.
+      startupTask=Task { @MainActor [weak self] in
+        let coordinator=await Task.detached(priority:.userInitiated) {
+          RangeCoordinator(source:source,identity:identity,cacheEnabled:cacheEnabled,persistenceEnabled:false,refresh:{
+            let response=try await api.initialVideoSources(for:item,preferOriginal:true)
+            guard let fresh=response.sources.first(where: \.isOriginal) else { throw URLError(.resourceUnavailable) }
+            return fresh
+          })
+        }.value
+        guard let self,!Task.isCancelled,self.lifecycleEpoch==epoch else { coordinator.close(); return }
+        self.startupTask=nil; self.cache=coordinator
+        self.openSession(source:source,preferHardware:preferHardware)
+      }
+    } else {
+      openSession(source:source,preferHardware:preferHardware)
     }
+  }
+  private func openSession(source:VideoSource,preferHardware:Bool) {
+    var options=CinevaFFmpegSessionOptions()
+    options.preferHardware=preferHardware ? 1 : 0; options.videoOnly=0; options.outputAudio=1
+    if let cache { options.attach(cache) }
     let headers=source.headers.sorted { $0.key < $1.key }.map { "\($0.key): \($0.value)\r\n" }.joined()
     let pointer=source.url.absoluteString.withCString { url in
       headers.withCString { CinevaFFmpegSessionCreate(url,$0,target,options) }
@@ -206,6 +201,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
   }
   func stop() {
     lifecycleEpoch=UUID()
+    startupTask?.cancel(); startupTask=nil
     toneMapTask?.cancel(); toneMapTask=nil; pendingToneMapped=false
     toneMapper.reset()
     resetSubtitleImage()
@@ -216,7 +212,6 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     audio.stop(); renderer.reset(to:currentTime); pending=nil
     handle=nil; cache?.close(); cache=nil
     observers.forEach(NotificationCenter.default.removeObserver); observers.removeAll()
-    mediaCacheProgress=MediaCacheProgress()
     playbackState = .stopped
   }
   func pause() {
@@ -232,16 +227,6 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     } else { playbackState = .buffering }
   }
   func togglePlayback() { wantsPlayback ? pause() : resume() }
-  func clearSegmentCache() async {
-    guard let source=currentSource, let item=sourceItem, let api, let library else { return }
-    let position=currentTime, playing=wantsPlayback, record=recordsHistory
-    let backend=inputBackend, hardware=preferHardware
-    stop()
-    let epoch=lifecycleEpoch
-    await Task.detached(priority:.utility) { SegmentDiskCache.shared.clear() }.value
-    guard lifecycleEpoch==epoch else { return }
-    start(source:source,item:item,api:api,library:library,at:position,playing:playing,preferHardware:hardware,recordsHistory:record,inputBackend:backend)
-  }
   func setPlaybackRate(_ value: Float) {
     rate=min(2,max(0.5,value)); audio.setRate(rate)
     renderer.alignClock(to:currentTime,rate:Double(rate),running:isPlaying)
@@ -251,8 +236,14 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     if scrubbing { cancelInteractiveScrub() }
     resetSubtitleImage()
     toneMapTask?.cancel(); toneMapTask=nil; pendingToneMapped=false
-    guard let handle, seconds.isFinite else { return }
-    cache?.allowPrefetch(false)
+    guard seconds.isFinite else { return }
+    guard let handle else {
+      if startupTask != nil {
+        target=min(max(0,seconds),duration>0 ? max(0,duration-0.01) : max(0,seconds))
+        currentTime=target // The first native open uses the latest release target.
+      }
+      return
+    }
     target=min(max(0,seconds),duration>0 ? max(0,duration-0.01) : max(0,seconds))
     let io=cache?.statistics
     seekIO=dragIO ?? io; dragIO=nil
@@ -261,17 +252,16 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     // Stop already scheduled old audio before publishing a new generation.
     audio.pause(); renderer.setPlaying(false)
     serial=CinevaFFmpegSessionSeek(handle.pointer,target)
-    if inputBackend == .customAVIOCached { seekReadiness.begin(generation:serial) }
+    if cache != nil { seekReadiness.begin(generation:serial) }
     seekGeneration=serial
     audio.reset(to:target,generation:serial); renderer.reset(to:target,preservingImage:true)
-    pending=nil; currentTime=target; waiting=true; resumeTarget=0.75
+    pending=nil; currentTime=target; waiting=true; resumeTarget=PlaybackPolicy.seekRunway
     audioTail=false
     waitStarted=CACurrentMediaTime(); playbackState = .seeking
   }
   func replayFromStart() { wantsPlayback=true; seek(to:0) }
   func beginInteractiveScrub() -> Bool {
     guard !scrubbing else { return scrubIntent }
-    cache?.allowPrefetch(false)
     dragIO=cache?.statistics
     scrubIntent=wantsPlayback; scrubbing=true
     audio.pause(); renderer.setPlaying(false) // Keep PCM, frame queues and real position.
@@ -377,7 +367,6 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     if lastFailure?.session != sessionID {
       var snapshot=CinevaFFmpegSnapshot()
       if let handle { CinevaFFmpegSessionSnapshot(handle.pointer,&snapshot) }
-      if let cache { mediaCacheProgress=cache.mediaCacheProgress }
       let io=cache?.statistics
       let function=withUnsafeBytes(of:snapshot.failureFunction) { String(decoding:$0.prefix { $0 != 0 },as:UTF8.self) }
       let build="\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"))"
@@ -390,6 +379,8 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
       diagnostics=lastFailure!.text
     }
     errorMessage=message
+    startupTask?.cancel(); startupTask=nil
+    scrubbing=false; commitAt=nil; preview.stop()
     audio.stop(); renderer.setPlaying(false)
     handle=nil; cache?.close(); cache=nil; ticker?.invalidate(); ticker=nil
     playbackState = .failed(message)
@@ -410,7 +401,9 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     observers.append(center.addObserver(forName:AVAudioSession.interruptionNotification,object:nil,queue:.main) { [weak self] note in
       MainActor.assumeIsolated {
         guard let self, let raw=note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt else { return }
-        if raw==AVAudioSession.InterruptionType.began.rawValue { self.interruptedIntent=self.wantsPlayback; self.pause() }
+        if raw==AVAudioSession.InterruptionType.began.rawValue {
+          self.audio.invalidateSession(); self.interruptedIntent=self.wantsPlayback; self.pause()
+        }
         else if self.interruptedIntent, let options=note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt,
           AVAudioSession.InterruptionOptions(rawValue:options).contains(.shouldResume) { self.resume() }
       }
@@ -424,6 +417,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
           guard let self else { return }
           if note.name == .AVAudioEngineConfigurationChange,
             (note.object as AnyObject?) !== self.audio.notificationObject { return }
+          self.audio.invalidateSession()
           if note.name==AVAudioSession.mediaServicesWereResetNotification {
             self.audio.stop(); self.audio=NativeAudioRenderer()
             self.audio.setRate(self.rate); self.audio.setVolume(self.volume)
@@ -452,6 +446,9 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     if snapshot.status<0 {
       var message=[CChar](repeating:0,count:192); CinevaFFmpegErrorText(snapshot.errorCode,&message,192)
       fail(snapshot.errorCode == -70001 ? "检测到 Dolby Vision，当前 FFmpeg 路径未实现动态元数据输出，请使用兼容内核。" : "FFmpeg \(FFmpegFailureSnapshot.stageName(snapshot.failureStage))：\(String(cString:message))（\(snapshot.errorCode)）"); return
+    }
+    if let began=commitAt, now-began>15, cache?.playbackReadState.waitingForNetwork != true {
+      fail("定位后未能呈现目标画面，请重试或切换兼容内核。"); return
     }
     if snapshot.serial != serial {
       resetSubtitleImage()
@@ -615,10 +612,6 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
     if isPlaying, let began=uninterruptedAt, now-began>=1, !hasAudio || audioRenderedAt != nil,
       displayReadyAt != nil, stableAt==nil { stableAt=now }
 
-    // Playback gating always uses decoded A/V continuity. UI only uses durable
-    // file coverage, coalesced independently of packet -> frame/PCM handoffs.
-    cache?.allowPrefetch(!scrubbing && ((!waiting && bufferedDuration>=2 && stableAt != nil)
-      || (!wantsPlayback && renderer.anchored && playbackState != .seeking)))
     if now-lastPublished>=0.2 {
       lastPublished=now
       if hasAudio, !waiting, wantsPlayback, !backgroundAudioOnly { renderer.disciplineClock(to:audio.audibleTime,rate:Double(rate)) }
@@ -648,7 +641,6 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
         if let saved=UserDefaults.standard.string(forKey:key), saved != selectedAudioOptionID,
           tracks.contains(where: { $0.id==saved }) { selectAudio(saved); return }
       }
-      if let cache { mediaCacheProgress=cache.mediaCacheProgress }
       let io=cache?.statistics
       hasAtmosMetadata=snapshot.atmosMetadataDetected != 0
       let bytes=io?.networkBytes ?? 0
@@ -657,7 +649,7 @@ final class FFmpegPlayerEngine: PlayerEngine, PlayerTrackSelecting {
       statistics=PlayerStatistics(backend:.ffmpeg,codec:String(cString:CinevaFFmpegCodecName(snapshot.videoCodec)),
         videoSize:videoSize,fps:snapshot.fps,hdrFormat:snapshot.colorTransfer==16 ? "PQ 标记" : snapshot.colorTransfer==18 ? "HLG 标记" : "SDR",
         networkMbps:io == nil ? nil : speed,downloadedBytes:io?.networkBytes,bufferedSeconds:bufferedDuration,
-        cachedBytes:mediaCacheProgress.bytes,decoder:snapshot.decoderType==2 ? "VideoToolbox" : "FFmpeg 软件解码",
+        cachedBytes:Int64(io?.memoryBytes ?? 0),decoder:snapshot.decoderType==2 ? "VideoToolbox" : "FFmpeg 软件解码",
         renderer:"Apple Native + AVAudioEngine PCM",droppedFrames:renderer.droppedFrames,
         avSyncOffset:hasAudio ? renderer.time-audio.audibleTime : nil)
       func elapsed(_ time:Double?) -> String { time.map { String(format:"%.3f s",$0-clickAt) } ?? "尚未发生 / 不可获得" }

@@ -1,6 +1,28 @@
 import CinevaFFmpeg
 import Foundation
 
+/// Coordinates a retained preview session's timeout budget with its AVIO gate.
+/// Calls are synchronous so an old drag cannot pause a newly started drag.
+final class FFmpegPreviewActivity: @unchecked Sendable {
+  private let coordinator: RangeCoordinator?
+  private let lock = NSLock()
+  private var active = true
+  private var handle: FFmpegSessionHandle?
+  init(coordinator: RangeCoordinator? = nil) { self.coordinator = coordinator }
+  func setActive(_ active: Bool) {
+    lock.lock(); defer { lock.unlock() }
+    self.active = active
+    if let handle { CinevaFFmpegSessionSetPreviewIOActive(handle.pointer, active ? 1 : 0) }
+    // Resume the native budget before waking any previously gated AVIO read.
+    coordinator?.setPreviewReadsAllowed(active)
+  }
+  func attach(_ handle: FFmpegSessionHandle?) {
+    lock.lock(); defer { lock.unlock() }
+    self.handle = handle
+    if let handle { CinevaFFmpegSessionSetPreviewIOActive(handle.pointer, active ? 1 : 0) }
+  }
+}
+
 extension CinevaFFmpegSessionOptions {
   mutating func attach(_ coordinator: RangeCoordinator) {
     ioContext = Unmanaged.passUnretained(coordinator).toOpaque()

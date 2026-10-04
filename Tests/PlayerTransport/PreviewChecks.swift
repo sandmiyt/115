@@ -83,12 +83,49 @@ import CoreImage
       if file=="subtitles.mkv" { expect(CinevaFFmpegSessionSubtitleTrackCount(primary.pointer)>0,"Subtitle enumeration survives preview isolation") }
       if file=="long-cache.mp4" {
         expect(io.fileSize>512*1048576,"Offline acceptance uses a real media file over 512 MiB")
+        // Retain the SAME preview context over a pause longer than both AVIO
+        // budgets. Its uncached target must not download while inactive, and
+        // must resume without an expired native deadline or a media reopen.
+        let pausedReader=FFmpegPreviewReader(io)
+        var pausedOptions=CinevaFFmpegSessionOptions()
+        pausedOptions.videoOnly=1; pausedOptions.sequentialVideoOnly=1; pausedOptions.preview=1
+        pausedOptions.attachPreview(pausedReader)
+        let pausedPointer=source.url.absoluteString.withCString { CinevaFFmpegSessionCreate($0,"",0,pausedOptions) }!
+        let pausedHandle=FFmpegSessionHandle(pausedPointer,previewReader:pausedReader)
+        let activity=FFmpegPreviewActivity(coordinator:io); activity.attach(pausedHandle)
+        var firstPreview=false
+        let previewDeadline=ProcessInfo.processInfo.systemUptime+10
+        while !firstPreview && ProcessInfo.processInfo.systemUptime<previewDeadline {
+          var pts=0.0,span=0.0,generation:Int32=0
+          firstPreview=CinevaFFmpegSessionCopyFrame(pausedPointer,&pts,&span,&generation) != nil
+          try? await Task.sleep(for:.milliseconds(10))
+        }
+        expect(firstPreview,"Native pause fixture opens a real independent preview session")
+        activity.setActive(false)
+        let pausedGeneration=CinevaFFmpegSessionSeek(pausedPointer,330.731)
+        let pausedRequests=io.statistics.requests
+        try? await Task.sleep(for:.seconds(12))
+        expect(io.statistics.requests==pausedRequests,"Finished drag cannot keep downloading preview ranges")
+        activity.setActive(true)
+        var resumedPreview=false
+        let resumedDeadline=ProcessInfo.processInfo.systemUptime+8
+        while !resumedPreview && ProcessInfo.processInfo.systemUptime<resumedDeadline {
+          var state=CinevaFFmpegSnapshot(); CinevaFFmpegSessionSnapshot(pausedPointer,&state)
+          expect(state.status>=0,"Long preview pause never becomes an AVERROR_EXIT failure")
+          var pts=0.0,span=0.0,generation:Int32=0
+          if CinevaFFmpegSessionCopyFrame(pausedPointer,&pts,&span,&generation) != nil,
+            generation==pausedGeneration,pts<=330.731 && 330.731<pts+span { resumedPreview=true }
+          try? await Task.sleep(for:.milliseconds(10))
+        }
+        expect(resumedPreview,"Retained preview session resumes the exact uncached target after 12 seconds")
+        print("STREAMING_PREVIEW_PAUSE seconds=12 resumed=true retainedSession=true")
+        CinevaFFmpegSessionCancel(pausedPointer); activity.attach(nil)
         let localRoot=FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at:localRoot) }
         let disk=SegmentDiskCache(root:localRoot)
         let identity=RangeCacheIdentity(account:"offline-fixture",fileID:file,size:io.fileSize,
           validator:"sha1:"+String(repeating:"c",count:40))
-        let fill=RangeCoordinator(source:source,identity:identity,disk:disk)
+        let fill=RangeCoordinator(source:source,identity:identity,disk:disk,persistenceEnabled:true)
         var probe=[UInt8](repeating:0,count:4096)
         expect(fill.read(offset:0,buffer:&probe,count:4096,generation:1)>0,"Offline fixture begins incrementally")
         fill.allowPrefetch(true)
@@ -100,7 +137,7 @@ import CoreImage
         fill.close(); disk.flush()
         let offlineSource=VideoSource(id:file,title:file,definition:0,
           url:URL(string:"cineva-cache://media/offline")!,kind:.original,headers:[:])
-        let local=RangeCoordinator(source:offlineSource,identity:identity,disk:SegmentDiskCache(root:localRoot))
+        let local=RangeCoordinator(source:offlineSource,identity:identity,disk:SegmentDiskCache(root:localRoot),persistenceEnabled:true)
         var localOptions=CinevaFFmpegSessionOptions(); localOptions.outputAudio=1; localOptions.attach(local)
         let localPointer=offlineSource.url.absoluteString.withCString { CinevaFFmpegSessionCreate($0,"",0,localOptions) }!
         let localHandle=FFmpegSessionHandle(localPointer,io:local)

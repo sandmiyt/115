@@ -2,8 +2,12 @@ import Foundation
 
 /// Every new media item starts here. Legacy engine preferences cannot change it.
 enum PlaybackPolicy {
+  // Initial/seek output already has its exact target frame and trimmed PCM.
+  // An actual underrun still uses the separate, adaptive recovery runway.
+  static let startupRunway=0.25
+  static let seekRunway=0.15
   static func input(for source: VideoSource) -> FFmpegInputBackend {
-    source.isOriginal && source.url.pathExtension.lowercased() != "m3u8" ? .customAVIOCached : .ffmpegHTTP
+    source.isOriginal && source.url.pathExtension.lowercased() != "m3u8" ? .customAVIOStreaming : .ffmpegHTTP
   }
   static func migrateEnginePreference(_ defaults: UserDefaults) {
     defaults.removeObject(forKey:"cineva.playback.originalEngine.v1")
@@ -15,7 +19,7 @@ enum PlaybackPolicy {
     return String(format:"%02lld:%02lld.%03lld",total/60,total%60,ms%1000)
   }
 }
-enum FFmpegInputBackend:String,Sendable { case ffmpegHTTP, customAVIODirect, customAVIOCached }
+enum FFmpegInputBackend:String,Sendable { case ffmpegHTTP, customAVIODirect, customAVIOStreaming, customAVIOCached }
 
 struct FFmpegFailureSnapshot: Sendable {
   let session: UUID

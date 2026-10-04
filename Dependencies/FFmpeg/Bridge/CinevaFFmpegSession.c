@@ -41,6 +41,9 @@ struct CinevaFFmpegSession {
     atomic_int wantedAudioIndex;
     atomic_int videoSuppressed;
     atomic_llong deadline;
+    atomic_int previewIOPaused;
+    pthread_mutex_t ioBudgetMutex;
+    int64_t previewPausedAtUs; // Protected with preview deadline writes.
     char *url, *headers;
     double target, origin;
     int64_t createdUs;
@@ -87,9 +90,23 @@ struct CinevaFFmpegSession {
 static int interrupted(void *opaque) {
     CinevaFFmpegSession *s = opaque;
     return atomic_load(&s->cancelled) ||
-        (atomic_load(&s->deadline) > 0 && av_gettime_relative() > atomic_load(&s->deadline)) ||
+        (!atomic_load(&s->previewIOPaused) && atomic_load(&s->deadline) > 0 &&
+         av_gettime_relative() > atomic_load(&s->deadline)) ||
         (atomic_load(&s->interruptSeek) &&
          atomic_load(&s->ioGeneration) != atomic_load(&s->generation));
+}
+static void readDeadline(CinevaFFmpegSession *s, int64_t budgetUs) {
+    if (!s->options.preview) {
+        atomic_store(&s->deadline, av_gettime_relative() + budgetUs);
+        return;
+    }
+    pthread_mutex_lock(&s->ioBudgetMutex);
+    int64_t now = av_gettime_relative();
+    atomic_store(&s->deadline, now + budgetUs);
+    // If a new read starts while Swift has gated preview AVIO, only suspend
+    // the budget from this new operation's start, not an earlier idle period.
+    if (atomic_load(&s->previewIOPaused)) s->previewPausedAtUs = now;
+    pthread_mutex_unlock(&s->ioBudgetMutex);
 }
 static int customRead(void *opaque, uint8_t *buffer, int capacity) {
     CinevaFFmpegSession *s = opaque;
@@ -673,7 +690,7 @@ static int openInput(CinevaFFmpegSession *s, int extended) {
     av_dict_set(&options, "protocol_whitelist", "http,https,tcp,tls,crypto", 0);
     av_dict_set(&options, "probesize", extended ? "8388608" : "2097152", 0);
     av_dict_set(&options, "analyzeduration", extended ? "8000000" : "3000000", 0);
-    atomic_store(&s->deadline, av_gettime_relative() + 30000000);
+    readDeadline(s, 30000000);
     s->readerFunction = "avformat_open_input";
     int result = avformat_open_input(&s->format, s->url, NULL, &options);
     av_dict_free(&options);
@@ -863,7 +880,7 @@ static void *readLoop(void *opaque) {
                 atomic_store(&s->interruptSeek, 1);
                 if (s->format->pb) { s->format->pb->error = 0; s->format->pb->eof_reached = 0; }
                 int64_t stamp = (int64_t)((target + s->origin) * AV_TIME_BASE);
-                atomic_store(&s->deadline, av_gettime_relative() + 10000000);
+                readDeadline(s, 10000000);
                 int64_t videoStamp = av_rescale_q(stamp, AV_TIME_BASE_Q, s->videoTimeBase);
                 s->readerFunction = "avformat_seek_file";
                 int64_t lookupBeganUs = av_gettime_relative();
@@ -905,7 +922,7 @@ static void *readLoop(void *opaque) {
         if (!packet) { result = AVERROR(ENOMEM); goto done; }
         atomic_store(&s->ioGeneration, serial); atomic_store(&s->interruptSeek, 1);
         stage = CinevaStageRead; readerStage(s, stage);
-        atomic_store(&s->deadline, av_gettime_relative() + 10000000);
+        readDeadline(s, 10000000);
         s->readerFunction = "av_read_frame";
         result = av_read_frame(s->format, packet);
         readerFinished(s, 1);
@@ -974,11 +991,13 @@ CinevaFFmpegSession *CinevaFFmpegSessionCreate(const char *url, const char *head
     CinevaFFmpegSession *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
     pthread_mutex_init(&s->mutex, NULL); pthread_cond_init(&s->changed, NULL);
+    pthread_mutex_init(&s->ioBudgetMutex, NULL);
     atomic_init(&s->cancelled, 0); atomic_init(&s->generation, 1);
     atomic_init(&s->wantedAudioIndex,-1);
     atomic_init(&s->videoSuppressed,0);
     atomic_init(&s->interruptSeek, 0); atomic_init(&s->ioGeneration, 1);
     atomic_init(&s->deadline, 0);
+    atomic_init(&s->previewIOPaused, 0);
     s->url = strdup(url); s->headers = strdup(headers);
     s->createdUs=av_gettime_relative();
     s->target = isfinite(startTime) ? fmax(0, startTime) : 0;
@@ -1019,6 +1038,7 @@ void CinevaFFmpegSessionDestroy(CinevaFFmpegSession *s) {
     closeInput(s);
     free(s->url); free(s->headers);
     pthread_cond_destroy(&s->changed); pthread_mutex_destroy(&s->mutex);
+    pthread_mutex_destroy(&s->ioBudgetMutex);
     free(s);
 }
 int CinevaFFmpegSessionSeek(CinevaFFmpegSession *s, double seconds) {
@@ -1040,6 +1060,27 @@ void CinevaFFmpegSessionSetPosition(CinevaFFmpegSession *s, double seconds) {
     pthread_mutex_lock(&s->mutex);
     s->playbackPosition = fmax(0, seconds);
     pthread_mutex_unlock(&s->mutex);
+}
+void CinevaFFmpegSessionSetPreviewIOActive(CinevaFFmpegSession *s, int active) {
+    // Only custom preview AVIO has the Swift read gate. Native HTTP/HLS keeps
+    // its real I/O timeout, including while a preview gesture is inactive.
+    if (!s->options.preview || !s->options.read) return;
+    pthread_mutex_lock(&s->ioBudgetMutex);
+    int paused = atomic_load(&s->previewIOPaused);
+    int64_t now = av_gettime_relative();
+    if (!active && !paused) {
+        s->previewPausedAtUs = now;
+        atomic_store(&s->previewIOPaused, 1);
+    } else if (active && paused) {
+        int64_t deadline = atomic_load(&s->deadline);
+        if (deadline > 0)
+            atomic_store(&s->deadline, deadline + FFMAX(0, now - s->previewPausedAtUs));
+        // Publish the extended deadline before allowing interruption checks.
+        // Cancellation and generation changes stay active throughout a pause.
+        atomic_store(&s->previewIOPaused, 0);
+        s->previewPausedAtUs = 0;
+    }
+    pthread_mutex_unlock(&s->ioBudgetMutex);
 }
 void CinevaFFmpegSessionSetVideoActive(CinevaFFmpegSession *s,int active) {
     if(!s->options.outputAudio) return;
